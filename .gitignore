@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.runtime/
+captures/
+*.zip
+*.png
+.DS_Store
+*.pfx
+*.p12
+*.pem
+*.key
+*.app/
+*.egg-info/

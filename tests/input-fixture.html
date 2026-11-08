@@ -1,0 +1,11 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>LanPilot Input Fixture — no business data</title>
+<style>body{font:16px sans-serif;margin:30px;min-height:2400px}input{font:22px sans-serif;width:500px;padding:6px}button{font:16px sans-serif;padding:10px;margin:10px}.animated .pulse{animation:pulse .7s infinite alternate}@keyframes pulse{to{opacity:.35}}</style>
+<h1>Disposable input fixture</h1><p>Keyboard / double-click / scroll</p><input id="a" autofocus aria-label="Test input A"><p><input id="b" aria-label="Test input B"></p><button id="button">Clicks: 0</button><p class="pulse">Unrelated animated footer</p><p style="margin-top:1000px">Scroll target</p>
+<script>
+let count=0,doubles=0,timer;const a=document.getElementById('a'),b=document.getElementById('b');
+if(new URLSearchParams(location.search).has('animate'))document.body.classList.add('animated');
+function save(){clearTimeout(timer);timer=setTimeout(()=>fetch('/readback',{method:'POST',body:JSON.stringify({kind:'input-fixture',a:a.value,b:b.value,count,doubles,focus:document.activeElement.id,selection:[a.selectionStart,a.selectionEnd],scrollY})}),60)}
+button.onclick=()=>{button.textContent='Clicks: '+(++count);save()};a.ondblclick=()=>{doubles++;save()};
+for(const name of ['input','keyup','mouseup','focusin','scroll'])window.addEventListener(name,save,true);
+setTimeout(()=>{a.focus();save()},500);
+</script>

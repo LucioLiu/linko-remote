@@ -1,0 +1,6 @@
+interface:
+  display_name: "邻控"
+  short_description: "后台连接局域网里的另一台电脑，查看屏幕并执行已授权操作，不占用本机前台"
+  default_prompt: "用 $lanpilot 查看已连接的电脑，并通过后台通道完成我的任务。"
+policy:
+  allow_implicit_invocation: true
