@@ -20,9 +20,10 @@ final class App: NSObject, NSApplicationDelegate {
   window=NSWindow(contentRect:NSRect(x:0,y:0,width:680,height:480),styleMask:[.titled,.closable,.miniaturizable],backing:.buffered,defer:false);window.title="邻控";window.center();window.contentView=content()
   status=NSStatusBar.system.statusItem(withLength:NSStatusItem.variableLength);status.button?.title="邻控"
   let menu=NSMenu();menu.addItem(withTitle:"打开邻控",action:#selector(show),keyEquivalent:"").target=self;menu.addItem(withTitle:"刷新设备",action:#selector(connect),keyEquivalent:"").target=self;menu.addItem(withTitle:"断开后台连接",action:#selector(disconnect),keyEquivalent:"").target=self;menu.addItem(.separator());menu.addItem(withTitle:"退出面板（后台保持在线）",action:#selector(quit),keyEquivalent:"q").target=self;status.menu=menu
-  window.makeKeyAndOrderFront(nil);connect();timer=Timer.scheduledTimer(withTimeInterval:10,repeats:true){[weak self] _ in self?.check()}
+  if !ProcessInfo.processInfo.arguments.contains("--background"){window.makeKeyAndOrderFront(nil)};connect();timer=Timer.scheduledTimer(withTimeInterval:10,repeats:true){[weak self] _ in self?.check()}
  }
  func service(_ command:String){DispatchQueue.global().async{let p=Process();p.executableURL=URL(fileURLWithPath:self.executable);p.arguments=[command];p.standardOutput=Pipe();p.standardError=Pipe();do{try p.run();p.waitUntilExit()}catch{};DispatchQueue.main.async{self.check()}}}
+ func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool{if !flag{show()};return true}
  @objc func connect(){service("service-start")}
  @objc func disconnect(){service("service-stop")}
  @objc func show(){window.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true)}
