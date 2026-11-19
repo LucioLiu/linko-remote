@@ -8,7 +8,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
  var codeHint=NSTextField(labelWithString:"生成后，在 Windows 邻控中输入即可连接")
  var generateButton:NSButton!;var copyCodeButton:NSButton!;var expires:TimeInterval=0;var currentCode="";var clipboardCode=""
  var devices=[[String:Any]]();var sshItems=[[String:Any]]();var rows=[[String:Any]]()
- var localName:String {get{UserDefaults.standard.string(forKey:"computerName") ?? "我的 Mac"} set{UserDefaults.standard.set(newValue,forKey:"computerName")}}
+ var localName:String {get{UserDefaults.standard.string(forKey:"computerName") ?? "这台电脑"} set{UserDefaults.standard.set(newValue,forKey:"computerName")}}
  let executable=Bundle.main.path(forResource:"lanpilot",ofType:nil)!
  func label(_ text:String,_ size:CGFloat,_ bold:Bool,_ rect:NSRect,_ parent:NSView)->NSTextField {
   let l=NSTextField(labelWithString:text);l.font = .systemFont(ofSize:size,weight:bold ? .semibold : .regular);l.frame=rect;parent.addSubview(l);return l
@@ -32,7 +32,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
   let desc=label("macOS · 后台连接 Windows\n不同 Wi-Fi 也可连接",12,false,NSRect(x:20,y:17,width:240,height:43),local);desc.maximumNumberOfLines=2;desc.textColor = .secondaryLabelColor
   let pairing=card(NSRect(x:324,y:409,width:528,height:198),v)
   _=label("用验证码添加电脑",17,true,NSRect(x:20,y:155,width:310,height:26),pairing)
-  pairName=NSTextField(frame:NSRect(x:20,y:116,width:324,height:27));pairName.placeholderString="给对方取个名字，例如：深圳办公室";pairing.addSubview(pairName)
+  pairName=NSTextField(frame:NSRect(x:20,y:116,width:324,height:27));pairName.placeholderString="给对方取个名字，例如：办公室电脑";pairing.addSubview(pairName)
   generateButton=button("生成验证码",#selector(generateCode),NSRect(x:356,y:113,width:150,height:32),pairing)
   codeLabel=label("••••  ••••  ••••",27,true,NSRect(x:20,y:64,width:355,height:39),pairing);codeLabel.font = .monospacedDigitSystemFont(ofSize:27,weight:.semibold);codeLabel.isSelectable=true
   copyCodeButton=button("复制连接码",#selector(copyCode),NSRect(x:377,y:67,width:127,height:30),pairing);copyCodeButton.isEnabled=false
@@ -83,7 +83,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
  }
  @objc func generateCode(){
   let name=pairName.stringValue.trimmingCharacters(in:.whitespacesAndNewlines)
-  guard !name.isEmpty else{notice("为对方电脑取个名字","例如：深圳办公室。以后也可以修改。");return}
+  guard !name.isEmpty else{notice("为对方电脑取个名字","例如：办公室电脑。以后也可以修改。");return}
   generateButton.isEnabled=false;generateButton.title="正在生成…";currentCode="";copyCodeButton.isEnabled=false;codeLabel.stringValue="正在准备…"
   run(["pair-code",name]){r in
    self.generateButton.isEnabled=true;self.generateButton.title="刷新验证码"
@@ -109,7 +109,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
  @objc func addSSH(){
   let a=NSAlert();a.messageText="添加 SSH 连接";a.informativeText="连接已开启 SSH 的电脑或服务器。可使用 ~/.ssh/config 中的主机别名。"
   let box=NSView(frame:NSRect(x:0,y:0,width:340,height:164));var fields=[NSTextField]()
-  for (i,text) in ["名称，例如：深圳服务器","主机 IP / 域名 / SSH 别名","用户名，留空沿用 SSH 配置","端口，默认 22"].enumerated(){let f=NSTextField(frame:NSRect(x:0,y:CGFloat(126-i*40),width:340,height:27));f.placeholderString=text;box.addSubview(f);fields.append(f)}
+  for (i,text) in ["名称，例如：示例服务器","主机 IP / 域名 / SSH 别名","用户名，留空沿用 SSH 配置","端口，默认 22"].enumerated(){let f=NSTextField(frame:NSRect(x:0,y:CGFloat(126-i*40),width:340,height:27));f.placeholderString=text;box.addSubview(f);fields.append(f)}
   a.accessoryView=box;a.addButton(withTitle:"保存连接");a.addButton(withTitle:"取消");guard a.runModal() == .alertFirstButtonReturn else{return}
   run(["ssh-add",fields[0].stringValue,fields[1].stringValue,"--user",fields[2].stringValue,"--port",fields[3].stringValue.isEmpty ? "22" : fields[3].stringValue]){r in if case .failure(let e)=r{self.notice("保存失败",e.localizedDescription)};self.check()}
  }
@@ -238,9 +238,9 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
 let app=NSApplication.shared;let delegate=App()
 if let i=CommandLine.arguments.firstIndex(of:"--preview"),CommandLine.arguments.count>i+1 {
  app.setActivationPolicy(.prohibited);let view=delegate.content()
- delegate.devices=[["id":"example001","name":"深圳办公室","online":true],["id":"example002","name":"家里的电脑","online":false]]
- delegate.sshItems=[["id":"example003","name":"深圳服务器","host":"server.example.com","user":"admin","port":22]];delegate.filterRows()
- delegate.pairName.stringValue="深圳办公室";delegate.codeLabel.stringValue="1234  5678  9012";delegate.codeHint.stringValue="示例验证码 · 10 分钟有效";delegate.summary.stringValue="界面示例 · 设备和验证码均为演示数据"
+ delegate.devices=[["id":"example001","name":"办公室电脑","online":true],["id":"example002","name":"家里的电脑","online":false]]
+ delegate.sshItems=[["id":"example003","name":"示例服务器","host":"server.example.com","user":"admin","port":22]];delegate.filterRows()
+ delegate.pairName.stringValue="办公室电脑";delegate.codeLabel.stringValue="1234  5678  9012";delegate.codeHint.stringValue="示例验证码 · 10 分钟有效";delegate.summary.stringValue="界面示例 · 设备和验证码均为演示数据"
  view.layoutSubtreeIfNeeded();let rep=view.bitmapImageRepForCachingDisplay(in:view.bounds)!;view.cacheDisplay(in:view.bounds,to:rep)
  try rep.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:CommandLine.arguments[i+1]))
 }else{app.delegate=delegate;app.run()}

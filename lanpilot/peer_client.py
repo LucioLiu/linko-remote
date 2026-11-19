@@ -1,0 +1,533 @@
+"""One cross-platform desktop client: both session initiator and desktop agent."""
+import base64
+import hashlib
+import hmac
+import http.client
+import http.server
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+from urllib.parse import urlsplit
+import uuid
+import webbrowser
+
+from desktop import make_request
+from .peer_hub import display_name
+
+ROOT = Path(__file__).resolve().parents[1]
+ASSETS = ROOT / 'ui'
+MAX_BODY = 24_000_000
+
+
+class InstanceLock:
+    def __init__(self, home):
+        self.path = Path(home) / 'app.lock'
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.file = None
+
+    def acquire(self):
+        self.file = self.path.open('a+b')
+        try:
+            if sys.platform == 'win32':
+                import msvcrt
+                self.file.seek(0)
+                if not self.file.read(1):
+                    self.file.write(b'0')
+                    self.file.flush()
+                self.file.seek(0)
+                msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            self.file.close()
+            self.file = None
+            return False
+
+    def close(self):
+        if self.file:
+            self.file.close()
+            self.file = None
+
+
+def atomic_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(value, stream, ensure_ascii=False, separators=(',', ':'))
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class PinnedConnection(http.client.HTTPSConnection):
+    def __init__(self, host, port, pin):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        super().__init__(host, port, context=context, timeout=12)
+        self.pin = pin
+
+    def connect(self):
+        super().connect()
+        if not hmac.compare_digest(hashlib.sha256(self.sock.getpeercert(True)).hexdigest(), self.pin):
+            self.close()
+            raise PermissionError('连接服务证书不匹配，已停止连接')
+
+
+class PinnedHub:
+    def __init__(self, endpoint, credential):
+        parsed = urlsplit(endpoint['url'])
+        if parsed.scheme != 'https' or parsed.username or parsed.password or parsed.path not in ('', '/') or parsed.query or parsed.fragment or not parsed.hostname:
+            raise ValueError('连接服务地址必须是 HTTPS')
+        if not re.fullmatch('[a-f0-9]{64}', endpoint.get('pin', '')):
+            raise ValueError('缺少连接服务的证书指纹')
+        self.host, self.port, self.pin = parsed.hostname, parsed.port or 443, endpoint['pin']
+        self.credential = credential
+        self.lock = threading.Lock()
+        self.connection = None
+        self.last_response = 0
+
+    def call(self, operation, body=None):
+        with self.lock:
+            try:
+                # The gateway bounds idle sockets to 30 seconds. Retire a
+                # locally idle socket before writing, never replay after send.
+                if self.connection and time.monotonic() - self.last_response >= 20:
+                    self.connection.close()
+                    self.connection = None
+                if self.connection is None:
+                    self.connection = PinnedConnection(self.host, self.port, self.pin)
+                payload = json.dumps(body or {}, ensure_ascii=False, separators=(',', ':')).encode()
+                self.connection.request('POST', '/v2/' + operation, payload,
+                                        {'Authorization': 'Bearer ' + self.credential, 'Content-Type': 'application/json'})
+                response = self.connection.getresponse()
+                raw = response.read(MAX_BODY + 1)
+                if len(raw) > MAX_BODY:
+                    raise ValueError('连接服务响应过大')
+                answer = json.loads(raw)
+                if response.status != 200 or not answer.get('ok'):
+                    raise PermissionError(answer.get('error', '连接请求未完成'))
+                self.last_response = time.monotonic()
+                return answer['value']
+            except BaseException:
+                if self.connection:
+                    self.connection.close()
+                    self.connection = None
+                # A lost response never causes an action to be submitted again.
+                raise
+
+
+class MailboxAgent:
+    def __init__(self, home):
+        self.home = Path(home)
+        self.workspace = self.home / 'worker'
+        self.workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.process = None
+        self.stop_path = self.workspace / 'stop'
+
+    def permissions(self):
+        if sys.platform == 'darwin':
+            helper = ROOT / 'native/LinkoDesktop'
+            result = subprocess.run([str(helper), '--permissions'], capture_output=True, timeout=8)
+            return json.loads(result.stdout)
+        return {'screen': True, 'input': True, 'platform': 'windows'}
+
+    def start(self):
+        if self.process and self.process.poll() is None:
+            return
+        self.stop_path.unlink(missing_ok=True)
+        if sys.platform == 'darwin':
+            permissions = self.permissions()
+            if not permissions.get('screen') or not permissions.get('input'):
+                raise PermissionError('请先在 macOS 系统设置中允许邻控录屏和辅助功能')
+            helper = ROOT / 'native/LinkoDesktop'
+            command = [str(helper), '--workspace', str(self.workspace)]
+            options = {}
+        else:
+            command = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                       str(ROOT / 'windows/Start-Desktop.ps1'), '-AllowInput', '-TargetGuard',
+                       '-Workspace', str(self.workspace), '-StopFile', str(self.stop_path)]
+            options = {'creationflags': subprocess.CREATE_NO_WINDOW}
+        self.process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options)
+
+    def stop(self):
+        self.stop_path.write_text('stop')
+        # The worker checks this immediately before sending any input. Pending
+        # durable results remain available to the receipt pump on next launch.
+
+    def execute(self, command, elapsed=0):
+        identifier = command['id']
+        if not re.fullmatch('[a-f0-9]{32}', identifier):
+            raise ValueError('无效操作编号')
+        response = self.workspace / (identifier + '.response.json')
+        if response.exists():
+            return json.loads(response.read_text(encoding='utf-8-sig'))
+        lifetime = command['valid_for_ms'] / 1000 - elapsed
+        if lifetime <= 0:
+            return {'ok': False, 'input_attempted': False, 'request_id': identifier, 'error': 'REQUEST_EXPIRED_IN_TRANSIT'}
+        if self.stop_path.exists() or not self.process or self.process.poll() is not None:
+            return {'ok': False, 'input_attempted': False, 'request_id': identifier, 'error': 'LOCAL_CONTROL_NOT_ENABLED'}
+        request = dict(command['request'], expires=int(time.time() + min(45, lifetime)))
+        path = self.workspace / (identifier + '.request.json')
+        # Publish exactly once. A duplicate transport delivery cannot repeat input.
+        marker = self.workspace / (identifier + '.accepted')
+        try:
+            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+        except FileExistsError:
+            if response.exists():
+                return json.loads(response.read_text(encoding='utf-8-sig'))
+            return None
+        atomic_json(path, request)
+        return None
+
+
+class DesktopClient:
+    def __init__(self, home, endpoint, hub_factory=PinnedHub, agent_factory=MailboxAgent):
+        self.home = Path(home)
+        self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.platform = 'macos' if sys.platform == 'darwin' else 'windows'
+        self.path = self.home / 'client.json'
+        if self.path.exists():
+            self.config = json.loads(self.path.read_text())
+        else:
+            credential = secrets.token_urlsafe(32)
+            # Never import the developer's or the current user's OS hostname.
+            label = 'Mac 电脑' if self.platform == 'macos' else 'Windows 电脑'
+            self.config = {'credential': credential,
+                           'name': label + ' ' + hashlib.sha256(credential.encode()).hexdigest()[:4],
+                           'endpoint': endpoint, 'ssh': []}
+            atomic_json(self.path, self.config)
+        self.agent_hub = hub_factory(self.config['endpoint'], self.config['credential'])
+        self.ui_hub = hub_factory(self.config['endpoint'], self.config['credential'])
+        self.agent = agent_factory(self.home)
+        self.stop_event = threading.Event()
+        self.lock = threading.RLock()
+        self.incoming = False
+        self.connected = False
+        self.error = ''
+        self.state = {'self': {'name': self.config['name'], 'platform': self.platform},
+                      'incoming': False, 'peers': [], 'approvals': [], 'outgoing': []}
+        self.permissions = {'screen': False, 'input': False}
+        self.pending_path = self.home / 'pending.json'
+        self.pending = json.loads(self.pending_path.read_text()) if self.pending_path.exists() else {}
+
+    def start(self):
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        registered = False
+        while not self.stop_event.is_set():
+            try:
+                if not registered:
+                    self.agent_hub.call('register', {'name': self.config['name'], 'platform': self.platform})
+                    # A restarted application requires a new local decision;
+                    # a previous session grant must not silently reopen access.
+                    self.agent_hub.call('availability', {'enabled': False})
+                    registered = True
+                self.permissions = self.agent.permissions()
+                workspace = self.agent.workspace
+                outbox = workspace / 'hub-outbox.json'
+                if outbox.exists():
+                    receipt = json.loads(outbox.read_text(encoding='utf-8-sig'))
+                    self.agent_hub.call('result', receipt)
+                    outbox.unlink()
+                else:
+                    delivery = workspace / 'delivery.json'
+                    if delivery.exists():
+                        command = json.loads(delivery.read_text())
+                        response = workspace / (command['id'] + '.response.json')
+                        if response.exists():
+                            receipt = {'id': command['id'], 'result': json.loads(response.read_text(encoding='utf-8-sig'))}
+                            atomic_json(outbox, receipt)
+                            delivery.unlink()
+                    else:
+                        started = time.monotonic()
+                        command = self.agent_hub.call('poll')
+                        if command:
+                            atomic_json(delivery, command)
+                            result = self.agent.execute(command, time.monotonic() - started)
+                            if result is not None:
+                                atomic_json(outbox, {'id': command['id'], 'result': result})
+                                delivery.unlink()
+                value = self.agent_hub.call('state')
+                with self.lock:
+                    self.state = value
+                    self.connected = True
+                    self.error = ''
+            except Exception as error:
+                with self.lock:
+                    self.connected = False
+                    self.error = str(error)[:250]
+            self.stop_event.wait(1)
+
+    def local_state(self):
+        with self.lock:
+            value = dict(self.state)
+            value.update(version='0.8.0-unified-preview', connected=self.connected, error=self.error,
+                         permissions=self.permissions, ssh=self.config['ssh'], pending=self.pending)
+            return value
+
+    def api(self, operation, body):
+        if operation == 'state':
+            return self.local_state()
+        if operation == 'availability':
+            enabled = body.get('enabled')
+            if type(enabled) is not bool:
+                raise ValueError('请明确选择是否允许连接')
+            if enabled:
+                self.agent.start()
+            else:
+                self.agent.stop()
+            value = self.ui_hub.call(operation, {'enabled': enabled})
+            self.incoming = enabled
+            return value
+        if operation == 'name':
+            name = display_name(body.get('name'))
+            value = self.ui_hub.call(operation, {'name': name})
+            self.config['name'] = name
+            atomic_json(self.path, self.config)
+            return value
+        if operation in ('code', 'connect', 'access', 'approve', 'disconnect'):
+            if operation == 'connect':
+                code = body.get('code', '')
+                if isinstance(code, str) and code.startswith('linko2:'):
+                    try:
+                        encoded = code[7:]
+                        if len(encoded) > 2000:
+                            raise ValueError()
+                        decoded = json.loads(base64.urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
+                        if decoded['v'] != 2 or decoded['url'].rstrip('/') != self.config['endpoint']['url'].rstrip('/') or not hmac.compare_digest(decoded['pin'], self.config['endpoint']['pin']):
+                            raise ValueError()
+                        code = decoded['code']
+                    except (KeyError, ValueError, TypeError):
+                        raise ValueError('连接码无效，或两台电脑使用了不同的连接服务')
+                elif isinstance(code, str):
+                    code = re.sub(r'[\s-]', '', code)
+                body = {'code': code}
+            if operation == 'approve' and body.get('allow'):
+                self.agent.start()
+            value = self.ui_hub.call(operation, body)
+            if operation == 'code':
+                encoded = dict(v=2, **self.config['endpoint'], code=value['code'])
+                value['connection'] = 'linko2:' + base64.urlsafe_b64encode(json.dumps(encoded).encode()).decode().rstrip('=')
+            return value
+        if operation == 'remote':
+            peer = body.get('peer')
+            with self.lock:
+                if peer in self.pending:
+                    raise ValueError('此电脑上一操作未确认，请先查询原结果')
+                raw = body.get('request', {})
+                request = make_request(raw.get('action'), **{k: v for k, v in raw.items() if k not in ('action', 'expires')})
+                request.pop('expires')
+                identifier = uuid.uuid4().hex
+                self.pending[peer] = identifier
+                atomic_json(self.pending_path, self.pending)
+            try:
+                self.ui_hub.call('submit', {'peer': peer, 'id': identifier, 'request': request})
+            except Exception:
+                return {'id': identifier, 'state': 'unconfirmed', 'result': None}
+            return self.recover(identifier)
+        if operation == 'recover':
+            return self.recover(body.get('id'))
+        if operation == 'ssh-save':
+            return self.save_ssh(body)
+        if operation == 'ssh-open':
+            return self.open_ssh(body.get('id'))
+        if operation == 'permissions':
+            if sys.platform == 'darwin':
+                pages = {'screen': 'Privacy_ScreenCapture', 'input': 'Privacy_Accessibility'}
+                if body.get('kind') not in pages:
+                    raise ValueError('权限类型无效')
+                helper = ROOT / 'native/LinkoDesktop'
+                subprocess.Popen([str(helper), '--request-' + body['kind']], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(['/usr/bin/open', 'x-apple.systempreferences:com.apple.preference.security?' + pages[body['kind']]], check=True)
+            return {'opened': sys.platform == 'darwin'}
+        raise ValueError('不支持的操作')
+
+    def recover(self, identifier):
+        if not isinstance(identifier, str) or not re.fullmatch('[a-f0-9]{32}', identifier):
+            raise ValueError('无效操作编号')
+        result = self.ui_hub.call('recover', {'id': identifier})
+        if result['state'] == 'complete':
+            with self.lock:
+                self.pending = {key: value for key, value in self.pending.items() if value != identifier}
+                atomic_json(self.pending_path, self.pending)
+        return result
+
+    def save_ssh(self, body):
+        name = display_name(body.get('name'))
+        host, user = body.get('host', '').strip(), body.get('user', '').strip()
+        port = int(body.get('port') or 22)
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.:-]{0,252}', host) or (user and not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}', user)) or not 1 <= port <= 65535:
+            raise ValueError('SSH 地址、用户名或端口无效')
+        item = dict(id=uuid.uuid4().hex[:12], name=name, host=host, user=user, port=port)
+        with self.lock:
+            self.config['ssh'].append(item)
+            atomic_json(self.path, self.config)
+        return item
+
+    def open_ssh(self, identifier):
+        item = next((x for x in self.config['ssh'] if x['id'] == identifier), None)
+        if item is None:
+            raise ValueError('找不到 SSH 连接')
+        args = ['ssh', '-p', str(item['port'])]
+        if item['user']:
+            args += ['-l', item['user']]
+        args += ['--', item['host']]
+        if sys.platform == 'darwin':
+            path = self.home / ('ssh-' + identifier + '.command')
+            path.write_text('#!/bin/sh\nexec ' + shlex.join(args) + '\n')
+            path.chmod(0o700)
+            subprocess.Popen(['/usr/bin/open', '-a', 'Terminal', str(path)])
+        else:
+            subprocess.Popen(['cmd.exe', '/d', '/c', 'start', '', 'ssh.exe', *args[1:]])
+        return {'opened': True}
+
+    def close(self):
+        self.agent.stop()
+        self.stop_event.set()
+        try:
+            self.ui_hub.call('availability', {'enabled': False})
+        except Exception:
+            pass
+
+
+class LocalHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *args):
+        pass
+
+    def respond(self, status, body, mime='application/json; charset=utf-8'):
+        self.send_response(status)
+        self.send_header('Content-Type', mime)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def valid_host(self):
+        return self.headers.get_all('Host', []) == [self.server.authority]
+
+    def do_GET(self):
+        if not self.valid_host():
+            return self.respond(403, b'{}')
+        files = {'/': ('index.html', 'text/html; charset=utf-8'), '/app.js': ('app.js', 'application/javascript; charset=utf-8'), '/style.css': ('style.css', 'text/css; charset=utf-8')}
+        if self.path not in files:
+            return self.respond(404, b'{}')
+        name, mime = files[self.path]
+        return self.respond(200, (ASSETS / name).read_bytes(), mime)
+
+    def do_POST(self):
+        if not self.valid_host() or self.headers.get('Origin') not in (None, 'http://' + self.server.authority) or not hmac.compare_digest(self.headers.get('X-Linko-Session', ''), self.server.nonce):
+            self.close_connection = True
+            return self.respond(403, b'{}')
+        lengths = self.headers.get_all('Content-Length', [])
+        if len(lengths) != 1 or not lengths[0].isdigit() or not 0 < int(lengths[0]) <= 16000 or self.headers.get('Transfer-Encoding'):
+            self.close_connection = True
+            return self.respond(400, b'{}')
+        try:
+            body = json.loads(self.rfile.read(int(lengths[0])))
+            if not isinstance(body, dict) or not re.fullmatch('/api/[a-z-]+', self.path):
+                raise ValueError('无效请求')
+            if self.path == '/api/shutdown':
+                self.respond(200, b'{"ok":true,"value":{"stopped":true}}')
+                self.server.client.agent.stop()
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
+            value = self.server.client.api(self.path[5:], body)
+            data = json.dumps({'ok': True, 'value': value}, ensure_ascii=False, separators=(',', ':')).encode()
+            self.respond(200, data)
+        except Exception as error:
+            self.respond(400, json.dumps({'ok': False, 'error': str(error)[:250]}, ensure_ascii=False).encode())
+
+
+def run(home, endpoint, open_browser=False):
+    client = DesktopClient(home, endpoint)
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), LocalHandler)
+    server.daemon_threads = True
+    server.client = client
+    server.authority = '127.0.0.1:' + str(server.server_port)
+    server.nonce = secrets.token_urlsafe(32)
+    url = 'http://' + server.authority + '/#' + server.nonce
+    atomic_json(Path(home) / 'shell-session.json', {'url': url, 'pid': os.getpid()})
+    if sys.stdout is not None:
+        print(json.dumps({'url': url}), flush=True)
+    client.start()
+    def terminate(*_):
+        client.agent.stop()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+    for event in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(event, terminate)
+    if open_browser:
+        if sys.platform == 'win32':
+            edge = Path(os.environ.get('PROGRAMFILES(X86)', 'C:/Program Files (x86)')) / 'Microsoft/Edge/Application/msedge.exe'
+            if edge.exists():
+                subprocess.Popen([str(edge), '--app=' + url, '--user-data-dir=' + str(Path(home) / 'webview-profile')])
+            else:
+                webbrowser.open(url)
+        else:
+            webbrowser.open(url)
+    try:
+        server.serve_forever(poll_interval=0.3)
+    finally:
+        client.close()
+        server.server_close()
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--home', type=Path)
+    parser.add_argument('--endpoint', type=Path, default=ROOT / 'peer-endpoint.json')
+    parser.add_argument('--open-browser', action='store_true')
+    args = parser.parse_args()
+    home = args.home or ((Path(os.environ['LOCALAPPDATA']) / 'LinkoRemote') if sys.platform == 'win32' else Path.home() / 'Library/Application Support/LinkoRemote')
+    endpoint = json.loads(args.endpoint.read_text())
+    lock = InstanceLock(home)
+    if not lock.acquire():
+        session = json.loads((home / 'shell-session.json').read_text())
+        url = session['url']
+        parsed = urlsplit(url)
+        if parsed.scheme != 'http' or parsed.hostname != '127.0.0.1' or not parsed.port or not re.fullmatch('[A-Za-z0-9_-]{40,90}', parsed.fragment):
+            raise ValueError('本机邻控会话无效')
+        check = http.client.HTTPConnection('127.0.0.1', parsed.port, timeout=3)
+        try:
+            check.request('POST', '/api/state', '{}', {'X-Linko-Session': parsed.fragment})
+            response = check.getresponse()
+            if response.status != 200:
+                raise ValueError('本机邻控服务尚未就绪')
+            response.read()
+        finally:
+            check.close()
+        if sys.stdout is not None:
+            print(json.dumps({'url': url}), flush=True)
+        if args.open_browser:
+            webbrowser.open(url)
+        return
+    try:
+        run(home, endpoint, args.open_browser)
+    finally:
+        lock.close()
+
+
+if __name__ == '__main__':
+    main()

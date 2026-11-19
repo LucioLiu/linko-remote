@@ -273,7 +273,8 @@ public static class RemoteDesktop {
    Check(); var b=Bounds(); if(b[2]<=0 || b[3]<=0 || (long)b[2]*b[3]>50000000) throw new Exception("DISPLAY_SIZE_UNSUPPORTED");
    using(var bitmap=new Bitmap(b[2],b[3])) {using(var g=Graphics.FromImage(bitmap)) {g.CopyFromScreen(b[0],b[1],0,0,new Size(b[2],b[3]));} using(var s=new MemoryStream()) {bitmap.Save(s,ImageFormat.Png); return s.ToArray();}}
  }
- static void Send(INPUT[] a) {Check();CheckInputAccess(); if(SendInput((uint)a.Length,a,Marshal.SizeOf(typeof(INPUT)))!=a.Length) throw new Exception("INPUT_NOT_CONFIRMED_POSSIBLE_UIPI_DO_NOT_RETRY");}
+ public static string InputStopFile;
+ static void Send(INPUT[] a) {if(!String.IsNullOrEmpty(InputStopFile)&&File.Exists(InputStopFile))throw new Exception("WORKER_STOPPING_BEFORE_INPUT");Check();CheckInputAccess(); if(SendInput((uint)a.Length,a,Marshal.SizeOf(typeof(INPUT)))!=a.Length) throw new Exception("INPUT_NOT_CONFIRMED_POSSIBLE_UIPI_DO_NOT_RETRY");}
  static INPUT Mouse(int x,int y,uint flags,uint data) {var i=new INPUT();i.type=0;i.u.mouse=new MOUSE{x=x,y=y,flags=flags,data=data};return i;}
  static INPUT Key(ushort vk,ushort scan,uint flags) {var i=new INPUT();i.type=1;i.u.key=new KEY{vk=vk,scan=scan,flags=flags};return i;}
  public static void Move(int x,int y) {var b=Bounds();if(x<0||y<0||x>=b[2]||y>=b[3]) throw new Exception("OUT_OF_FRAME"); Send(new[]{Mouse((int)Math.Round(x*65535.0/Math.Max(1,b[2]-1)),(int)Math.Round(y*65535.0/Math.Max(1,b[3]-1)),0xC001,0)});

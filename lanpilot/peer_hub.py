@@ -1,0 +1,287 @@
+"""Symmetric client directory and durable command receipts.
+
+Every client can request a session and locally approve incoming sessions. A
+pairing establishes a contact, never an implicit reverse control permission.
+The gateway transports this API only over pinned TLS; device credentials stay
+out of the UI and are stored as hashes at the hub.
+"""
+import hashlib
+import hmac
+import json
+import re
+import secrets
+import sqlite3
+import threading
+import time
+import uuid
+from pathlib import Path
+
+from desktop import make_request
+
+
+def digest(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def display_name(value):
+    if not isinstance(value, str):
+        raise ValueError('请输入电脑名称')
+    value = value.strip()
+    if not 1 <= len(value) <= 100 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError('电脑名称应为 1–100 个字符')
+    return value
+
+
+class PeerHub:
+    def __init__(self, path, clock=time.time):
+        self.clock = clock
+        self.lock = threading.RLock()
+        path = Path(path)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        path.chmod(0o600)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript('''
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS devices (
+          id TEXT PRIMARY KEY, credential TEXT UNIQUE, name TEXT, platform TEXT,
+          seen REAL, incoming INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS codes (hash TEXT PRIMARY KEY, owner TEXT, expires REAL);
+        CREATE TABLE IF NOT EXISTS approvals (
+          id TEXT PRIMARY KEY, caller TEXT, target TEXT, expires REAL, state TEXT,
+          created REAL);
+        CREATE TABLE IF NOT EXISTS contacts (a TEXT, b TEXT, PRIMARY KEY(a,b));
+        CREATE TABLE IF NOT EXISTS grants (
+          caller TEXT, target TEXT, expires REAL, PRIMARY KEY(caller,target));
+        CREATE TABLE IF NOT EXISTS commands (
+          id TEXT PRIMARY KEY, caller TEXT, target TEXT, payload TEXT, expires REAL,
+          delivered INTEGER DEFAULT 0, result TEXT, created REAL);
+        CREATE TABLE IF NOT EXISTS attempts (source TEXT, operation TEXT, at REAL);
+        ''')
+
+    def close(self):
+        self.db.close()
+
+    def _one(self, sql, args=()):
+        return self.db.execute(sql, args).fetchone()
+
+    def _rate(self, source, operation, maximum):
+        now = self.clock()
+        self.db.execute('DELETE FROM attempts WHERE at < ?', (now - 60,))
+        count = self._one('SELECT COUNT(*) n FROM attempts WHERE source=? AND operation=?',
+                          (digest(source), operation))['n']
+        if count >= maximum:
+            raise PermissionError('请求过于频繁，请稍候再试')
+        self.db.execute('INSERT INTO attempts VALUES(?,?,?)', (digest(source), operation, now))
+
+    def _device(self, credential):
+        if not isinstance(credential, str) or not re.fullmatch(r'[A-Za-z0-9_-]{40,90}', credential):
+            raise PermissionError('身份验证失败')
+        row = self._one('SELECT * FROM devices WHERE credential=?', (digest(credential),))
+        if row is None:
+            raise PermissionError('身份验证失败')
+        return row
+
+    def _identity(self, row):
+        return {k: row[k] for k in ('id', 'name', 'platform')}
+
+    def _approval(self, row):
+        result = dict(row)
+        result['peer'] = self._identity(self._one('SELECT * FROM devices WHERE id=?', (row['caller'],)))
+        return result
+
+    def dispatch(self, operation, credential, body, source='local'):
+        if not isinstance(body, dict):
+            raise ValueError('无效的请求')
+        with self.lock:
+            # Failed guesses count too. Commit rate accounting before opening
+            # the operation transaction, which may legitimately roll back.
+            if operation == 'register':
+                self._rate(source, operation, 20)
+            elif operation in ('connect', 'access'):
+                self._rate(source, 'connect-source', 60)
+                self._rate(str(credential), 'connect-client', 10)
+            self.db.execute('BEGIN IMMEDIATE')
+            try:
+                result = self._dispatch(operation, credential, body, source)
+                self.db.execute('COMMIT')
+                return result
+            except BaseException:
+                self.db.execute('ROLLBACK')
+                raise
+
+    def _dispatch(self, operation, credential, body, source):
+        now = self.clock()
+        if operation == 'register':
+            if not isinstance(credential, str) or not re.fullmatch(r'[A-Za-z0-9_-]{40,90}', credential):
+                raise PermissionError('身份验证失败')
+            name = display_name(body.get('name'))
+            platform = body.get('platform')
+            if platform not in ('macos', 'windows'):
+                raise ValueError('不支持的系统')
+            identifier = digest(credential)[:12]
+            existing = self._one('SELECT * FROM devices WHERE id=?', (identifier,))
+            if existing and not hmac.compare_digest(existing['credential'], digest(credential)):
+                raise PermissionError('设备身份冲突')
+            if existing and existing['platform'] != platform:
+                raise PermissionError('设备系统身份不可更换')
+            self.db.execute('INSERT INTO devices VALUES(?,?,?,?,?,0) '
+                            'ON CONFLICT(id) DO UPDATE SET name=excluded.name,seen=excluded.seen',
+                            (identifier, digest(credential), name, platform, now))
+            return {'id': identifier, 'name': name, 'platform': platform}
+        device = self._device(credential)
+        me = device['id']
+        self.db.execute('UPDATE devices SET seen=? WHERE id=?', (now, me))
+        if operation == 'name':
+            name = display_name(body.get('name'))
+            self.db.execute('UPDATE devices SET name=? WHERE id=?', (name, me))
+            return {'name': name}
+        if operation == 'availability':
+            if type(body.get('enabled')) is not bool:
+                raise ValueError('请明确选择是否允许连接')
+            self.db.execute('UPDATE devices SET incoming=? WHERE id=?', (body['enabled'], me))
+            if not body['enabled']:
+                self.db.execute('DELETE FROM grants WHERE target=?', (me,))
+                self.db.execute('DELETE FROM codes WHERE owner=?', (me,))
+                self.db.execute("UPDATE approvals SET state='denied' WHERE target=? AND state='pending'", (me,))
+            return {'incoming': body['enabled']}
+        if operation == 'code':
+            if not device['incoming']:
+                raise PermissionError('请先允许其他电脑连接本机')
+            self.db.execute('DELETE FROM codes WHERE owner=? OR expires<?', (me, now))
+            while True:
+                code = ''.join(str(secrets.randbelow(10)) for _ in range(12))
+                if not self._one('SELECT hash FROM codes WHERE hash=?', (digest(code),)):
+                    break
+            self.db.execute('INSERT INTO codes VALUES(?,?,?)', (digest(code), me, now + 600))
+            return {'code': code, 'expires': now + 600}
+        if operation in ('connect', 'access'):
+            if operation == 'connect':
+                code = body.get('code', '')
+                if not isinstance(code, str) or not re.fullmatch(r'\d{12}', code):
+                    raise PermissionError('验证码无效或已过期')
+                record = self._one('SELECT * FROM codes WHERE hash=? AND expires>?', (digest(code), now))
+                if record is None:
+                    raise PermissionError('验证码无效或已过期')
+                target = record['owner']
+            else:
+                target = body.get('peer')
+                if not self._one('SELECT * FROM contacts WHERE a=? AND b=?', tuple(sorted((me, str(target))))):
+                    raise PermissionError('请先使用验证码添加此电脑')
+            peer = self._one('SELECT * FROM devices WHERE id=?', (target,))
+            if target == me or not peer or not peer['incoming']:
+                raise PermissionError('对方未允许连接')
+            pending = self._one("SELECT * FROM approvals WHERE caller=? AND target=? AND state='pending' AND expires>?",
+                                (me, target, now))
+            if pending:
+                return {'approval': pending['id'], 'state': 'pending'}
+            identifier = uuid.uuid4().hex
+            self.db.execute('INSERT INTO approvals VALUES(?,?,?,?,?,?)',
+                            (identifier, me, target, now + 120, 'pending', now))
+            if operation == 'connect':
+                self.db.execute('DELETE FROM codes WHERE hash=?', (digest(body['code']),))
+            return {'approval': identifier, 'state': 'pending', 'peer': self._identity(peer)}
+        if operation == 'approve':
+            row = self._one("SELECT * FROM approvals WHERE id=? AND target=? AND state='pending' AND expires>?",
+                            (body.get('approval'), me, now))
+            if row is None or type(body.get('allow')) is not bool:
+                raise PermissionError('此连接申请已失效')
+            allow = body['allow'] and bool(device['incoming'])
+            self.db.execute('UPDATE approvals SET state=? WHERE id=?',
+                            ('approved' if allow else 'denied', row['id']))
+            if allow:
+                self.db.execute('INSERT OR IGNORE INTO contacts VALUES(?,?)', tuple(sorted((me, row['caller']))))
+                self.db.execute('INSERT OR REPLACE INTO grants VALUES(?,?,?)', (row['caller'], me, now + 3600))
+            return {'state': 'approved' if allow else 'denied'}
+        if operation == 'disconnect':
+            peer = body.get('peer')
+            self.db.execute('DELETE FROM grants WHERE (caller=? AND target=?) OR (caller=? AND target=?)',
+                            (me, peer, peer, me))
+            return {'disconnected': True}
+        if operation == 'state':
+            peers = self.db.execute('SELECT d.* FROM devices d JOIN contacts c ON '
+                                   '(c.a=? AND c.b=d.id) OR (c.b=? AND c.a=d.id)', (me, me)).fetchall()
+            result = []
+            for peer in peers:
+                item = self._identity(peer)
+                item.update(online=now - peer['seen'] < 20,
+                            can_control=bool(self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND expires>?',
+                                                      (me, peer['id'], now))),
+                            incoming=bool(self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND expires>?',
+                                                   (peer['id'], me, now))))
+                result.append(item)
+            approvals = self.db.execute("SELECT * FROM approvals WHERE target=? AND state='pending' AND expires>?",
+                                        (me, now)).fetchall()
+            outgoing = self.db.execute('SELECT id,state,target FROM approvals WHERE caller=? AND expires>?', (me, now)).fetchall()
+            return {'self': self._identity(device), 'incoming': bool(device['incoming']), 'peers': result,
+                    'approvals': [self._approval(row) for row in approvals],
+                    'outgoing': [dict(row) for row in outgoing]}
+        if operation == 'poll':
+            self.db.execute('UPDATE devices SET seen=? WHERE id=?', (now, me))
+            commands = self.db.execute('SELECT * FROM commands WHERE target=? AND delivered=0 AND result IS NULL ORDER BY created', (me,)).fetchall()
+            for command in commands:
+                permitted = device['incoming'] and self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND expires>?',
+                                                            (command['caller'], me, now))
+                if command['expires'] <= now or not permitted:
+                    value = {'request_id': command['id'], 'ok': False, 'input_attempted': False,
+                             'error': 'EXPIRED_OR_ACCESS_REVOKED_BEFORE_DELIVERY'}
+                    self.db.execute('UPDATE commands SET result=? WHERE id=?', (json.dumps(value), command['id']))
+                    continue
+                self.db.execute('UPDATE commands SET delivered=1 WHERE id=?', (command['id'],))
+                return {'id': command['id'], 'request': json.loads(command['payload']),
+                        'valid_for_ms': max(1, int((command['expires'] - now) * 1000))}
+            return None
+        if operation == 'submit':
+            peer = body.get('peer')
+            identifier = body.get('id')
+            payload = body.get('request')
+            if not isinstance(identifier, str) or not re.fullmatch('[a-f0-9]{32}', identifier) or not isinstance(payload, dict):
+                raise ValueError('无效操作')
+            if payload.get('action') not in ('observe', 'status', 'click', 'doubleclick', 'text', 'key', 'scroll'):
+                raise PermissionError('本次连接仅允许取屏和键鼠操作')
+            request = make_request(payload.get('action'), **{k: v for k, v in payload.items() if k not in ('action', 'expires')})
+            request.pop('expires')
+            encoded = json.dumps(request, sort_keys=True, separators=(',', ':'))
+            prior = self._one('SELECT * FROM commands WHERE id=?', (identifier,))
+            if prior:
+                if prior['caller'] != me or prior['target'] != peer or prior['payload'] != encoded:
+                    raise PermissionError('操作编号冲突')
+                return {'id': identifier}
+            target = self._one('SELECT * FROM devices WHERE id=?', (peer,))
+            if not target or not target['incoming'] or not self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND expires>?', (me, peer, now)):
+                raise PermissionError('尚未取得对方授权')
+            if self._one('SELECT 1 FROM commands WHERE target=? AND result IS NULL', (peer,)):
+                raise ValueError('上一操作结果未确认，请先查询原结果')
+            self.db.execute('INSERT INTO commands VALUES(?,?,?,?,?,0,NULL,?)', (identifier, me, peer, encoded, now + 45, now))
+            return {'id': identifier}
+        if operation == 'result':
+            value = body.get('result')
+            identifier = body.get('id')
+            prior = self._one('SELECT * FROM commands WHERE id=? AND target=? AND delivered=1', (identifier, me))
+            if prior is None or not isinstance(value, dict) or value.get('request_id') != identifier or type(value.get('ok')) is not bool or type(value.get('input_attempted')) is not bool:
+                raise PermissionError('无效操作回执')
+            encoded = json.dumps(value, sort_keys=True, separators=(',', ':'))
+            if prior['result'] is not None and prior['result'] != encoded:
+                raise PermissionError('不能覆盖已经确认的回执')
+            self.db.execute('UPDATE commands SET result=? WHERE id=?', (encoded, identifier))
+            return {'saved': True}
+        if operation == 'recover':
+            identifier = body.get('id')
+            if not isinstance(identifier, str) or not re.fullmatch('[a-f0-9]{32}', identifier):
+                raise ValueError('无效操作编号')
+            row = self._one('SELECT * FROM commands WHERE id=?', (identifier,))
+            if row is None:
+                # A submission may still be in transit. Persist a tombstone
+                # before reporting non-execution, so that a late submission
+                # cannot subsequently execute under the same identifier.
+                receipt = {'ok': False, 'request_id': identifier, 'input_attempted': False,
+                           'error': 'REQUEST_NOT_ACCEPTED_CANCELLED'}
+                encoded = json.dumps(receipt, sort_keys=True, separators=(',', ':'))
+                self.db.execute('INSERT INTO commands VALUES(?,?,?,?,?,0,?,?)',
+                                (identifier, me, '', '{}', now, encoded, now))
+                return {'id': identifier, 'state': 'complete', 'result': receipt}
+            if row['caller'] != me:
+                raise PermissionError('找不到此操作')
+            return {'id': row['id'], 'state': 'complete' if row['result'] else 'unconfirmed',
+                    'result': json.loads(row['result']) if row['result'] else None}
+        raise ValueError('不支持的请求')

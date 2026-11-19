@@ -40,7 +40,7 @@ def make_request(action, **kwargs):
     if action == 'key' and (not isinstance(kwargs.get('keys'), list) or not 1 <= len(kwargs['keys']) <= 4):
         raise ValueError('Supply one to four key names')
     if action == 'key':
-        allowed={'CTRL','ALT','SHIFT','ENTER','TAB','ESC','BACKSPACE','DELETE','LEFT','UP','RIGHT','DOWN','HOME','END','PAGEUP','PAGEDOWN','SPACE','F4','F5'}
+        allowed={'CTRL','ALT','SHIFT','META','ENTER','TAB','ESC','BACKSPACE','DELETE','LEFT','UP','RIGHT','DOWN','HOME','END','PAGEUP','PAGEDOWN','SPACE','F4','F5'}
         if any(not isinstance(k,str) or (k not in allowed and not re.fullmatch('[A-Z0-9]',k)) for k in kwargs['keys']):
             raise ValueError('Unsupported key name')
     return dict(action=action, expires=int(time.time())+45, **kwargs)

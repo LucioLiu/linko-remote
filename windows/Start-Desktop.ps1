@@ -1,7 +1,7 @@
-param([switch]$AllowInput, [string]$RelayConfig, [switch]$TargetGuard, [switch]$Persistent, [switch]$LanDiscovery, [switch]$WanOnly, [Threading.ManualResetEvent]$StopEvent, [ValidatePattern('^[a-f0-9]{32}$')][string]$Generation)
+param([switch]$AllowInput, [string]$RelayConfig, [switch]$TargetGuard, [switch]$Persistent, [switch]$LanDiscovery, [switch]$WanOnly, [Threading.ManualResetEvent]$StopEvent, [ValidatePattern('^[a-f0-9]{32}$')][string]$Generation, [string]$Workspace, [string]$StopFile)
 $ErrorActionPreference = 'Stop'
 if($env:LANPILOT_ISOLATED -match '^[0-9a-f]{32}$' -and $env:LOCALAPPDATA -eq (Join-Path ([IO.Path]::GetTempPath()) ('LanPilot-Invite-QA-'+$env:LANPILOT_ISOLATED))){$AllowInput=$false}
-$root = Join-Path $env:LOCALAPPDATA 'CodexRemoteDesktop'
+$root = if($Workspace){[IO.Path]::GetFullPath($Workspace)}else{Join-Path $env:LOCALAPPDATA 'CodexRemoteDesktop'}
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 # Protect mailbox contents (typed text and screenshots) from other local users.
 $acl = [IO.Directory]::GetAccessControl($root,[Security.AccessControl.AccessControlSections]::Access)
@@ -49,10 +49,11 @@ try {
   $relay.url=Select-RelayEndpoint ''
  }
  [RemoteDesktop]::Init()
+ if($StopFile){[RemoteDesktop]::InputStopFile=$StopFile}
  if($Persistent){[void][RemoteDesktop]::KeepAwake($true)}
  [RemoteDesktop]::Check()
  $session = if($Generation){$Generation}else{[guid]::NewGuid().ToString('N')}
- function Test-WorkerStop {return $StopEvent -and $StopEvent.WaitOne(0)}
+ function Test-WorkerStop {return ($StopEvent -and $StopEvent.WaitOne(0)) -or ($StopFile -and (Test-Path -LiteralPath $StopFile))}
  function Wait-Reconnect([int]$Seconds) {
   if($StopEvent){[void]$StopEvent.WaitOne($Seconds*1000)}else{Start-Sleep -Seconds $Seconds}
  }
@@ -247,6 +248,7 @@ try {
      if([RemoteDesktop]::LastInput() -ne $frame.input -or [RemoteDesktop]::GetForegroundWindow().ToInt64() -ne $frame.hwnd -or [RemoteDesktop]::FocusIdentity() -ne $frame.focus){throw 'INPUT_OWNER_CHANGED_DURING_FINAL_GUARD'}
      if(($frame.windowBounds -join ',') -ne ([RemoteDesktop]::ForegroundBounds() -join ',')){throw 'WINDOW_MOVED_DURING_FINAL_GUARD'}
      [RemoteDesktop]::CheckInputAccess()
+     if(Test-WorkerStop){throw 'WORKER_STOPPING_BEFORE_INPUT'}
      # Consume observation before input; failures are never retried automatically.
      $frame = $null
      $attempted = $true
@@ -255,7 +257,7 @@ try {
       'doubleclick' {if($request.button -ne 'left'){throw 'INVALID_BUTTON'};[RemoteDesktop]::DoubleClick([int]$request.x,[int]$request.y)}
       'text' {if ($null -eq $request.text -or $request.text.Length -gt 2000) {throw 'INVALID_TEXT'}; [RemoteDesktop]::Text([string]$request.text)}
       'key' {
-       $map=@{CTRL=17;ALT=18;SHIFT=16;ENTER=13;TAB=9;ESC=27;BACKSPACE=8;DELETE=46;LEFT=37;UP=38;RIGHT=39;DOWN=40;HOME=36;END=35;PAGEUP=33;PAGEDOWN=34;SPACE=32;F4=115;F5=116}
+       $map=@{CTRL=17;ALT=18;SHIFT=16;META=91;ENTER=13;TAB=9;ESC=27;BACKSPACE=8;DELETE=46;LEFT=37;UP=38;RIGHT=39;DOWN=40;HOME=36;END=35;PAGEUP=33;PAGEDOWN=34;SPACE=32;F4=115;F5=116}
        $keys=@();foreach($k in $request.keys){if($map.ContainsKey($k)){$keys += [uint16]$map[$k]} elseif($k -cmatch '^[A-Z0-9]$'){$keys += [uint16][char]$k} else {throw 'INVALID_KEY'}}
        if($keys.Count -lt 1 -or $keys.Count -gt 4){throw 'INVALID_KEY_COUNT'};[RemoteDesktop]::Keys([uint16[]]$keys)
       }

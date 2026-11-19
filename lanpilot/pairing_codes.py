@@ -85,7 +85,7 @@ def claim_code(bridge, code, xml, source, now=None):
     return claim(bridge,token,xml,now)
 
 
-def export_client(bridge, output, controller='我的 Mac', isolated_test=False, generic=False):
+def export_client(bridge, output, controller='这台电脑', isolated_test=False, generic=False):
     """Reusable kit: intentionally contains no invitation, code or private key."""
     endpoint=profile(bridge) if not generic else {}
     if output.suffix.lower()!='.zip':raise ValueError('请保存为 .zip 安装包')

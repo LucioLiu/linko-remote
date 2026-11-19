@@ -32,7 +32,7 @@ $editName.Add_Click({
   $value=$field.Text.Trim();if(-not $value -or $value -match '[\x00-\x1f\x7f]'){throw '请输入有效的电脑名称。'}
   New-Item -ItemType Directory -Force -Path $root|Out-Null
   $tmp=Join-Path $root ([guid]::NewGuid().ToString('N')+'.tmp')
-  try{[IO.File]::WriteAllText($tmp,(@{name=$value}|ConvertTo-Json -Compress));if(Test-Path -LiteralPath $namePath){[IO.File]::Replace($tmp,$namePath,$null)}else{[IO.File]::Move($tmp,$namePath)}}finally{if(Test-Path -LiteralPath $tmp){Remove-Item -LiteralPath $tmp}}
+  try{[IO.File]::WriteAllText($tmp,(@{name=$value}|ConvertTo-Json -Compress));if(Test-Path -LiteralPath $namePath){[IO.File]::Replace($tmp,$namePath,[System.Management.Automation.Language.NullString]::Value)}else{[IO.File]::Move($tmp,$namePath)}}finally{if(Test-Path -LiteralPath $tmp){Remove-Item -LiteralPath $tmp}}
   $nameLabel.Text=$value
  }}catch{[Windows.Forms.MessageBox]::Show($_.Exception.Message,'保存失败')|Out-Null}finally{$dialog.Dispose()}
 })
@@ -67,7 +67,7 @@ $settings.Add_Click({
    $tmp=Join-Path $root ([guid]::NewGuid().ToString('N')+'.tmp')
    try{
     [IO.File]::WriteAllText($tmp,(@{url=$value}|ConvertTo-Json -Compress))
-    if([IO.File]::Exists($path)){[IO.File]::Replace($tmp,$path,$null)}else{[IO.File]::Move($tmp,$path)}
+    if([IO.File]::Exists($path)){[IO.File]::Replace($tmp,$path,[System.Management.Automation.Language.NullString]::Value)}else{[IO.File]::Move($tmp,$path)}
    }finally{if(Test-Path -LiteralPath $tmp){Remove-Item -LiteralPath $tmp}}
   }elseif(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path}
   [Windows.Forms.MessageBox]::Show('已保存，将在重新连接时使用。','邻控')|Out-Null

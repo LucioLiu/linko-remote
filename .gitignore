@@ -11,3 +11,4 @@ captures/
 *.key
 *.app/
 *.egg-info/
+native/LinkoDesktop

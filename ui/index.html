@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>邻控 · Linko Remote</title><link rel="stylesheet" href="/style.css"></head>
+<body>
+<aside class="sidebar">
+ <a class="brand" href="#"><span class="brandmark">↔</span><span>邻控<small>Linko Remote</small></span></a>
+ <div class="nav-label">工作空间</div>
+ <button class="nav active" data-page="home"><span>⌘</span>连接电脑</button>
+ <button class="nav" data-page="ssh"><span>›_</span>SSH 连接</button>
+ <button class="nav" data-page="settings"><span>⚙</span>设置与帮助</button>
+ <div class="sidebar-bottom"><span class="status-dot" id="service-dot"></span><span id="service-state">正在连接服务</span><small id="version">统一客户端预览</small></div>
+</aside>
+<main>
+ <header><div><div class="eyebrow">每台电脑，都能彼此连接</div><h1 id="page-title">让远方的电脑，就在手边</h1></div><div class="header-actions"><button class="button secondary" id="refresh">刷新状态</button><span class="version-badge">双向连接</span></div></header>
+ <div class="notice hidden" id="notice" role="status"></div>
+ <section id="page-home" class="page">
+  <div class="hero-grid">
+   <article class="card local-card"><div class="card-label"><span class="computer-symbol">▣</span>这台电脑<span class="system" id="local-platform"></span></div>
+    <div class="name-row"><h2 id="local-name">正在读取…</h2><button class="icon-button" id="rename" aria-label="编辑本机名称" title="编辑名称">✎</button></div>
+    <div class="identity">设备 <span id="local-id">—</span></div>
+    <div class="receive-row"><div><strong>允许其他电脑连接本机</strong><p>每次连接，都需在本机确认</p></div><label class="switch"><input type="checkbox" id="incoming"><span></span></label></div>
+    <div class="code-area"><div><span class="small-label">本机临时连接码</span><div class="connection-code" id="own-code">•••• •••• ••••</div><small id="code-hint">允许连接后，生成 10 分钟有效的连接码</small></div><div class="code-actions"><button class="button secondary" id="generate">生成连接码</button><button class="text-button" id="copy-code" disabled>复制连接码</button></div></div>
+    <div class="permission-strip" id="permission-strip"><span id="permission-text">正在检查本机权限</span><button class="text-button" id="screen-permission">录屏权限</button><button class="text-button" id="input-permission">辅助功能</button></div>
+   </article>
+   <article class="card connect-card"><div class="card-label"><span class="computer-symbol">↗</span>连接另一台电脑</div><h2>输入对方的连接码</h2><p class="muted">对方打开邻控并生成连接码，复制到这里即可。</p><form id="connect-form"><label class="sr-only" for="connect-code">对方连接码</label><input id="connect-code" class="large-input" autocomplete="off" spellcheck="false" placeholder="粘贴连接码或 12 位数字" maxlength="2048"><button class="button primary wide" id="connect-button">发起连接 <span>→</span></button></form><div class="connection-note"><span>✓</span><p>确认对方身份后连接<br><small>连接码会过期，保存的电脑仍会留在列表中</small></p></div></article>
+  </div>
+  <section class="devices-section"><div class="section-heading"><div><h2>我的电脑</h2><p>连接过的电脑会保存在这里，随时再次发起连接</p></div><input id="device-search" placeholder="搜索名称或设备号" aria-label="搜索电脑"></div><div id="devices" class="device-list"></div></section>
+ </section>
+ <section id="page-ssh" class="page hidden"><div class="section-heading"><div><h2>SSH 连接</h2><p>使用系统终端连接电脑或服务器，保留正常的主机身份校验。</p></div><button class="button primary" id="add-ssh">添加 SSH</button></div><div id="ssh-list" class="device-list"></div></section>
+ <section id="page-settings" class="page hidden"><article class="card settings-card"><h2>连接与权限</h2><p>每台电脑都能发起和接受连接。允许连接本机后，对方仍需得到你的本机确认。</p><dl><dt>客户端版本</dt><dd id="settings-version">—</dd><dt>连接服务</dt><dd id="settings-network">—</dd><dt>本机权限</dt><dd id="settings-permissions">—</dd></dl><p class="muted">退出或关闭本机连接权限后，其他电脑不能继续发起新的操作。操作结果不明时，请先查询原结果，避免重复执行。</p><p class="muted">0.7 旧配对保留在原客户端中，不会被此预览版覆盖。统一版需要两端都启动此客户端。</p><button class="button secondary" id="quit">退出邻控并停止接受连接</button></article></section>
+</main>
+<dialog id="rename-dialog"><form method="dialog"><h2>编辑这台电脑的名称</h2><p class="muted">使用你能认出的名字，方便其他电脑识别。</p><input id="new-name" maxlength="100" required><div class="dialog-actions"><button value="cancel" formnovalidate class="button secondary">取消</button><button value="save" class="button primary">保存</button></div></form></dialog>
+<dialog id="ssh-dialog"><form method="dialog"><h2>添加 SSH 连接</h2><label>名称<input name="name" required maxlength="100" placeholder="例如：示例服务器"></label><label>主机<input name="host" required placeholder="IP、域名或 SSH 配置别名"></label><div class="field-row"><label>用户名<input name="user" placeholder="沿用系统配置"></label><label>端口<input name="port" type="number" min="1" max="65535" value="22"></label></div><div class="dialog-actions"><button value="cancel" formnovalidate class="button secondary">取消</button><button value="save" class="button primary">保存连接</button></div></form></dialog>
+<dialog id="approval-dialog"><h2>有电脑希望连接你</h2><p><strong id="approval-name"></strong></p><p class="muted" id="approval-detail"></p><p>允许后，对方可查看本机屏幕并操作键鼠。请确认是你正在等待的连接。</p><div class="dialog-actions"><button id="deny" class="button secondary">拒绝</button><button id="approve" class="button primary">允许本次连接</button></div></dialog>
+<dialog id="remote-dialog" class="remote-dialog"><div class="remote-header"><div><strong id="remote-name">远程电脑</strong><small id="remote-state">等待画面</small></div><div><button class="button secondary" id="remote-refresh">取新画面</button><button class="button secondary" id="remote-recover">查询原结果</button><button class="icon-button" id="remote-close" aria-label="关闭远程桌面">×</button></div></div><div class="remote-canvas"><img id="remote-image" alt="远程电脑画面" draggable="false"><div id="remote-placeholder">先取得画面，再进行操作</div></div><div class="remote-toolbar"><input id="remote-text" placeholder="输入要发送的文字" maxlength="2000" aria-label="远程输入文字"><button class="button primary" id="send-text">发送文字</button><button class="button secondary key" data-key="ENTER">Enter</button><button class="button secondary key" data-key="TAB">Tab</button><button class="button secondary key" data-key="ESC">Esc</button><button class="button secondary key" data-key="BACKSPACE">退格</button></div><p class="remote-help">点击画面发送一次点击；取屏和操作会逐步确认。当前画面变化时会要求重新取屏。</p></dialog>
+<script src="/app.js"></script></body></html>

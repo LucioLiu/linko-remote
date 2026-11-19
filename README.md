@@ -1,35 +1,38 @@
 # 邻控 · Linko Remote
+
 **致力于打造一个 AI 易用的「UU 远程」。**
 
-让 AI 能可靠地使用另一台电脑。图形操作负责必须看屏、点击和输入的任务；SSH 入口服务已有 SSH 环境的电脑和服务器。
+每台电脑使用同一套界面，都可以连接另一台电脑，也可以在本机确认后接受连接。支持临时连接码、电脑改名、逐次取屏和键鼠操作，以及 SSH 连接管理。
 
-Linko Remote，中文名「邻控」，日常简称 Linko。现阶段支持 Mac 后台控制 Windows，并提供 SSH 连接管理和系统终端入口。[产品定位](docs/branding.md)
+## 下载统一预览版
 
-> 0.7.0 为预览版本。完整的人工实时桌面控制器、AI SSH 命令任务，以及通用公共设备目录仍待建设。当前新 Mac 需配置一次中继，Windows 公开下载包可粘贴 Mac 复制的完整连接码；专用包也可输入 12 位数字配对。旧 LanPilot 命令、配对与存储路径保留兼容。
+[Windows 10/11 x64](https://github.com/LucioLiu/linko-remote/releases/download/v0.8.0-preview.1/LinkoRemote-Windows-0.8.0-preview.1.zip) · [macOS 14+ Apple Silicon](https://github.com/LucioLiu/linko-remote/releases/download/v0.8.0-preview.1/LinkoRemote-macOS-arm64-0.8.0-preview.1.zip) · [版本说明与校验文件](https://github.com/LucioLiu/linko-remote/releases/tag/v0.8.0-preview.1)
 
-- 屏幕操作：先取当前画面，在该设备、该画面上执行动作，再检查回执和实际变化。
-- 批量作业：把受支持的任务发给 Windows 本机执行，收回结果文件，并按需检查屏幕。断线后先查询原任务状态，避免重复执行。
-- 连接方式：支持局域网，以及配置好的跨网路由。配对凭据、设备配置和原始屏幕仅保存在部署环境。
-- 开发验证：在项目根目录运行 `python3 -m unittest discover -s tests`。Windows 原生测试在 Windows 上运行。
+两端均自带运行环境。Windows 解压后双击「打开邻控.cmd」；Mac 将应用移入「应用程序」后打开。本预览版未做 Apple 开发者公证，macOS 可能提示来源限制。
 
-## 下载预览版
+1. 双方安装同一统一预览版。
+2. 接收连接的电脑开启「允许其他电脑连接本机」，生成 10 分钟有效的连接码。
+3. 另一台电脑输入连接码；接收电脑核对名称和设备号，允许本次连接。
+4. 点击「打开桌面」，先取新画面，再进行操作。反向连接需要另行批准。
 
-[macOS 控制端](https://github.com/LucioLiu/linko-remote/releases/download/v0.7.0-preview.2/LinkoRemote-macOS-0.7.0-preview.zip) · [Windows 接入端](https://github.com/LucioLiu/linko-remote/releases/download/v0.7.0-preview.2/LinkoRemote-Windows-0.7.0-preview.zip) · [版本说明与校验文件](https://github.com/LucioLiu/linko-remote/releases/tag/v0.7.0-preview.2)
+**当前可用范围：** 两台 Windows 已通过公网中继完成双向取屏、点击和文字输入实测；Mac 可主动连接 Windows，Mac 被控尚未完成实机验收。当前采用逐次截图和操作确认，尚非连续视频桌面。测试中使用公网入口，未验证机器分处两个实际网络的场景。测试中继依赖临时公网隧道，可能延迟或暂时不可达，不承诺生产可用性。
 
-Windows 解压后双击「打开邻控.cmd」，粘贴 Mac 端「复制连接码」的内容。Mac 需有可用的系统 Python 3，并按[说明](docs/invitations.md)配置一次可达中继。当前优先支持新设备接入；旧设备请先用独立测试实例验收，保留原有工作连接。
+## 干净安装与隐私
 
-## 0.7.0：验证码连接与设备管理
+- 安装包不包含开发者的设备列表、旧配对、连接验证码、私钥、截图或运行日志。
+- 首次启动生成独立随机身份和通用电脑名称，不读取系统主机名。设备列表初始为空；只显示经连接并批准的电脑。
+- 公共连接服务地址与 TLS 证书指纹是公开服务配置，不是电脑连接凭据。仅知道地址或设备号不能取得桌面权限。
+- 允许连接默认关闭；程序重启后需重新开启。授权一小时有效，反向控制单独批准。
+- 预览中继会处理设备名称、临时连接申请及桌面回执。建议只在测试电脑使用；源码支持自建服务。详见[统一预览说明](docs/unified-preview.md)。
 
-Mac 首页可生成 10 分钟有效的配对验证码；Windows 使用可复用客户端输入验证码接入，不再逐台传递邀请或公钥。首页支持电脑改名、搜索、画面快照和 SSH 连接管理。跨网使用配置好的中继入口。当前 Windows 客户端包含本控制端的公开网关配置；新控制端仍需一次性配置中继，并非通用的全局设备目录。详见[连接改进与验收边界](docs/2026-11-19-connection-upgrade.md)。
+统一版使用独立配置目录：Windows `%LOCALAPPDATA%\LinkoRemote`，macOS `~/Library/Application Support/LinkoRemote`。旧 0.7 安装和配对保留在旧客户端，尚未自动迁移；连接双方均需使用统一版。
 
-构建 Mac 应用：在具备系统 Python、Swift 编译器和签名工具的 Mac 上运行 `python3 lanpilot/build_mac.py /tmp/邻控.app`。命令行入口为应用中的 `Contents/Resources/lanpilot`；可用 `--help` 查看子命令。[本地文件作业](docs/local-jobs.md)列出了可执行任务和结果验证方法。
+## 开发与验收
 
-旧邀请文件方式仍可使用：在 Mac 应用点「更多接入」，为设备取名，把生成的安装邀请通过私密渠道交给目标电脑。Windows 用户双击并确认接入。邀请默认 15 分钟有效，仅能绑定一台设备。接入前需由管理员为控制端配置一次可达的邀请路由；后续设备共用该入口，不必逐台填写 IP。安装邀请内含一次性凭据，请勿提交到 Git。
+运行 `python3 -m unittest discover -s tests`。Windows 原生检查需在 Windows 上运行。[构建与发布检查](docs/releasing.md)说明安装包的文件白名单、校验值和隐私扫描。
 
-| 你要完成的任务 | 从哪里开始 |
-| --- | --- |
-| AI 后台查看 Windows 屏幕、点击控件，不占用 Mac 前台 | MCP：`list_devices` → `observe` → `act`；[操作指南](skill/lanpilot/SKILL.md) |
-| 多台电脑并发处理文件，弱网下减少鼠标往返 | `stage_inputs` → `run_job`；[作业清单](docs/local-jobs.md) · [远控与本机执行对照](docs/route-comparison.md) |
-| 从不同 Wi-Fi 接入新的 Windows 电脑 | [一次性邀请与跨网配置](docs/invitations.md) |
+SSH 入口使用系统 OpenSSH 和已有配置，保存主机、用户名和端口，不代存密码，也不提供 SSH 自动穿透。
 
-[MCP 接入与设备选择](AGENTS.md)
+旧 0.7 的 Mac → Windows 后台 MCP、受限文件作业与邀请流程仍保留兼容：[MCP 操作](skill/lanpilot/SKILL.md) · [文件作业](docs/local-jobs.md) · [旧版接入](docs/invitations.md)。统一版的图形会话仅授予取屏与键鼠能力，不授予文件作业权限。
+
+[产品定位](docs/branding.md)。项目与网易 UU 远程没有隶属或集成关系。
