@@ -12,6 +12,12 @@ Linko Remote，中文名「邻控」，日常简称 Linko。现阶段支持 Mac 
 - 连接方式：支持局域网，以及配置好的跨网路由。配对凭据、设备配置和原始屏幕仅保存在部署环境。
 - 开发验证：在项目根目录运行 `python3 -m unittest discover -s tests`。Windows 原生测试在 Windows 上运行。
 
+## 下载预览版
+
+[macOS 控制端](https://github.com/LucioLiu/linko-remote/releases/download/v0.7.0-preview.1/LinkoRemote-macOS-0.7.0-preview.zip) · [Windows 接入端](https://github.com/LucioLiu/linko-remote/releases/download/v0.7.0-preview.1/LinkoRemote-Windows-0.7.0-preview.zip) · [版本说明与校验文件](https://github.com/LucioLiu/linko-remote/releases/tag/v0.7.0-preview.1)
+
+Windows 解压后双击「打开邻控.cmd」，粘贴 Mac 端「复制连接码」的内容。Mac 需有可用的系统 Python 3，并按[说明](docs/invitations.md)配置一次可达中继。当前优先支持新设备接入；旧设备请先用独立测试实例验收，保留原有工作连接。
+
 ## 0.7.0：验证码连接与设备管理
 
 Mac 首页可生成 10 分钟有效的配对验证码；Windows 使用可复用客户端输入验证码接入，不再逐台传递邀请或公钥。首页支持电脑改名、搜索、画面快照和 SSH 连接管理。跨网使用配置好的中继入口。当前 Windows 客户端包含本控制端的公开网关配置；新控制端仍需一次性配置中继，并非通用的全局设备目录。详见[连接改进与验收边界](docs/2026-11-19-connection-upgrade.md)。
