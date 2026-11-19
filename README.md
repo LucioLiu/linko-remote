@@ -14,7 +14,7 @@ Linko Remote，中文名「邻控」，日常简称 Linko。现阶段支持 Mac 
 
 ## 下载预览版
 
-[macOS 控制端](https://github.com/LucioLiu/linko-remote/releases/download/v0.7.0-preview.1/LinkoRemote-macOS-0.7.0-preview.zip) · [Windows 接入端](https://github.com/LucioLiu/linko-remote/releases/download/v0.7.0-preview.1/LinkoRemote-Windows-0.7.0-preview.zip) · [版本说明与校验文件](https://github.com/LucioLiu/linko-remote/releases/tag/v0.7.0-preview.1)
+[macOS 控制端](https://github.com/LucioLiu/linko-remote/releases/download/v0.7.0-preview.2/LinkoRemote-macOS-0.7.0-preview.zip) · [Windows 接入端](https://github.com/LucioLiu/linko-remote/releases/download/v0.7.0-preview.2/LinkoRemote-Windows-0.7.0-preview.zip) · [版本说明与校验文件](https://github.com/LucioLiu/linko-remote/releases/tag/v0.7.0-preview.2)
 
 Windows 解压后双击「打开邻控.cmd」，粘贴 Mac 端「复制连接码」的内容。Mac 需有可用的系统 Python 3，并按[说明](docs/invitations.md)配置一次可达中继。当前优先支持新设备接入；旧设备请先用独立测试实例验收，保留原有工作连接。
 
