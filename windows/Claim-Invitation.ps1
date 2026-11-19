@@ -24,7 +24,7 @@ if([Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName -eq 'z
 }
 if($codeMode){$msg="连接到控制端「$($meta.controller)」吗？对方将能查看当前桌面、操作键鼠，并运行限定的文件作业。请确认验证码来自您信任的控制端。"}
 if([Windows.Forms.MessageBox]::Show($msg,'LanPilot | Connect this PC','YesNo','Question') -ne 'Yes'){return}
-Add-Type -Path (Join-Path $PSScriptRoot 'Relay.cs')
+if(-not ('DesktopRelay' -as [type])){Add-Type -Path (Join-Path $PSScriptRoot 'Relay.cs')}
 $base=[DesktopRelay]::NormalizeEndpoint([string]$meta.url)
 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
 New-Item -ItemType Directory -Force -Path $root|Out-Null
