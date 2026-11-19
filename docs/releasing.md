@@ -23,3 +23,10 @@
 - 上传前保持 Release 为草稿，上传后下载并核对实际字节的 SHA-256，再发布为预览版本。
 
 历史提交的作者信息仍由 GitHub 展示。本流程清理产品内容和分发产物，不重写公开 Git 历史。
+
+
+## 更新发布约定
+
+版本只在 `lanpilot/version.py` 修改，支持 `major.minor.patch` 和 `-preview.N`、`-beta.N`、`-rc.N`。公开 Release 标签为 `v` 加版本号。Windows 资产名为 `LinkoRemote-Windows-VERSION.zip`，Mac Apple Silicon 为 `LinkoRemote-macOS-arm64-VERSION.zip`，GitHub 资产元数据须有 `sha256:` digest。两个平台产物均上传完成后再发布，避免客户端看见不完整版本。
+
+更新器读取 Releases 集合，预览客户端可检测后续预览版；正式版客户端跳过预览版本。更旧或相同版本不会提示安装。不要修改已发布版本的资产字节，应提高版本号重新发布。

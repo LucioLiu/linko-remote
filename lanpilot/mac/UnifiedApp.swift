@@ -1,7 +1,7 @@
 import Cocoa
 import WebKit
 
-final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate {
+final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler {
  var window: NSWindow!
  var view: WKWebView!
  var process: Process?
@@ -10,7 +10,9 @@ final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate {
   NSApp.setActivationPolicy(.regular)
   window=NSWindow(contentRect:NSRect(x:0,y:0,width:1220,height:860),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
   window.title="邻控 · Linko Remote";window.minSize=NSSize(width:860,height:680);window.center();window.isReleasedWhenClosed=false
-  view=WKWebView(frame:window.contentView!.bounds);view.navigationDelegate=self;view.autoresizingMask=[.width,.height];window.contentView=view
+  let configuration=WKWebViewConfiguration()
+  configuration.userContentController.add(self,name:"linkoUpdate")
+  view=WKWebView(frame:window.contentView!.bounds,configuration:configuration);view.navigationDelegate=self;view.autoresizingMask=[.width,.height];window.contentView=view
   window.makeKeyAndOrderFront(nil)
   let menu=NSMenu(), item=NSMenuItem(), appMenu=NSMenu()
   appMenu.addItem(withTitle:"关于邻控",action:#selector(about),keyEquivalent:"").target=self
@@ -23,6 +25,10 @@ final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate {
   DispatchQueue.global().async {
    let backend=Process(), pipe=Pipe(), errors=Pipe()
    backend.executableURL=engine.appendingPathComponent("LinkoService");backend.arguments=[]
+   var environment=ProcessInfo.processInfo.environment
+   environment["LINKO_APP_PATH"]=Bundle.main.bundleURL.path
+   environment["LINKO_APP_PID"]=String(ProcessInfo.processInfo.processIdentifier)
+   backend.environment=environment
    backend.currentDirectoryURL=engine;backend.standardOutput=pipe;backend.standardError=errors
    do {
     try backend.run();self.process=backend
@@ -33,10 +39,16 @@ final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate {
    }catch {DispatchQueue.main.async{let alert=NSAlert();alert.messageText="邻控暂时无法启动";alert.informativeText="本地连接服务没有正常启动。原版配对和安装不受影响。";alert.runModal()}}
   }
  }
+ func userContentController(_ userContentController:WKUserContentController,didReceive message:WKScriptMessage){
+  guard message.name=="linkoUpdate",message.body as? String=="installing",message.frameInfo.isMainFrame,
+   let url=message.frameInfo.request.url,url.host=="127.0.0.1",url.scheme=="http",
+   url.host!+":"+String(url.port ?? 80)==authority else{return}
+  NSApp.terminate(nil)
+ }
  func webView(_ webView:WKWebView,decidePolicyFor navigationAction:WKNavigationAction,decisionHandler:@escaping(WKNavigationActionPolicy)->Void){
   guard let url=navigationAction.request.url,url.scheme=="http",url.host=="127.0.0.1",url.host!+":"+String(url.port ?? 80)==authority else{decisionHandler(.cancel);return};decisionHandler(.allow)
  }
- @objc func about(){let alert=NSAlert();alert.messageText="邻控 · Linko Remote";alert.informativeText="0.8.0 统一客户端预览\n每台电脑，都能彼此连接。";alert.runModal()}
+ @objc func about(){let alert=NSAlert();alert.messageText="邻控 · Linko Remote";let version=Bundle.main.object(forInfoDictionaryKey:"LinkoReleaseVersion") as? String ?? "预览版";alert.informativeText=version+"\n每台电脑，都能彼此连接。";alert.runModal()}
  @objc func quit(){NSApp.terminate(nil)}
  func applicationWillTerminate(_ notification:Notification){if let process=process,process.isRunning{process.terminate()}}
  func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool{window.makeKeyAndOrderFront(nil);return true}

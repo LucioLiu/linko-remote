@@ -24,7 +24,7 @@ class UnifiedBuildTests(unittest.TestCase):
             with patch('lanpilot.build_unified.ROOT', source):
                 copy_code(output, {'url': 'https://example.test', 'pin': 'a' * 64})
             paths = {p.relative_to(output).as_posix() for p in output.rglob('*') if p.is_file()}
-            self.assertEqual(set(CLIENT_FILES) | {'peer-endpoint.json'}, paths)
+            self.assertEqual(set(CLIENT_FILES) | {'peer-endpoint.json', 'release.json'}, paths)
             (output / 'client.json').write_text('{"credential":"must-not-ship"}')
             with self.assertRaisesRegex(ValueError, 'Unexpected files'):
                 copy_code(output, {'url': 'https://example.test', 'pin': 'a' * 64})

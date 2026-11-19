@@ -87,6 +87,37 @@ class ClientTests(unittest.TestCase):
         self.assertNotIn(self.target, json.dumps(view))
         self.assertNotIn(self.a.config['credential'], json.dumps(view))
 
+    def test_update_preferences_preserve_existing_identity_name_and_ssh(self):
+        self.a.config['name'] = 'Saved PC'
+        self.a.config['ssh'] = [{'id': 'saved', 'name': 'Saved host', 'host': 'host.example', 'port': 22, 'user': ''}]
+        before = dict(self.a.config)
+        self.a.api('update-preference', {'enabled': False})
+        restored = json.loads(self.a.path.read_text())
+        self.assertFalse(restored['auto_update_check'])
+        self.assertEqual(before, {key: value for key, value in restored.items() if key != 'auto_update_check'})
+        self.assertFalse(self.a.local_state()['updates']['auto_check'])
+
+    def test_update_install_is_blocked_by_sessions_or_unconfirmed_actions(self):
+        with patch.object(self.b.updater, 'prepare_install') as install:
+            with self.assertRaisesRegex(ValueError, '结束远程'):
+                self.b.api('update-install', {})
+            install.assert_not_called()
+        self.a.state['peers'] = [{'can_control': True}]
+        with patch.object(self.a.updater, 'prepare_install') as install:
+            with self.assertRaises(ValueError):
+                self.a.api('update-install', {})
+            self.a.state['peers'] = []
+            self.a.pending['peer'] = 'a' * 32
+            with self.assertRaises(ValueError):
+                self.a.api('update-install', {})
+            install.assert_not_called()
+            self.a.pending.clear()
+            install.return_value = {'installing': True}
+            self.assertTrue(self.a.api('update-install', {})['installing'])
+            self.assertTrue(self.a.updating)
+            with self.assertRaisesRegex(ValueError, '正在更新'):
+                self.a.api('name', {'name': 'Changed during update'})
+
     def test_complete_connection_codes_validate_service_identity(self):
         import base64
         value = dict(v=2, code='123456789012', url='https://impostor.example', pin='b' * 64)

@@ -8,7 +8,9 @@ try{
  }
  $base=Join-Path $env:LOCALAPPDATA 'LinkoRemote\app'
  $build=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'checksums.json')).Hash.Substring(0,10).ToLowerInvariant()
- $target=Join-Path $base ('0.8.0-'+$build)
+ $release=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'code\release.json') -Raw|ConvertFrom-Json
+ if($release.version -notmatch '^\d+\.\d+\.\d+(-(preview|beta|rc)\.\d+)?$'){throw '安装包版本信息无效'}
+ $target=Join-Path $base ($release.version+'-'+$build)
  if(-not (Test-Path -LiteralPath $target)){
   New-Item -ItemType Directory -Path $target -Force|Out-Null
   foreach($name in @('runtime','code')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination $target -Recurse}

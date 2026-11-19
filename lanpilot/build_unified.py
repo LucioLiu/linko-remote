@@ -13,6 +13,7 @@ import subprocess
 import sys
 import urllib.request
 import zipfile
+from .version import VERSION, TAG
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -21,7 +22,8 @@ ROOT=Path(__file__).resolve().parents[1]
 # working directories, local profiles, logs, fixtures, or old enrollment kits.
 CLIENT_FILES = (
     'desktop.py', 'lanpilot/__init__.py', 'lanpilot/peer_client.py',
-    'lanpilot/peer_hub.py', 'windows/Start-Desktop.ps1', 'windows/Desktop.cs',
+    'lanpilot/peer_hub.py', 'lanpilot/updater.py', 'lanpilot/version.py',
+    'windows/Start-Desktop.ps1', 'windows/Desktop.cs',
     'windows/Relay.cs', 'windows/Discovery.cs', 'windows/LocalJob.ps1',
     'windows/LocalJobHost.ps1', 'windows/LedgerReconcile.cs',
     'ui/index.html', 'ui/style.css', 'ui/app.js',
@@ -30,7 +32,7 @@ CLIENT_FILES = (
 
 def copy_code(destination, endpoint):
     destination.mkdir(parents=True, exist_ok=True)
-    allowed = set(CLIENT_FILES) | {'peer-endpoint.json', 'native/LinkoDesktop'}
+    allowed = set(CLIENT_FILES) | {'peer-endpoint.json', 'release.json', 'native/LinkoDesktop'}
     unexpected = [p.relative_to(destination).as_posix() for p in destination.rglob('*')
                   if p.is_file() and p.relative_to(destination).as_posix() not in allowed]
     if unexpected:
@@ -40,6 +42,7 @@ def copy_code(destination, endpoint):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / name, target)
     (destination / 'peer-endpoint.json').write_text(json.dumps(endpoint))
+    (destination / 'release.json').write_text(json.dumps({'version': VERSION, 'tag': TAG}))
 
 
 def mac(output, endpoint, engine):
@@ -50,7 +53,8 @@ def mac(output, endpoint, engine):
     code=contents/'Resources/code'
     copy_code(code,endpoint)
     data={'CFBundleName':'邻控统一预览','CFBundleDisplayName':'邻控统一预览','CFBundleIdentifier':'local.linko.remote.unified.preview',
-          'CFBundleVersion':'0.8.0','CFBundleShortVersionString':'0.8.0','CFBundleExecutable':'LinkoRemote','NSHighResolutionCapable':True,
+          'CFBundleVersion':VERSION.split('-')[0],'CFBundleShortVersionString':VERSION.split('-')[0],
+          'LinkoReleaseVersion':VERSION,'CFBundleExecutable':'LinkoRemote','NSHighResolutionCapable':True,
           'LSMinimumSystemVersion':'14.0','NSAppTransportSecurity':{'NSAllowsLocalNetworking':True},'NSScreenCaptureUsageDescription':'允许可信电脑通过邻控查看本机屏幕。'}
     (contents/'Info.plist').write_bytes(plistlib.dumps(data))
     subprocess.run(['swiftc',str(ROOT/'lanpilot/mac/UnifiedApp.swift'),'-o',str(contents/'MacOS/LinkoRemote'),'-framework','Cocoa','-framework','WebKit'],check=True)

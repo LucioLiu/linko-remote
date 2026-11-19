@@ -6,7 +6,7 @@
 
 ## 下载统一预览版
 
-[Windows 10/11 x64](https://github.com/LucioLiu/linko-remote/releases/download/v0.8.0-preview.1/LinkoRemote-Windows-0.8.0-preview.1.zip) · [macOS 14+ Apple Silicon](https://github.com/LucioLiu/linko-remote/releases/download/v0.8.0-preview.1/LinkoRemote-macOS-arm64-0.8.0-preview.1.zip) · [版本说明与校验文件](https://github.com/LucioLiu/linko-remote/releases/tag/v0.8.0-preview.1)
+[Windows 10/11 x64](https://github.com/LucioLiu/linko-remote/releases/download/v0.8.1-preview.1/LinkoRemote-Windows-0.8.1-preview.1.zip) · [macOS 14+ Apple Silicon](https://github.com/LucioLiu/linko-remote/releases/download/v0.8.1-preview.1/LinkoRemote-macOS-arm64-0.8.1-preview.1.zip) · [版本说明与校验文件](https://github.com/LucioLiu/linko-remote/releases/tag/v0.8.1-preview.1)
 
 两端均自带运行环境。Windows 解压后双击「打开邻控.cmd」；Mac 将应用移入「应用程序」后打开。本预览版未做 Apple 开发者公证，macOS 可能提示来源限制。
 
@@ -16,6 +16,12 @@
 4. 点击「打开桌面」，先取新画面，再进行操作。反向连接需要另行批准。
 
 **当前可用范围：** 两台 Windows 已通过公网中继完成双向取屏、点击和文字输入实测；Mac 可主动连接 Windows，Mac 被控尚未完成实机验收。当前采用逐次截图和操作确认，尚非连续视频桌面。测试中使用公网入口，未验证机器分处两个实际网络的场景。测试中继依赖临时公网隧道，可能延迟或暂时不可达，不承诺生产可用性。
+
+## 检查与安装更新
+
+启动后自动检查 GitHub 新版本，每 4 小时再检查一次。也可在「设置与帮助 → 软件更新」手动检查；发现新版后显示提示和更新说明，点击下载、校验完成后选择「安装并重启」。自动检查可关闭，不会静默替换正在使用的软件。
+
+更新前需结束远程连接、确认未完成操作并关闭允许连接。更新保留电脑身份、名称、配对和 SSH 设置；下载或校验失败不会安装，替换失败会恢复或保留上一版。0.8.0 及更早版本没有更新入口，需要先手动升级一次到 0.8.1。
 
 ## 干净安装与隐私
 

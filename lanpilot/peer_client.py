@@ -23,6 +23,8 @@ import webbrowser
 
 from desktop import make_request
 from .peer_hub import display_name
+from .version import VERSION
+from .updater import UpdateManager
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / 'ui'
@@ -218,6 +220,7 @@ class DesktopClient:
         self.agent = agent_factory(self.home)
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
+        self.operation_lock = threading.RLock()
         self.incoming = False
         self.connected = False
         self.error = ''
@@ -226,9 +229,12 @@ class DesktopClient:
         self.permissions = {'screen': False, 'input': False}
         self.pending_path = self.home / 'pending.json'
         self.pending = json.loads(self.pending_path.read_text()) if self.pending_path.exists() else {}
+        self.updating = False
+        self.updater = UpdateManager(self.home, lambda: self.config.get('auto_update_check', True))
 
     def start(self):
         threading.Thread(target=self._pump, daemon=True).start()
+        self.updater.start()
 
     def _pump(self):
         registered = False
@@ -279,13 +285,40 @@ class DesktopClient:
     def local_state(self):
         with self.lock:
             value = dict(self.state)
-            value.update(version='0.8.0-unified-preview', connected=self.connected, error=self.error,
-                         permissions=self.permissions, ssh=self.config['ssh'], pending=self.pending)
-            return value
+            value.update(version=VERSION, connected=self.connected, error=self.error,
+                         permissions=self.permissions, ssh=self.config['ssh'], pending=dict(self.pending))
+        value['updates'] = self.updater.snapshot()
+        return value
 
     def api(self, operation, body):
         if operation == 'state':
             return self.local_state()
+        with self.operation_lock:
+            return self._api(operation, body)
+
+    def _api(self, operation, body):
+        if operation == 'update-check':
+            return self.updater.begin('check')
+        if operation == 'update-download':
+            return self.updater.begin('download')
+        if operation == 'update-preference':
+            enabled = body.get('enabled')
+            if type(enabled) is not bool:
+                raise ValueError('请选择是否自动检查更新')
+            with self.lock:
+                self.config['auto_update_check'] = enabled
+                atomic_json(self.path, self.config)
+            return self.updater.snapshot()
+        if operation == 'update-install':
+            with self.lock:
+                peers = self.state.get('peers', [])
+                if self.pending or self.incoming or any(p.get('incoming') or p.get('can_control') for p in peers):
+                    raise ValueError('请先结束远程连接、确认原操作结果，并关闭允许连接，再安装更新')
+                value = self.updater.prepare_install()
+                self.updating = True
+                return value
+        if self.updating:
+            raise ValueError('正在更新，暂不能发起新的操作')
         if operation == 'availability':
             enabled = body.get('enabled')
             if type(enabled) is not bool:
@@ -402,6 +435,7 @@ class DesktopClient:
     def close(self):
         self.agent.stop()
         self.stop_event.set()
+        self.updater.stop.set()
         try:
             self.ui_hub.call('availability', {'enabled': False})
         except Exception:
@@ -456,6 +490,9 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
             value = self.server.client.api(self.path[5:], body)
             data = json.dumps({'ok': True, 'value': value}, ensure_ascii=False, separators=(',', ':')).encode()
             self.respond(200, data)
+            if self.path == '/api/update-install':
+                self.server.client.agent.stop()
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
         except Exception as error:
             self.respond(400, json.dumps({'ok': False, 'error': str(error)[:250]}, ensure_ascii=False).encode())
 
@@ -468,7 +505,8 @@ def run(home, endpoint, open_browser=False):
     server.authority = '127.0.0.1:' + str(server.server_port)
     server.nonce = secrets.token_urlsafe(32)
     url = 'http://' + server.authority + '/#' + server.nonce
-    atomic_json(Path(home) / 'shell-session.json', {'url': url, 'pid': os.getpid()})
+    atomic_json(Path(home) / 'shell-session.json', {'url': url, 'pid': os.getpid(),
+                'app_pid': int(os.environ.get('LINKO_APP_PID', '0'))})
     if sys.stdout is not None:
         print(json.dumps({'url': url}), flush=True)
     client.start()

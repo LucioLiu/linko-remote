@@ -43,7 +43,7 @@ async function refresh() {
   const ready=state.permissions.screen && state.permissions.input;
   $('permission-text').textContent=ready?'本机屏幕与键鼠权限已就绪':'连接本机需要录屏与辅助功能权限'; $('settings-permissions').textContent=ready?'已就绪':'等待系统权限';
   $('screen-permission').disabled=state.permissions.screen; $('input-permission').disabled=state.permissions.input;
-  renderDevices(); renderSSH();
+  renderDevices(); renderSSH(); renderUpdates();
   if(!activeApproval && state.approvals.length){activeApproval=state.approvals[0];$('approval-name').textContent=activeApproval.peer.name;$('approval-detail').textContent=platform(activeApproval.peer.platform)+' · '+activeApproval.peer.id;$('approval-dialog').showModal();}
   if(activeApproval && !state.approvals.some(x=>x.id===activeApproval.id)){ $('approval-dialog').close(); activeApproval=null; }
   if(selectedPeer && state.pending[selectedPeer.id] && !remotePending){remotePending=state.pending[selectedPeer.id];$('remote-state').textContent='上一操作结果未确认，请查询原结果';}
@@ -86,3 +86,30 @@ $('remote-image').onclick=event=>{if(!remoteFrame)return;const rect=event.target
 $('send-text').onclick=()=>{const value=$('remote-text').value;if(value)perform({action:'text',text:value});};document.querySelectorAll('.key').forEach(button=>button.onclick=()=>perform({action:'key',keys:[button.dataset.key]}));
 setInterval(()=>{if(ownCode){const seconds=Math.max(0,Math.ceil(ownCode.expires-Date.now()/1000));$('code-hint').textContent=seconds?Math.floor(seconds/60)+':'+String(seconds%60).padStart(2,'0')+' 后失效 · 对方输入后仍需你确认':'连接码已过期，请重新生成';if(!seconds)$('copy-code').disabled=true;}},1000);
 setInterval(refresh,2500);setInterval(()=>{if(remotePending && $('remote-dialog').open)recoverPending();},2000);refresh();
+
+function renderUpdates(){
+ const update=state.updates;if(!update)return;
+ $('auto-update-check').checked=update.auto_check;
+ $('update-state').textContent=update.message;
+ const working=['checking','downloading','installing'].includes(update.status);
+ $('check-updates').disabled=working;
+ $('download-update').classList.toggle('hidden',update.status!=='available');
+ $('install-update').classList.toggle('hidden',update.status!=='ready');
+ $('update-progress').classList.toggle('hidden',update.status!=='downloading');
+ $('update-progress').value=update.progress||0;
+ $('update-notes').textContent=update.notes||'';
+ $('update-notes-box').classList.toggle('hidden',!update.notes);
+ const announced=['available','downloading','ready'].includes(update.status);
+ $('update-banner').classList.toggle('hidden',!announced);
+ $('update-banner-text').textContent=announced?'邻控有新版本 '+update.latest+'，可在设置中更新。':'';
+ $('update-last-result').textContent=update.last_result?.message||'';
+}
+$('show-updates').onclick=()=>document.querySelector('[data-page="settings"]').click();
+$('check-updates').onclick=async()=>{try{await api('update-check');await refresh();}catch(e){note(e.message);}};
+$('download-update').onclick=async()=>{try{await api('update-download');await refresh();}catch(e){note(e.message);}};
+$('auto-update-check').onchange=async()=>{try{await api('update-preference',{enabled:$('auto-update-check').checked});await refresh();}catch(e){note(e.message);}};
+$('install-update').onclick=async()=>{
+ if(selectedPeer||remoteBusy||remotePending){note('请先结束远程操作并确认原结果，再安装更新。');return;}
+ if(!confirm('安装更新会重新启动邻控。本机电脑名称、配对和 SSH 设置会保留。现在安装？'))return;
+ try{await api('update-install');closing=true;document.querySelectorAll('button,input').forEach(x=>x.disabled=true);$('update-state').textContent='正在安装并重新启动，请稍候…';note('更新已开始；新版将自动打开。若此旧窗口未关闭，可以直接关闭。',true);if(window.webkit?.messageHandlers?.linkoUpdate)window.webkit.messageHandlers.linkoUpdate.postMessage('installing');else window.close();}catch(e){note(e.message);}
+};
