@@ -1,6 +1,13 @@
-﻿$ErrorActionPreference='Stop'
+﻿param([string]$PairingCode)
+$ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Windows.Forms
-$meta=Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'invitation.json') -Encoding UTF8|ConvertFrom-Json
+$codeMode= -not [string]::IsNullOrEmpty($PairingCode)
+$metadata=if($codeMode){'pairing-endpoint.json'}else{'invitation.json'}
+$meta=Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot $metadata) -Encoding UTF8|ConvertFrom-Json
+if($codeMode){
+ if($PairingCode -notmatch '^[0-9]{12}$'){throw '请输入 12 位配对验证码。'}
+ $meta|Add-Member -NotePropertyName name -NotePropertyValue ([string]$meta.controller)
+}
 $isolated=([string]$meta.isolated_test -match '^[0-9a-f]{32}$')
 if($isolated){
  $env:LANPILOT_ISOLATED=[string]$meta.isolated_test
@@ -8,13 +15,14 @@ if($isolated){
 }else{Remove-Item Env:LANPILOT_ISOLATED -ErrorAction SilentlyContinue}
 $root=Join-Path $env:LOCALAPPDATA 'CodexRemoteDesktop'
 if(Test-Path -LiteralPath (Join-Path $root 'relay-pairing.bin')){throw 'Already paired: this invitation cannot replace an existing identity.'}
-if([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -ge [int64]$meta.expires){throw 'Invitation expired; obtain a new installer.'}
+if(-not $codeMode -and [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -ge [int64]$meta.expires){throw 'Invitation expired; obtain a new installer.'}
 $msg="Connect this Windows account to the LanPilot Mac controller as '$($meta.name)'? The controller will be able to view and operate this signed-in desktop."
 if($isolated){$msg="Connect a temporary READ-ONLY test profile as '$($meta.name)'? Your normal pairing, startup and shortcuts will not be changed."}
 if([Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName -eq 'zh'){
  if($isolated){$msg="将此电脑以「$($meta.name)」的名称临时接入邻控吗？这个验收实例只能查看屏幕，不会修改已有配对、启动项或快捷方式。"}
  else{$msg="将此 Windows 账户以「$($meta.name)」的名称接入邻控 Mac 吗？这台 Mac 将能查看当前桌面、操作键鼠，并运行限定的文件作业。"}
 }
+if($codeMode){$msg="连接到控制端「$($meta.controller)」吗？对方将能查看当前桌面、操作键鼠，并运行限定的文件作业。请确认验证码来自您信任的控制端。"}
 if([Windows.Forms.MessageBox]::Show($msg,'LanPilot | Connect this PC','YesNo','Question') -ne 'Yes'){return}
 Add-Type -Path (Join-Path $PSScriptRoot 'Relay.cs')
 $base=[DesktopRelay]::NormalizeEndpoint([string]$meta.url)
@@ -24,7 +32,9 @@ $claimLock=[IO.File]::Open((Join-Path $root 'invite.lock'),'OpenOrCreate','ReadW
 try{
 if(Test-Path -LiteralPath (Join-Path $root 'relay-pairing.bin')){throw 'Existing pairing; invitation stopped.'}
 $xml=& (Join-Path $PSScriptRoot 'Pair-Device.ps1')
-$reply=[DesktopRelay]::Exchange(($base+'/claim'),[string]$meta.token,[string]$meta.pin,'POST',(@{public_key=[string]$xml}|ConvertTo-Json -Compress))|ConvertFrom-Json
+$claimPath=if($codeMode){'/claim-code'}else{'/claim'}
+$credential=if($codeMode){$PairingCode}else{[string]$meta.token}
+$reply=[DesktopRelay]::Exchange(($base+$claimPath),$credential,[string]$meta.pin,'POST',(@{public_key=[string]$xml}|ConvertTo-Json -Compress))|ConvertFrom-Json
 if($reply.device_id -notmatch '^[0-9a-f]{12}$' -or ([DesktopRelay]::NormalizeEndpoint($reply.route)) -cne $base){throw 'Invalid claim response.'}
 $pairing=[Convert]::FromBase64String($reply.pairing)
 if($pairing.Length -ne 256){throw 'Invalid pairing ciphertext.'}

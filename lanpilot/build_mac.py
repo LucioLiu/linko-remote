@@ -4,7 +4,7 @@ from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 out=Path(sys.argv[1]).resolve();contents=out/'Contents'
 for sub in ['MacOS','Resources']:(contents/sub).mkdir(parents=True,exist_ok=True)
-(contents/'Info.plist').write_bytes(plistlib.dumps({'CFBundleName':'邻控','CFBundleDisplayName':'邻控','CFBundleIdentifier':'local.lanpilot.desktop','CFBundleVersion':'0.6.0','CFBundleShortVersionString':'0.6.0','CFBundleExecutable':'LanPilot','NSHighResolutionCapable':True}))
+(contents/'Info.plist').write_bytes(plistlib.dumps({'CFBundleName':'邻控','CFBundleDisplayName':'邻控','CFBundleIdentifier':'local.lanpilot.desktop','CFBundleVersion':'0.7.0','CFBundleShortVersionString':'0.7.0','CFBundleExecutable':'LanPilot','NSHighResolutionCapable':True}))
 code=contents/'Resources/code'
 code.mkdir(exist_ok=True)
 for n in ['relay.py','desktop.py','lanpilot_mcp.py','lanpilot_service.py']:shutil.copyfile(root/n,code/n)

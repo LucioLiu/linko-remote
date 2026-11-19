@@ -2,6 +2,7 @@
 import argparse
 import fcntl
 import json
+import json
 import os
 import plistlib
 import re
@@ -10,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -72,6 +74,11 @@ def launch_definition(config):
         return
     if loaded:
         run_launchctl("bootout", target)
+        # Supervisors drain their child process on SIGTERM. launchctl bootout
+        # may return while the old job still occupies its registration.
+        for _ in range(100):
+            if run_launchctl("print",target,check=False).returncode != 0:break
+            time.sleep(.1)
     try:
         atomic_write(path, plistlib.dumps(config))
         run_launchctl("bootstrap", f"gui/{os.getuid()}", str(path))
@@ -142,6 +149,9 @@ def install(device, server, remote, local, binary, secret_file=None):
             private_secret(secret_file)
             forward_args = ["/usr/bin/python3", "-m", "lanpilot.wan_forward", "_forward",
                             str(secret_file.resolve()), *forward_args]
+        cfg=json.loads((Path(Bridge().device(device)['runtime'])/'config.json').read_text())
+        forward_args=['/usr/bin/python3','-m','lanpilot.tunnel_supervisor',
+                      '--host',server,'--remote',str(remote),'--pin',cfg['pin'],'--',*forward_args]
         configs = [
             definition(gateway, ["/usr/bin/python3", "-m", "lanpilot.worker_gateway",
                                  "--device", device, "--port", str(local)]),

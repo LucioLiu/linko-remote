@@ -3,6 +3,13 @@ from pathlib import Path
 from .core import Bridge
 p=argparse.ArgumentParser(prog='邻控');s=p.add_subparsers(dest='command',required=True)
 s.add_parser('devices')
+s.add_parser('ssh-list')
+x=s.add_parser('ssh-add');x.add_argument('name');x.add_argument('host');x.add_argument('--user',default='');x.add_argument('--port',type=int,default=22)
+x=s.add_parser('ssh-open');x.add_argument('id')
+x=s.add_parser('ssh-rename');x.add_argument('id');x.add_argument('name')
+x=s.add_parser('rename');x.add_argument('device');x.add_argument('name')
+x=s.add_parser('pair-code');x.add_argument('name');x.add_argument('--minutes',type=int,default=10)
+x=s.add_parser('windows-client');x.add_argument('installer',type=Path);x.add_argument('--controller',default='我的 Mac');x.add_argument('--isolated-test',action='store_true');x.add_argument('--generic',action='store_true')
 for a in ['service-install','service-start','service-stop']:s.add_parser(a)
 x=s.add_parser('enroll');x.add_argument('name');x.add_argument('public_xml',type=Path);x.add_argument('installer',type=Path)
 x=s.add_parser('invite');x.add_argument('name');x.add_argument('installer',type=Path);x.add_argument('--minutes',type=int,default=15);x.add_argument('--isolated-test',action='store_true',help='isolated read-only acceptance profile; no user startup or shortcuts')
@@ -20,6 +27,24 @@ if a.command.startswith('service-'):
  from . import service
  r=getattr(service,a.command.split('-')[1])()
 elif a.command=='devices':r=b.health_all()
+elif a.command.startswith('ssh-'):
+ from .ssh_profiles import profiles,save,open_terminal,rename
+ try:
+  if a.command=='ssh-list':r=profiles(b)
+  elif a.command=='ssh-add':r=save(b,a.name,a.host,a.user,a.port)
+  elif a.command=='ssh-rename':r=rename(b,a.id,a.name)
+  else:r=open_terminal(b,a.id)
+ except Exception as e:p.exit(1,str(e)+'\n')
+elif a.command=='rename':
+ try:r=b.rename(a.device,a.name)
+ except Exception as e:p.exit(1,str(e)+'\n')
+elif a.command in ('pair-code','windows-client'):
+ from .invite_gateway import ensure_endpoint
+ from .pairing_codes import issue_code,export_client
+ try:
+  if a.command=='pair-code' or not a.generic:ensure_endpoint(b)
+  r=issue_code(b,a.name,a.minutes) if a.command=='pair-code' else export_client(b,a.installer,a.controller,a.isolated_test,a.generic)
+ except Exception as e:p.exit(1,str(e)+'\n')
 elif a.command in ('invite','invite-route'):
  from .invite_gateway import ensure_endpoint
  from .invitations import issue

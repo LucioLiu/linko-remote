@@ -4,6 +4,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from .core import Bridge
 from .invitations import claim, directory, profile
+from .pairing_codes import claim_code, RateLimited
 from .enrollment import local_address
 from .wan_forward import WAN, atomic_write, definition, launch_definition, deployment_lock, load_definition
 from .worker_gateway import WorkerGateway, WorkerHandler
@@ -13,18 +14,22 @@ class Handler(WorkerHandler):
         self.close_connection=True;self.send_error(code)
     def dispatch(self):
         path=urlsplit(self.path).path
-        if not ((self.command=='POST' and self.path in ('/claim','/result')) or (self.command=='GET' and path=='/poll')):
+        if not ((self.command=='POST' and self.path in ('/claim','/claim-code','/result')) or (self.command=='GET' and path=='/poll')):
             return self.reject(404)
         values=self.headers.get_all('Authorization',[])
         if len(values)!=1 or not re.fullmatch(r'Bearer [A-Za-z0-9_-]{1,90}',values[0]):return self.reject(401)
         token=values[0][7:]
-        if self.path=='/claim':
+        if self.path in ('/claim','/claim-code'):
             lengths=self.headers.get_all('Content-Length',[])
             if len(lengths)!=1 or not re.fullmatch(r'[0-9]{1,4}',lengths[0]) or not 1<=int(lengths[0])<=6000 or self.headers.get('Transfer-Encoding'):return self.reject(400)
             try:
                 req=json.loads(self.rfile.read(int(lengths[0])))
                 if not isinstance(req,dict) or set(req)!={'public_key'}:raise ValueError()
-                answer=claim(self.server.bridge,token,req['public_key']);data=json.dumps(answer).encode()
+                if self.path=='/claim-code':answer=claim_code(self.server.bridge,token,req['public_key'],self.client_address[0])
+                else:answer=claim(self.server.bridge,token,req['public_key'])
+                data=json.dumps(answer).encode()
+            except RateLimited:
+                self.close_connection=True;self.send_response(429);self.send_header('Retry-After','60');self.send_header('Content-Length','0');self.end_headers();return
             except PermissionError:return self.reject(403)
             except Exception:return self.reject(400)
             self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data);return
@@ -84,12 +89,16 @@ def ensure_endpoint(bridge,server=None,remote=None,lan_only=False):
         if cfg['mode']=='wan':
             binary=WAN/'bin/bore'
             if not binary.is_file():raise ValueError('请先安装 bore 到 '+str(binary))
-            launch_definition(definition('local.lanpilot.invitation.tunnel',[str(binary),'local',str(cfg['local']),'--local-host','127.0.0.1','--to',cfg['server'],'--port',str(cfg['remote'])]))
+            launch_definition(definition('local.lanpilot.invitation.tunnel',[
+                '/usr/bin/python3','-m','lanpilot.tunnel_supervisor','--host',cfg['server'],
+                '--remote',str(cfg['remote']),'--pin',cfg['pin'],'--',
+                str(binary),'local',str(cfg['local']),'--local-host','127.0.0.1',
+                '--to',cfg['server'],'--port',str(cfg['remote'])]))
         # Avoid issuing an unusable credential if the selected public port belongs to someone else.
         u=urlsplit(cfg['url']);ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT);ctx.check_hostname=False;ctx.verify_mode=ssl.CERT_NONE
         for attempt in range(6):
             try:
-                with socket.create_connection((u.hostname,u.port),2.5) as sock,ctx.wrap_socket(sock,server_hostname=u.hostname) as tls:
+                with socket.create_connection((u.hostname,u.port),8) as sock,ctx.wrap_socket(sock,server_hostname=u.hostname) as tls:
                     if not hmac.compare_digest(hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest(),cfg['pin']):raise ValueError('gateway identity mismatch')
                 break
             except (OSError,ValueError):

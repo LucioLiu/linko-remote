@@ -87,7 +87,7 @@ exit /b %LP_RC%
         fcntl.flock(lock,fcntl.LOCK_EX)
         if any(d['name']==name for d in bridge.devices()):raise ValueError('设备名称已使用')
         for f in p.glob('*.json'):
-            if f.name=='endpoint.json':continue
+            if not re.fullmatch('[a-f0-9]{64}.json',f.name):continue
             s=json.loads(f.read_text())
             if s['expires']<=time.time():f.unlink()
             elif s['name']==name:raise ValueError('该设备已有未过期邀请')

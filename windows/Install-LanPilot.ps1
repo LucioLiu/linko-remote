@@ -42,7 +42,7 @@ try {
   [void][DesktopRelay]::NormalizeEndpoint($pair.url)
  }finally{$rsa.Dispose()}
  $base=Join-Path $env:LOCALAPPDATA 'LanPilot'
- $dest=Join-Path $base ('0.6.0-'+(Get-Date -Format 'yyyyMMddHHmmssfff'))
+ $dest=Join-Path $base ('0.7.0-'+(Get-Date -Format 'yyyyMMddHHmmssfff'))
  New-Item -ItemType Directory -Force $dest|Out-Null
  foreach($name in @('Desktop.cs','Relay.cs','Discovery.cs','Start-Desktop.ps1','LanPilot.ps1','Launcher.cs','UserStartup.ps1','WorkerRunspace.ps1','LocalJob.ps1','LocalJobHost.ps1','LedgerReconcile.cs')){Copy-Item (Join-Path $PSScriptRoot $name) $dest}
  Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition ([IO.File]::ReadAllText((Join-Path $dest 'Launcher.cs'))) -OutputAssembly (Join-Path $dest 'LanPilot.exe') -OutputType WindowsApplication
@@ -83,6 +83,7 @@ try {
   }finally{$lock.Dispose()}
  }
  $exe=Join-Path $dest 'LanPilot.exe'
+ [IO.File]::WriteAllText((Join-Path $root 'client.json'),(@{exe=$exe}|ConvertTo-Json -Compress))
  if($IsolatedTest){$startup='isolated_test_no_startup'}else{
  $startup=Set-UserStartup $exe
  if((Get-UserStartup $exe) -ne $startup){throw 'Login startup target was not verified.'}

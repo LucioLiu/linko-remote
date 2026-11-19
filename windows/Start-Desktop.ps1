@@ -1,4 +1,4 @@
-param([switch]$AllowInput, [string]$RelayConfig, [switch]$TargetGuard, [switch]$Persistent, [switch]$LanDiscovery, [Threading.ManualResetEvent]$StopEvent, [ValidatePattern('^[a-f0-9]{32}$')][string]$Generation)
+param([switch]$AllowInput, [string]$RelayConfig, [switch]$TargetGuard, [switch]$Persistent, [switch]$LanDiscovery, [switch]$WanOnly, [Threading.ManualResetEvent]$StopEvent, [ValidatePattern('^[a-f0-9]{32}$')][string]$Generation)
 $ErrorActionPreference = 'Stop'
 if($env:LANPILOT_ISOLATED -match '^[0-9a-f]{32}$' -and $env:LOCALAPPDATA -eq (Join-Path ([IO.Path]::GetTempPath()) ('LanPilot-Invite-QA-'+$env:LANPILOT_ISOLATED))){$AllowInput=$false}
 $root = Join-Path $env:LOCALAPPDATA 'CodexRemoteDesktop'
@@ -40,6 +40,7 @@ try {
      $route=[DesktopRelay]::NormalizeEndpoint($config.url)
     }catch{Write-Warning 'Ignoring invalid relay-route.json; using paired routes.'}
    }
+   if($WanOnly){if(-not $route){throw 'WAN_TEST_ROUTE_REQUIRED'};return $route}
    if($LanDiscovery){
     try{$local=[LanPilotDiscovery]::Find($relay.token)}catch{Write-Verbose 'LAN discovery unavailable'}
    }
@@ -173,7 +174,7 @@ try {
     continue
    }
    if($Persistent){
-     $live=@{pid=$PID;session=$session;host=$(if($Generation){'panel'}else{'standalone'});input=[bool]$AllowInput;guard=[bool]$TargetGuard;last_seen=[DateTime]::UtcNow.ToString('o')}
+     $live=@{pid=$PID;session=$session;host=$(if($Generation){'panel'}else{'standalone'});input=[bool]$AllowInput;guard=[bool]$TargetGuard;endpoint=[string]$relay.url;wan_only=[bool]$WanOnly;last_seen=[DateTime]::UtcNow.ToString('o')}
      $live|ConvertTo-Json -Compress|Set-Content -Encoding UTF8 (Join-Path $root 'online.json.tmp')
      Move-Item -Force (Join-Path $root 'online.json.tmp') (Join-Path $root 'online.json')
     }

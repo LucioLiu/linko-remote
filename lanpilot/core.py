@@ -18,6 +18,20 @@ class Bridge:
   matches=[d for d in self.devices() if name in [d['id'],d['name']]]
   if len(matches)!=1:raise ValueError('设备不存在或名称不唯一')
   return matches[0]
+ def rename(self, identifier, name):
+  name=name.strip()
+  if not name or len(name)>100 or any(ord(c)<32 or ord(c)==127 for c in name):
+   raise ValueError('请输入 1–100 个字符的电脑名称')
+  with (self.home/'registry.lock').open('a') as lock:
+   fcntl.flock(lock,fcntl.LOCK_EX)
+   devices=self.devices()
+   found=next((d for d in devices if d['id']==identifier),None)
+   if found is None:raise ValueError('设备不存在')
+   if any(d['id']!=identifier and name in (d['name'],d['id']) for d in devices):raise ValueError('设备名称已使用')
+   found['name']=name
+   from .wan_forward import atomic_write
+   atomic_write(self.registry,json.dumps({'devices':devices},ensure_ascii=False).encode())
+   return {'id':identifier,'name':name}
  def adopt(self, name, runtime):
   name=name.strip()
   if not name or len(name)>120:raise ValueError('请输入有效的设备名称')

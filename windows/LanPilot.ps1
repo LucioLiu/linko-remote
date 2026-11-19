@@ -13,14 +13,32 @@ if(-not $mutex.WaitOne(0)){exit}
 $script:worker=$null;$script:control=$true;$script:stopping=$false;$script:restart=$false;$script:retryAt=$null
 $root=Join-Path $env:LOCALAPPDATA 'CodexRemoteDesktop'
 $form=New-Object Windows.Forms.Form
-$form.Text='邻控 · 让 AI 连接这台电脑';$form.Size=New-Object Drawing.Size(540,380);$form.StartPosition='CenterScreen';$form.Font=New-Object Drawing.Font('Microsoft YaHei UI',11)
+$form.Text='邻控 · Linko Remote';$form.Size=New-Object Drawing.Size(620,480);$form.StartPosition='CenterScreen';$form.Font=New-Object Drawing.Font('Microsoft YaHei UI',11);$form.BackColor=[Drawing.Color]::White;$form.FormBorderStyle='FixedDialog';$form.MaximizeBox=$false
 $title=New-Object Windows.Forms.Label;$title.Text='邻控';$title.Font=New-Object Drawing.Font('Microsoft YaHei UI',26,[Drawing.FontStyle]::Bold);$title.SetBounds(28,20,450,50);$form.Controls.Add($title)
-$status=New-Object Windows.Forms.Label;$status.SetBounds(32,85,460,65);$status.Text='准备连接';$form.Controls.Add($status)
-$connect=New-Object Windows.Forms.Button;$connect.Text='连接';$connect.SetBounds(30,160,130,40);$form.Controls.Add($connect)
-$mode=New-Object Windows.Forms.CheckBox;$mode.Text='允许 AI 键鼠和限定文件作业';$mode.Checked= -not $isolated;$mode.Enabled= -not $isolated;$mode.SetBounds(180,165,280,30);$form.Controls.Add($mode)
-$hint=New-Object Windows.Forms.Label;$hint.Text="保持此程序运行，关闭窗口后会驻留托盘。`n控制会作用于这台电脑的当前桌面。";$hint.SetBounds(32,270,470,55);$form.Controls.Add($hint)
+$status=New-Object Windows.Forms.Label;$status.SetBounds(32,170,540,60);$status.Text='准备连接';$form.Controls.Add($status)
+$connect=New-Object Windows.Forms.Button;$connect.Text='连接';$connect.SetBounds(30,240,150,42);$form.Controls.Add($connect)
+$mode=New-Object Windows.Forms.CheckBox;$mode.Text='允许 AI 键鼠和限定文件作业';$mode.Checked= -not $isolated;$mode.Enabled= -not $isolated;$mode.SetBounds(200,245,350,30);$form.Controls.Add($mode)
+$hint=New-Object Windows.Forms.Label;$hint.Text="保持此程序运行，关闭窗口后会驻留托盘。`n控制会作用于这台电脑的当前桌面。";$hint.SetBounds(32,360,550,60);$form.Controls.Add($hint)
+$namePath=Join-Path $root 'display-name.json'
+$computerName=$env:COMPUTERNAME
+try{if(Test-Path -LiteralPath $namePath){$computerName=[string]((Get-Content -LiteralPath $namePath -Raw -Encoding UTF8|ConvertFrom-Json).name)}}catch{}
+$nameLabel=New-Object Windows.Forms.Label;$nameLabel.Text=$computerName;$nameLabel.Font=New-Object Drawing.Font('Microsoft YaHei UI',17,[Drawing.FontStyle]::Bold);$nameLabel.SetBounds(32,85,410,40);$form.Controls.Add($nameLabel)
+$editName=New-Object Windows.Forms.Button;$editName.Text='编辑名称';$editName.SetBounds(450,85,115,34);$form.Controls.Add($editName)
+$editName.Add_Click({
+ $dialog=New-Object Windows.Forms.Form;$dialog.Text='编辑这台电脑的名称';$dialog.Size=New-Object Drawing.Size(420,180);$dialog.StartPosition='CenterParent'
+ $field=New-Object Windows.Forms.TextBox;$field.SetBounds(20,20,360,30);$field.Text=$nameLabel.Text;$field.MaxLength=100;$dialog.Controls.Add($field)
+ $save=New-Object Windows.Forms.Button;$save.Text='保存';$save.SetBounds(270,70,110,32);$save.DialogResult='OK';$dialog.Controls.Add($save);$dialog.AcceptButton=$save
+ try{if($dialog.ShowDialog($form) -eq 'OK'){
+  $value=$field.Text.Trim();if(-not $value -or $value -match '[\x00-\x1f\x7f]'){throw '请输入有效的电脑名称。'}
+  New-Item -ItemType Directory -Force -Path $root|Out-Null
+  $tmp=Join-Path $root ([guid]::NewGuid().ToString('N')+'.tmp')
+  try{[IO.File]::WriteAllText($tmp,(@{name=$value}|ConvertTo-Json -Compress));if(Test-Path -LiteralPath $namePath){[IO.File]::Replace($tmp,$namePath,$null)}else{[IO.File]::Move($tmp,$namePath)}}finally{if(Test-Path -LiteralPath $tmp){Remove-Item -LiteralPath $tmp}}
+  $nameLabel.Text=$value
+ }}catch{[Windows.Forms.MessageBox]::Show($_.Exception.Message,'保存失败')|Out-Null}finally{$dialog.Dispose()}
+})
+$nameHint=New-Object Windows.Forms.Label;$nameHint.Text='本机显示名称 · 控制端列表的备注可在 Mac 单独编辑';$nameHint.ForeColor=[Drawing.Color]::DimGray;$nameHint.SetBounds(32,130,550,28);$form.Controls.Add($nameHint)
 $exe=Join-Path $PSScriptRoot 'LanPilot.exe'
-$autostart=New-Object Windows.Forms.CheckBox;$autostart.Text='登录 Windows 后自动连接';if($isolated){$autostart.Enabled=$false}else{$autostart.Checked=[bool](Get-UserStartup $exe)};$autostart.SetBounds(32,220,285,30);$form.Controls.Add($autostart)
+$autostart=New-Object Windows.Forms.CheckBox;$autostart.Text='登录 Windows 后自动连接';if($isolated){$autostart.Enabled=$false}else{$autostart.Checked=[bool](Get-UserStartup $exe)};$autostart.SetBounds(32,302,330,30);$form.Controls.Add($autostart)
 $script:updatingStartup=$false
 $autostart.Add_CheckedChanged({
  if($script:updatingStartup){return}
@@ -31,7 +49,7 @@ $autostart.Add_CheckedChanged({
   [Windows.Forms.MessageBox]::Show($_.Exception.Message,'登录自启设置失败')|Out-Null
  }
 })
-$settings=New-Object Windows.Forms.Button;$settings.Text='远程地址…';$settings.SetBounds(333,215,130,36);$form.Controls.Add($settings)
+$settings=New-Object Windows.Forms.Button;$settings.Text='远程地址…';$settings.SetBounds(420,298,145,36);$form.Controls.Add($settings)
 $settings.Add_Click({
  $dialog=New-Object Windows.Forms.Form
  $dialog.Text='远程连接';$dialog.Size=New-Object Drawing.Size(475,190);$dialog.StartPosition='CenterParent'
@@ -69,7 +87,7 @@ function Start-OwnedWorker {
  if(-not (Test-Path -LiteralPath $RelayConfig)){$status.Text='尚未配对';return}
  if($script:worker){return}
  try{
-  $params=@{RelayConfig=$RelayConfig;TargetGuard=$true;Persistent=$true;LanDiscovery=$true;AllowInput=($mode.Checked -and -not $isolated)}
+  $params=@{RelayConfig=$RelayConfig;TargetGuard=$true;Persistent=$true;LanDiscovery=(-not $isolated);WanOnly=$isolated;AllowInput=($mode.Checked -and -not $isolated)}
   $script:worker=New-DesktopWorker (Join-Path $PSScriptRoot 'Start-Desktop.ps1') $params
   $status.Text='正在连接控制端…';$connect.Text='断开';$connect.Enabled=$true
  }catch{$status.Text='无法启动连接：'+$_.Exception.Message;$connect.Text='连接';$connect.Enabled=$true}
