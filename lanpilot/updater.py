@@ -388,7 +388,7 @@ def restore_windows_launcher(spec):
     quote = lambda value: "'" + str(value).replace("'", "''") + "'"
     script = "$shell=New-Object -ComObject WScript.Shell;"
     script += "foreach($folder in @('Desktop','Programs')){"
-    script += "$path=Join-Path ([Environment]::GetFolderPath($folder)) '邻控统一预览.lnk';"
+    script += "$path=Join-Path ([Environment]::GetFolderPath($folder)) '邻控.lnk';"
     script += "$link=$shell.CreateShortcut($path);$link.TargetPath=" + quote(python) + ";"
     script += "$link.Arguments='-m lanpilot.peer_client --open-browser';$link.WorkingDirectory=" + quote(code) + ";$link.Save()}"
     subprocess.run(['powershell.exe', '-NoProfile', '-EncodedCommand',

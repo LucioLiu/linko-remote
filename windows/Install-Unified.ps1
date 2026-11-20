@@ -65,7 +65,7 @@ try{
     if(-not (Get-Process -Id $prior.pid -ErrorAction SilentlyContinue)){break}
     Start-Sleep -Milliseconds 500
    }
-   if(Get-Process -Id $prior.pid -ErrorAction SilentlyContinue){throw '旧预览实例尚未退出，请关闭邻控统一预览后重试。'}
+   if(Get-Process -Id $prior.pid -ErrorAction SilentlyContinue){throw '邻控尚未退出，请退出当前运行的邻控后重试。'}
   }
  }
  $started=Start-Process -FilePath $python -ArgumentList $arguments -WorkingDirectory $target -RedirectStandardError (Join-Path $linkoHome 'startup.err') -PassThru
@@ -85,8 +85,16 @@ try{
  if(-not $ready){throw ('邻控本地服务没有正常启动，错误记录位于：'+(Join-Path $linkoHome 'startup.err'))}
  $shell=New-Object -ComObject WScript.Shell
  foreach($folder in @('Desktop','Programs')){
-  $path=Join-Path ([Environment]::GetFolderPath($folder)) '邻控统一预览.lnk'
+  $shortcutDirectory=[Environment]::GetFolderPath($folder)
+  $path=Join-Path $shortcutDirectory '邻控.lnk'
   $link=$shell.CreateShortcut($path);$link.TargetPath=$python;$link.Arguments=$arguments;$link.WorkingDirectory=$target;$link.Save()
+  $previousPath=Join-Path $shortcutDirectory '邻控统一预览.lnk'
+  if(Test-Path -LiteralPath $previousPath -PathType Leaf){
+   $previousLink=$shell.CreateShortcut($previousPath)
+   if($previousLink.TargetPath.StartsWith($base+'\',[StringComparison]::OrdinalIgnoreCase) -and $previousLink.Arguments -eq $arguments){
+    Remove-Item -LiteralPath $previousPath
+   }
+  }
  }
 }catch{
  [Windows.Forms.MessageBox]::Show($_.Exception.Message,'邻控启动未完成')|Out-Null

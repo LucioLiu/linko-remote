@@ -54,7 +54,7 @@ def mac(output, endpoint, engine):
     for name in ('MacOS','Resources/code/native'):(contents/name).mkdir(parents=True,exist_ok=True)
     code=contents/'Resources/code'
     copy_code(code,endpoint)
-    data={'CFBundleName':'邻控统一预览','CFBundleDisplayName':'邻控统一预览','CFBundleIdentifier':'local.linko.remote.unified.preview',
+    data={'CFBundleName':'邻控','CFBundleDisplayName':'邻控','CFBundleIdentifier':'local.linko.remote.unified.preview',
           'CFBundleVersion':VERSION.split('-')[0],'CFBundleShortVersionString':VERSION.split('-')[0],
           'LinkoReleaseVersion':VERSION,'CFBundleExecutable':'LinkoRemote','NSHighResolutionCapable':True,
           'LSMinimumSystemVersion':'14.0','NSAppTransportSecurity':{'NSAllowsLocalNetworking':True},'NSScreenCaptureUsageDescription':'允许可信电脑通过邻控查看本机屏幕。'}

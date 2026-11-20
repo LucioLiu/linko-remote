@@ -4,7 +4,7 @@
 
 ## 安装与旧版兼容
 
-Windows 解压后运行「打开邻控.cmd」；macOS 使用「邻控统一预览.app」。两端均自带运行环境。
+Windows 解压后运行「打开邻控.cmd」；macOS 打开应用「邻控」。两端均自带运行环境。
 
 预览版 Windows 配置位于 `%LOCALAPPDATA%\LinkoRemote`，macOS 配置位于 `~/Library/Application Support/LinkoRemote`。0.7 的安装与配对保留在原客户端中，尚未自动迁移到新协议。连接双方均需安装统一预览版。
 

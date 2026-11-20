@@ -6,7 +6,7 @@
 
 ## 下载统一预览版
 
-[Windows 10/11 x64](https://github.com/LucioLiu/linko-remote/releases/download/v0.8.1-preview.1/LinkoRemote-Windows-0.8.1-preview.1.zip) · [macOS 14+ Apple Silicon](https://github.com/LucioLiu/linko-remote/releases/download/v0.8.1-preview.1/LinkoRemote-macOS-arm64-0.8.1-preview.1.zip) · [版本说明与校验文件](https://github.com/LucioLiu/linko-remote/releases/tag/v0.8.1-preview.1)
+[Windows 10/11 x64](https://github.com/LucioLiu/linko-remote/releases/download/v0.8.2-preview.7/LinkoRemote-Windows-0.8.2-preview.7.zip) · [macOS 14+ Apple Silicon](https://github.com/LucioLiu/linko-remote/releases/download/v0.8.2-preview.7/LinkoRemote-macOS-arm64-0.8.2-preview.7.zip) · [版本说明与校验文件](https://github.com/LucioLiu/linko-remote/releases/tag/v0.8.2-preview.7)
 
 两端均自带运行环境。Windows 解压后双击「打开邻控.cmd」；Mac 将应用移入「应用程序」后打开。本预览版未做 Apple 开发者公证，macOS 可能提示来源限制。
 
