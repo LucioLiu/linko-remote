@@ -39,7 +39,7 @@ class LocalTransport:
 class FakeAgent:
     def __init__(self, home):
         self.workspace = Path(home) / 'worker'
-        self.workspace.mkdir()
+        self.workspace.mkdir(exist_ok=True)
         self.enabled = False
 
     def start(self):
@@ -176,6 +176,25 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.hub.dispatch('submit', self.a.config['credential'],
                               {'peer': self.target, 'id': 'a' * 32, 'request': {'action': 'observe'}})
+
+    def test_restart_restores_only_unpaused_long_term_access(self):
+        def restart():
+            self.b.close()
+            self.b = DesktopClient(self.b.home, self.endpoint, LocalTransport, FakeAgent)
+            with patch.object(self.b.stop_event, 'wait', side_effect=lambda _: self.b.stop_event.set()):
+                self.b._pump()
+            return self.a.agent_hub.call('state')['peers'][0]['can_control']
+
+        self.assertFalse(restart())
+        self.assertFalse(self.b.agent.enabled)
+        self.b.api('availability', {'enabled': True})
+        approval = self.a.api('access', {'peer': self.target})['approval']
+        self.b.api('approve', {'approval': approval, 'allow': True, 'persistent': True})
+        self.assertTrue(restart())
+        self.assertTrue(self.b.agent.enabled)
+        self.b.api('availability', {'enabled': False})
+        self.assertFalse(restart())
+        self.assertFalse(self.b.agent.enabled)
 
     def test_single_instance_lock(self):
         one = InstanceLock(Path(self.folder.name) / 'locks')

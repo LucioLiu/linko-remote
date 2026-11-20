@@ -300,10 +300,18 @@ class DesktopClient:
         while not self.stop_event.is_set():
             try:
                 if not registered:
-                    self.agent_hub.call('register', {'name': self.config['name'], 'platform': self.platform, 'live_version': 1})
-                    # A restarted application requires a new local decision;
-                    # a previous session grant must not silently reopen access.
-                    self.agent_hub.call('availability', {'enabled': False})
+                    with self.operation_lock:
+                        if self.stop_event.is_set():
+                            return
+                        self.agent_hub.call('register', {'name': self.config['name'], 'platform': self.platform, 'live_version': 1})
+                        # Clear temporary grants before restoring explicitly trusted peers.
+                        self.agent_hub.call('availability', {'enabled': False})
+                        if self.config.get('resume_trusted_access', True):
+                            peers = self.agent_hub.call('state').get('peers', [])
+                            if any(peer.get('trusted_incoming') for peer in peers):
+                                self.agent.start()
+                                self.agent_hub.call('availability', {'enabled': True})
+                                self.incoming = True
                     registered = True
                 self.permissions = self.agent.permissions()
                 workspace = self.agent.workspace
@@ -406,6 +414,9 @@ class DesktopClient:
             enabled = body.get('enabled')
             if type(enabled) is not bool:
                 raise ValueError('请明确选择是否允许连接')
+            with self.lock:
+                self.config['resume_trusted_access'] = enabled
+                atomic_json(self.path, self.config)
             if enabled:
                 self.agent.start()
             else:
@@ -525,15 +536,16 @@ class DesktopClient:
         return {'opened': True}
 
     def close(self):
+        self.stop_event.set()
         if self.live_view: self.live_view.close()
         self.live_agent.expire()
-        self.agent.stop()
-        self.stop_event.set()
         self.updater.stop.set()
-        try:
-            self.ui_hub.call('availability', {'enabled': False})
-        except Exception:
-            pass
+        with self.operation_lock:
+            self.agent.stop()
+            try:
+                self.ui_hub.call('availability', {'enabled': False})
+            except Exception:
+                pass
 
 
 class LocalHandler(http.server.BaseHTTPRequestHandler):

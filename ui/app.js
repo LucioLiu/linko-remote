@@ -55,7 +55,7 @@ async function refresh() {
   $('screen-permission').disabled=state.permissions.screen; $('input-permission').disabled=state.permissions.input;
   renderDevices(); renderSSH(); renderUpdates();
   if(!activeApproval && state.approvals.length){activeApproval=state.approvals[0];$('approval-name').textContent=activeApproval.peer.name;$('approval-detail').textContent=platform(activeApproval.peer.platform)+' · '+activeApproval.peer.id;$('approval-permission').textContent=state.supports_long_term_trust
-   ? '允许后，只要本机开启接收连接，这台电脑就可以查看屏幕并操作键鼠。授权不会到期，可在设备列表撤销。'
+   ? '允许后，这台电脑可直接查看屏幕并操作键鼠。邻控下次启动后仍可连接。你可以暂停接收连接，或在设备列表撤销授权。'
    : '允许后，对方可在一小时内查看本机屏幕并操作键鼠。';
   $('approve').textContent=state.supports_long_term_trust?'允许长期连接':'允许本次连接';
   $('approval-dialog').showModal();}
