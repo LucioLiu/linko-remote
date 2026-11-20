@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from urllib.parse import urlsplit
+from urllib.parse import parse_qs
 import uuid
 import webbrowser
 
@@ -25,10 +26,14 @@ from desktop import make_request
 from .peer_hub import display_name
 from .version import VERSION
 from .updater import UpdateManager
+from .live_agent import LiveAgent
+from .live_view import LiveView
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / 'ui'
 MAX_BODY = 24_000_000
+LEGACY_PREVIEW_ENDPOINT = {'url': 'https://bore.pub:49006',
+                           'pin': 'd660698b3705ed323698955c0e36fe0e2be71d11777eee3d2e2bc1ff2dde73af'}
 
 
 class InstanceLock:
@@ -88,7 +93,15 @@ class PinnedConnection(http.client.HTTPSConnection):
         super().connect()
         if not hmac.compare_digest(hashlib.sha256(self.sock.getpeercert(True)).hexdigest(), self.pin):
             self.close()
-            raise PermissionError('连接服务证书不匹配，已停止连接')
+            raise RelayIdentityError('连接服务证书不匹配，已停止连接')
+
+
+class HubRejection(PermissionError):
+    """The relay confirmed it rejected an operation before accepting it."""
+
+
+class RelayIdentityError(PermissionError):
+    """No request may be sent when the relay certificate changes."""
 
 
 class PinnedHub:
@@ -105,6 +118,18 @@ class PinnedHub:
         self.last_response = 0
 
     def call(self, operation, body=None):
+        # Read-only recovery may use a fresh connection after a relay closes an
+        # idle TLS socket. Never retry a command submission or any input.
+        for attempt in range(3):
+            try:
+                return self._call(operation, body)
+            except (HubRejection, RelayIdentityError):
+                raise
+            except (OSError, http.client.HTTPException):
+                if operation not in ('state', 'recover', 'live-view', 'live-agent-state', 'live-exchange', 'live-frame') or attempt == 2:
+                    raise
+
+    def _call(self, operation, body=None):
         with self.lock:
             try:
                 # The gateway bounds idle sockets to 30 seconds. Retire a
@@ -112,8 +137,8 @@ class PinnedHub:
                 if self.connection and time.monotonic() - self.last_response >= 20:
                     self.connection.close()
                     self.connection = None
-                if self.connection is None:
-                    self.connection = PinnedConnection(self.host, self.port, self.pin)
+                if self.connection is None or self.connection.sock is None:
+                    self._connect()
                 payload = json.dumps(body or {}, ensure_ascii=False, separators=(',', ':')).encode()
                 self.connection.request('POST', '/v2/' + operation, payload,
                                         {'Authorization': 'Bearer ' + self.credential, 'Content-Type': 'application/json'})
@@ -122,6 +147,8 @@ class PinnedHub:
                 if len(raw) > MAX_BODY:
                     raise ValueError('连接服务响应过大')
                 answer = json.loads(raw)
+                if response.status in (400, 401, 403) and answer.get('ok') is False:
+                    raise HubRejection(answer.get('error', '连接请求未完成'))
                 if response.status != 200 or not answer.get('ok'):
                     raise PermissionError(answer.get('error', '连接请求未完成'))
                 self.last_response = time.monotonic()
@@ -132,6 +159,24 @@ class PinnedHub:
                     self.connection = None
                 # A lost response never causes an action to be submitted again.
                 raise
+
+    def _connect(self):
+        # Establish TLS before handing any request bytes to the socket. A
+        # failed handshake can be retried even for input; a failed write cannot.
+        for attempt in range(2):
+            connection = PinnedConnection(self.host, self.port, self.pin)
+            try:
+                connection.connect()
+            except RelayIdentityError:
+                connection.close()
+                raise
+            except OSError:
+                connection.close()
+                if attempt:
+                    raise
+            else:
+                self.connection = connection
+                return
 
 
 class MailboxAgent:
@@ -151,7 +196,9 @@ class MailboxAgent:
 
     def start(self):
         if self.process and self.process.poll() is None:
-            return
+            if not self.stop_path.exists():
+                return
+            self.process.wait(timeout=5)
         self.stop_path.unlink(missing_ok=True)
         if sys.platform == 'darwin':
             permissions = self.permissions()
@@ -207,6 +254,12 @@ class DesktopClient:
         self.path = self.home / 'client.json'
         if self.path.exists():
             self.config = json.loads(self.path.read_text())
+            if self.config.get('endpoint') == LEGACY_PREVIEW_ENDPOINT and endpoint != LEGACY_PREVIEW_ENDPOINT:
+                # The verified release can replace its own retired preview
+                # service. Custom/self-hosted endpoints are never overwritten.
+                atomic_json(self.home / 'client-before-relay-migration.json', self.config)
+                self.config['endpoint'] = endpoint
+                atomic_json(self.path, self.config)
         else:
             credential = secrets.token_urlsafe(32)
             # Never import the developer's or the current user's OS hostname.
@@ -217,6 +270,8 @@ class DesktopClient:
             atomic_json(self.path, self.config)
         self.agent_hub = hub_factory(self.config['endpoint'], self.config['credential'])
         self.ui_hub = hub_factory(self.config['endpoint'], self.config['credential'])
+        self.live_hub = hub_factory(self.config['endpoint'], self.config['credential'])
+        self.live_input_hub = hub_factory(self.config['endpoint'], self.config['credential'])
         self.agent = agent_factory(self.home)
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
@@ -231,17 +286,21 @@ class DesktopClient:
         self.pending = json.loads(self.pending_path.read_text()) if self.pending_path.exists() else {}
         self.updating = False
         self.updater = UpdateManager(self.home, lambda: self.config.get('auto_update_check', True))
+        self.live_agent = LiveAgent(self, hub_factory, atomic_json)
+        self.live_session = None
+        self.live_view = None
 
     def start(self):
         threading.Thread(target=self._pump, daemon=True).start()
         self.updater.start()
+        self.live_agent.start()
 
     def _pump(self):
         registered = False
         while not self.stop_event.is_set():
             try:
                 if not registered:
-                    self.agent_hub.call('register', {'name': self.config['name'], 'platform': self.platform})
+                    self.agent_hub.call('register', {'name': self.config['name'], 'platform': self.platform, 'live_version': 1})
                     # A restarted application requires a new local decision;
                     # a previous session grant must not silently reopen access.
                     self.agent_hub.call('availability', {'enabled': False})
@@ -288,15 +347,39 @@ class DesktopClient:
             value.update(version=VERSION, connected=self.connected, error=self.error,
                          permissions=self.permissions, ssh=self.config['ssh'], pending=dict(self.pending))
         value['updates'] = self.updater.snapshot()
+        value['live_error'] = self.live_agent.error
+        value['live'] = self.live_view.snapshot(touch=False) if self.live_view else None
         return value
 
     def api(self, operation, body):
         if operation == 'state':
             return self.local_state()
+        if operation == 'live-view':
+            if not self.live_view or body.get('id') != self.live_view.id:
+                raise ValueError('连续桌面会话已结束')
+            return self.live_view.snapshot()
         with self.operation_lock:
             return self._api(operation, body)
 
     def _api(self, operation, body):
+        if operation in ('live-open', 'live-input', 'live-close'):
+            if self.updating:
+                raise ValueError('正在更新，暂不能连接')
+            if operation == 'live-open' and self.pending.get(body.get('peer')):
+                raise ValueError('请先查询上一操作结果')
+            if operation == 'live-close':
+                if self.live_view and self.live_view.id == body.get('id'): self.live_view.close()
+                self.live_session = None
+                try: return self.live_input_hub.call(operation, body)
+                except PermissionError: return {'closed': True}
+            if operation == 'live-open' and self.live_view and not self.live_view.stop.is_set():
+                raise ValueError('请先关闭当前远程桌面')
+            value = self.live_input_hub.call(operation, body)
+            if operation == 'live-open':
+                self.live_session = value['id']
+                self.live_view = LiveView(self.live_hub, value['id'], self.stop_event)
+                self.live_view.start()
+            return value
         if operation == 'update-check':
             return self.updater.begin('check')
         if operation == 'update-download':
@@ -312,7 +395,7 @@ class DesktopClient:
         if operation == 'update-install':
             with self.lock:
                 peers = self.state.get('peers', [])
-                if self.pending or self.incoming or any(p.get('incoming') or p.get('can_control') for p in peers):
+                if self.live_session or self.pending or self.incoming or any(p.get('incoming') or p.get('can_control') for p in peers):
                     raise ValueError('请先结束远程连接、确认原操作结果，并关闭允许连接，再安装更新')
                 value = self.updater.prepare_install()
                 self.updating = True
@@ -327,6 +410,7 @@ class DesktopClient:
                 self.agent.start()
             else:
                 self.agent.stop()
+                self.live_agent.expire()
             value = self.ui_hub.call(operation, {'enabled': enabled})
             self.incoming = enabled
             return value
@@ -373,6 +457,9 @@ class DesktopClient:
                 atomic_json(self.pending_path, self.pending)
             try:
                 self.ui_hub.call('submit', {'peer': peer, 'id': identifier, 'request': request})
+            except HubRejection:
+                self.clear_pending(identifier)
+                raise
             except Exception:
                 return {'id': identifier, 'state': 'unconfirmed', 'result': None}
             return self.recover(identifier)
@@ -398,10 +485,15 @@ class DesktopClient:
             raise ValueError('无效操作编号')
         result = self.ui_hub.call('recover', {'id': identifier})
         if result['state'] == 'complete':
-            with self.lock:
-                self.pending = {key: value for key, value in self.pending.items() if value != identifier}
-                atomic_json(self.pending_path, self.pending)
+            self.clear_pending(identifier)
         return result
+
+    def clear_pending(self, identifier):
+        with self.lock:
+            pending = {key: value for key, value in self.pending.items() if value != identifier}
+            if pending != self.pending:
+                atomic_json(self.pending_path, pending)
+                self.pending = pending
 
     def save_ssh(self, body):
         name = display_name(body.get('name'))
@@ -433,6 +525,8 @@ class DesktopClient:
         return {'opened': True}
 
     def close(self):
+        if self.live_view: self.live_view.close()
+        self.live_agent.expire()
         self.agent.stop()
         self.stop_event.set()
         self.updater.stop.set()
@@ -464,11 +558,50 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.valid_host():
             return self.respond(403, b'{}')
+        if self.path.startswith('/live-feed/'):
+            return self.live_feed()
         files = {'/': ('index.html', 'text/html; charset=utf-8'), '/app.js': ('app.js', 'application/javascript; charset=utf-8'), '/style.css': ('style.css', 'text/css; charset=utf-8')}
         if self.path not in files:
             return self.respond(404, b'{}')
         name, mime = files[self.path]
         return self.respond(200, (ASSETS / name).read_bytes(), mime)
+
+    def live_feed(self):
+        parsed = urlsplit(self.path)
+        identifier = parsed.path.removeprefix('/live-feed/')
+        nonce = parse_qs(parsed.query).get('session', [''])
+        view = getattr(self.server.client, 'live_view', None)
+        if (not re.fullmatch('[a-f0-9]{32}', identifier) or len(nonce) != 1
+                or not hmac.compare_digest(nonce[0], self.server.nonce)
+                or self.headers.get('Origin') not in (None, 'http://' + self.server.authority)
+                or not view or view.id != identifier):
+            return self.respond(403, b'{}')
+        self.close_connection = True
+        self.connection.settimeout(3)
+        self.send_response(200)
+        self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=linko-frame')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.wfile.write(b'--linko-frame\r\n')
+        sequence = None
+        try:
+            while not view.stop.is_set() and not self.server.client.stop_event.is_set():
+                with view.changed:
+                    frame = view.value.get('frame')
+                    if not frame or frame['seq'] == sequence:
+                        view.changed.wait(.5)
+                        continue
+                    sequence = frame['seq']
+                    raw = base64.b64decode(frame['jpeg_base64'], validate=True)
+                # Complete the boundary immediately: image decoders must not
+                # wait for the next WAN frame to finish the preceding part.
+                self.wfile.write(b'Content-Type: image/jpeg\r\nContent-Length: '
+                                 + str(len(raw)).encode() + b'\r\n\r\n' + raw + b'\r\n--linko-frame\r\n')
+                self.wfile.flush()
+        except (OSError, ValueError):
+            pass
 
     def do_POST(self):
         if not self.valid_host() or self.headers.get('Origin') not in (None, 'http://' + self.server.authority) or not hmac.compare_digest(self.headers.get('X-Linko-Session', ''), self.server.nonce):

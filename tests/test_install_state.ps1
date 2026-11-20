@@ -1,6 +1,29 @@
 # Offline test: mock only Windows I/O. This does not change startup, registry or processes.
 $ErrorActionPreference='Stop'
 $windows=Join-Path $PSScriptRoot '../windows'
+$installer=[Management.Automation.Language.Parser]::ParseFile((Join-Path $windows 'Install-Unified.ps1'),[ref]$null,[ref]$null)
+foreach($name in @('Confirm-InstalledPayload','Install-Payload')){
+ $definition=$installer.Find({param($node)$node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)
+ . ([scriptblock]::Create($definition.Extent.Text))
+}
+$fixture=Join-Path ([IO.Path]::GetTempPath()) ('LinkoInstallTest-'+[Guid]::NewGuid().ToString('N'))
+try{
+ $source=Join-Path $fixture 'source'
+ $target=Join-Path $fixture 'app/release'
+ foreach($folder in @('runtime','code')){New-Item -ItemType Directory -Path (Join-Path $source $folder) -Force|Out-Null}
+ $payload=Join-Path $source 'code/test.txt'
+ Set-Content -LiteralPath $payload -Value 'fixture'
+ $manifest=[pscustomobject]@{'code/test.txt'=('0'*64)}
+ try{Install-Payload $source $target $manifest;throw 'Invalid payload was installed'}
+ catch{if($_.Exception.Message -notlike '已安装文件校验未通过*'){throw}}
+ if(Test-Path -LiteralPath $target){throw 'Failed installation left a visible version directory'}
+ if(@(Get-ChildItem -LiteralPath (Split-Path $target) -Force).Count){throw 'Failed installation left stage files behind'}
+ $manifest.'code/test.txt'=(Get-FileHash -LiteralPath $payload -Algorithm SHA256).Hash
+ Install-Payload $source $target $manifest
+ Install-Payload $source $target $manifest
+ if((Get-Content -LiteralPath (Join-Path $target 'code/test.txt')) -ne 'fixture'){throw 'Installed payload missing'}
+}finally{Remove-Item -LiteralPath $fixture -Recurse -Force}
+
 foreach($name in @('LanPilot.ps1','Start-Desktop.ps1','Install-LanPilot.ps1','UserStartup.ps1','WorkerRunspace.ps1')){
  $errors=$null;$tokens=$null
  $parsed=[Management.Automation.Language.Parser]::ParseFile((Join-Path $windows $name),[ref]$tokens,[ref]$errors)

@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 
 from desktop import make_request
+from .live import LiveSessions
 
 
 def digest(value):
@@ -57,7 +58,10 @@ class PeerHub:
           id TEXT PRIMARY KEY, caller TEXT, target TEXT, payload TEXT, expires REAL,
           delivered INTEGER DEFAULT 0, result TEXT, created REAL);
         CREATE TABLE IF NOT EXISTS attempts (source TEXT, operation TEXT, at REAL);
+        CREATE TABLE IF NOT EXISTS capabilities (id TEXT PRIMARY KEY, live INTEGER);
+        CREATE TABLE IF NOT EXISTS migrated_receipts (id TEXT PRIMARY KEY, hash TEXT);
         ''')
+        self.live = LiveSessions(self)
 
     def close(self):
         self.db.close()
@@ -128,10 +132,14 @@ class PeerHub:
             self.db.execute('INSERT INTO devices VALUES(?,?,?,?,?,0) '
                             'ON CONFLICT(id) DO UPDATE SET name=excluded.name,seen=excluded.seen',
                             (identifier, digest(credential), name, platform, now))
+            self.db.execute('INSERT OR REPLACE INTO capabilities VALUES(?,?)', (identifier, int(body.get('live_version') == 1)))
             return {'id': identifier, 'name': name, 'platform': platform}
         device = self._device(credential)
         me = device['id']
-        self.db.execute('UPDATE devices SET seen=? WHERE id=?', (now, me))
+        if now - device['seen'] >= 2:
+            self.db.execute('UPDATE devices SET seen=? WHERE id=?', (now, me))
+        if operation.startswith('live-'):
+            return self.live.dispatch(operation, me, body, now)
         if operation == 'name':
             name = display_name(body.get('name'))
             self.db.execute('UPDATE devices SET name=? WHERE id=?', (name, me))
@@ -141,7 +149,7 @@ class PeerHub:
                 raise ValueError('请明确选择是否允许连接')
             self.db.execute('UPDATE devices SET incoming=? WHERE id=?', (body['enabled'], me))
             if not body['enabled']:
-                self.db.execute('DELETE FROM grants WHERE target=?', (me,))
+                self.db.execute('DELETE FROM grants WHERE target=? AND expires IS NOT NULL', (me,))
                 self.db.execute('DELETE FROM codes WHERE owner=?', (me,))
                 self.db.execute("UPDATE approvals SET state='denied' WHERE target=? AND state='pending'", (me,))
             return {'incoming': body['enabled']}
@@ -182,6 +190,9 @@ class PeerHub:
                 self.db.execute('DELETE FROM codes WHERE hash=?', (digest(body['code']),))
             return {'approval': identifier, 'state': 'pending', 'peer': self._identity(peer)}
         if operation == 'approve':
+            persistent = body.get('persistent', False)
+            if type(persistent) is not bool or (persistent and body.get('allow') is not True):
+                raise ValueError('无效的连接授权选项')
             row = self._one("SELECT * FROM approvals WHERE id=? AND target=? AND state='pending' AND expires>?",
                             (body.get('approval'), me, now))
             if row is None or type(body.get('allow')) is not bool:
@@ -191,7 +202,8 @@ class PeerHub:
                             ('approved' if allow else 'denied', row['id']))
             if allow:
                 self.db.execute('INSERT OR IGNORE INTO contacts VALUES(?,?)', tuple(sorted((me, row['caller']))))
-                self.db.execute('INSERT OR REPLACE INTO grants VALUES(?,?,?)', (row['caller'], me, now + 3600))
+                expires = None if persistent else now + 3600
+                self.db.execute('INSERT OR REPLACE INTO grants VALUES(?,?,?)', (row['caller'], me, expires))
             return {'state': 'approved' if allow else 'denied'}
         if operation == 'disconnect':
             peer = body.get('peer')
@@ -204,23 +216,28 @@ class PeerHub:
             result = []
             for peer in peers:
                 item = self._identity(peer)
+                cap = self._one('SELECT live FROM capabilities WHERE id=?', (peer['id'],))
+                item['live'] = bool(cap and cap['live'])
                 item.update(online=now - peer['seen'] < 20,
-                            can_control=bool(self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND expires>?',
+                            trusted_incoming=bool(self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND expires IS NULL',
+                                                            (peer['id'], me))),
+                            can_control=bool(peer['incoming'] and self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND (expires IS NULL OR expires>?)',
                                                       (me, peer['id'], now))),
-                            incoming=bool(self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND expires>?',
+                            incoming=bool(device['incoming'] and self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND (expires IS NULL OR expires>?)',
                                                    (peer['id'], me, now))))
                 result.append(item)
             approvals = self.db.execute("SELECT * FROM approvals WHERE target=? AND state='pending' AND expires>?",
                                         (me, now)).fetchall()
             outgoing = self.db.execute('SELECT id,state,target FROM approvals WHERE caller=? AND expires>?', (me, now)).fetchall()
             return {'self': self._identity(device), 'incoming': bool(device['incoming']), 'peers': result,
+                    'supports_long_term_trust': True,
                     'approvals': [self._approval(row) for row in approvals],
                     'outgoing': [dict(row) for row in outgoing]}
         if operation == 'poll':
             self.db.execute('UPDATE devices SET seen=? WHERE id=?', (now, me))
             commands = self.db.execute('SELECT * FROM commands WHERE target=? AND delivered=0 AND result IS NULL ORDER BY created', (me,)).fetchall()
             for command in commands:
-                permitted = device['incoming'] and self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND expires>?',
+                permitted = device['incoming'] and self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND (expires IS NULL OR expires>?)',
                                                             (command['caller'], me, now))
                 if command['expires'] <= now or not permitted:
                     value = {'request_id': command['id'], 'ok': False, 'input_attempted': False,
@@ -233,6 +250,9 @@ class PeerHub:
             return None
         if operation == 'submit':
             peer = body.get('peer')
+            self.live.prune(now)
+            if any(s['target'] == peer for s in self.live.sessions.values()):
+                raise ValueError('请先关闭连续桌面，再使用逐步操作')
             identifier = body.get('id')
             payload = body.get('request')
             if not isinstance(identifier, str) or not re.fullmatch('[a-f0-9]{32}', identifier) or not isinstance(payload, dict):
@@ -248,7 +268,7 @@ class PeerHub:
                     raise PermissionError('操作编号冲突')
                 return {'id': identifier}
             target = self._one('SELECT * FROM devices WHERE id=?', (peer,))
-            if not target or not target['incoming'] or not self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND expires>?', (me, peer, now)):
+            if not target or not target['incoming'] or not self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND (expires IS NULL OR expires>?)', (me, peer, now)):
                 raise PermissionError('尚未取得对方授权')
             if self._one('SELECT 1 FROM commands WHERE target=? AND result IS NULL', (peer,)):
                 raise ValueError('上一操作结果未确认，请先查询原结果')
@@ -261,6 +281,11 @@ class PeerHub:
             if prior is None or not isinstance(value, dict) or value.get('request_id') != identifier or type(value.get('ok')) is not bool or type(value.get('input_attempted')) is not bool:
                 raise PermissionError('无效操作回执')
             encoded = json.dumps(value, sort_keys=True, separators=(',', ':'))
+            migrated = self._one('SELECT hash FROM migrated_receipts WHERE id=?', (identifier,))
+            if migrated and hmac.compare_digest(migrated['hash'], hashlib.sha256(encoded.encode()).hexdigest()):
+                return {'saved': True}
+            if prior['result'] is not None and json.loads(prior['result']).get('error') == 'SCREEN_CAPTURE_TIMED_OUT':
+                return {'saved': True, 'late_read_only_result': True}
             if prior['result'] is not None and prior['result'] != encoded:
                 raise PermissionError('不能覆盖已经确认的回执')
             self.db.execute('UPDATE commands SET result=? WHERE id=?', (encoded, identifier))
@@ -282,6 +307,13 @@ class PeerHub:
                 return {'id': identifier, 'state': 'complete', 'result': receipt}
             if row['caller'] != me:
                 raise PermissionError('找不到此操作')
+            # A lost poll response must not block screenshots forever. Only a
+            # read-only observation can be retired without knowing execution.
+            if row['result'] is None and row['expires'] <= now and json.loads(row['payload']).get('action') == 'observe':
+                receipt = {'request_id': identifier, 'ok': False, 'input_attempted': False,
+                           'error': 'SCREEN_CAPTURE_TIMED_OUT'}
+                self.db.execute('UPDATE commands SET result=? WHERE id=?', (json.dumps(receipt), identifier))
+                return {'id': identifier, 'state': 'complete', 'result': receipt}
             return {'id': row['id'], 'state': 'complete' if row['result'] else 'unconfirmed',
                     'result': json.loads(row['result']) if row['result'] else None}
         raise ValueError('不支持的请求')

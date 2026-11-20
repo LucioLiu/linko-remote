@@ -274,7 +274,8 @@ public static class RemoteDesktop {
    using(var bitmap=new Bitmap(b[2],b[3])) {using(var g=Graphics.FromImage(bitmap)) {g.CopyFromScreen(b[0],b[1],0,0,new Size(b[2],b[3]));} using(var s=new MemoryStream()) {bitmap.Save(s,ImageFormat.Png); return s.ToArray();}}
  }
  public static string InputStopFile;
- static void Send(INPUT[] a) {if(!String.IsNullOrEmpty(InputStopFile)&&File.Exists(InputStopFile))throw new Exception("WORKER_STOPPING_BEFORE_INPUT");Check();CheckInputAccess(); if(SendInput((uint)a.Length,a,Marshal.SizeOf(typeof(INPUT)))!=a.Length) throw new Exception("INPUT_NOT_CONFIRMED_POSSIBLE_UIPI_DO_NOT_RETRY");}
+ public static long LiveDeadlineUnixMs;
+ static void Send(INPUT[] a) {if(LiveDeadlineUnixMs>0&&DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()>LiveDeadlineUnixMs)throw new Exception("LIVE_INPUT_LEASE_EXPIRED");if(!String.IsNullOrEmpty(InputStopFile)&&File.Exists(InputStopFile))throw new Exception("WORKER_STOPPING_BEFORE_INPUT");Check();CheckInputAccess(); if(SendInput((uint)a.Length,a,Marshal.SizeOf(typeof(INPUT)))!=a.Length) throw new Exception("INPUT_NOT_CONFIRMED_POSSIBLE_UIPI_DO_NOT_RETRY");}
  static INPUT Mouse(int x,int y,uint flags,uint data) {var i=new INPUT();i.type=0;i.u.mouse=new MOUSE{x=x,y=y,flags=flags,data=data};return i;}
  static INPUT Key(ushort vk,ushort scan,uint flags) {var i=new INPUT();i.type=1;i.u.key=new KEY{vk=vk,scan=scan,flags=flags};return i;}
  public static void Move(int x,int y) {var b=Bounds();if(x<0||y<0||x>=b[2]||y>=b[3]) throw new Exception("OUT_OF_FRAME"); Send(new[]{Mouse((int)Math.Round(x*65535.0/Math.Max(1,b[2]-1)),(int)Math.Round(y*65535.0/Math.Max(1,b[3]-1)),0xC001,0)});
@@ -308,5 +309,49 @@ public static class RemoteDesktop {
  }
  public static void Keys(ushort[] keys) {
   var a=new INPUT[keys.Length*2];for(int i=0;i<keys.Length;i++){a[i]=Key(keys[i],0,0);a[a.Length-1-i]=Key(keys[i],0,2);} Send(a);
+ }
+ // Explicit human live sessions use ordered button/key transitions. Guarded
+ // one-shot AI actions above keep their exact-frame ownership checks.
+ static HashSet<ushort> liveKeys=new HashSet<ushort>();
+ static HashSet<int> liveButtons=new HashSet<int>();
+ static uint Extended(ushort vk) {return (vk==163||vk==165||vk==91||vk==92||(vk>=33&&vk<=46))?1u:0u;}
+ public static void LiveKey(ushort vk,bool down) {
+  if(down)liveKeys.Add(vk);
+  Send(new[]{Key(vk,0,Extended(vk)|(down?0u:2u))});
+  if(!down)liveKeys.Remove(vk);
+ }
+ public static void LivePointer(int x,int y,int button,int transition) {
+  if(x<0||x>65535||y<0||y>65535||button<0||button>2||transition<0||transition>2)throw new Exception("INVALID_LIVE_POINTER");
+  var a=new List<INPUT>();a.Add(Mouse(x,y,0xC001,0));
+  if(transition>0){
+   uint flag=button==0?(transition==1?2u:4u):button==2?(transition==1?8u:16u):(transition==1?32u:64u);
+   if(transition==1)liveButtons.Add(button);a.Add(Mouse(0,0,flag,0));
+  }
+  Send(a.ToArray());if(transition==2)liveButtons.Remove(button);
+ }
+ public static void LiveRelease() {
+  var a=new List<INPUT>();foreach(var key in liveKeys)a.Add(Key(key,0,Extended(key)|2u));
+  foreach(var button in liveButtons)a.Add(Mouse(0,0,button==0?4u:button==2?16u:64u,0));
+  // Release is allowed after revocation/lease expiry; it can only lift keys.
+  if(a.Count>0)SendInput((uint)a.Count,a.ToArray(),Marshal.SizeOf(typeof(INPUT)));
+  liveKeys.Clear();liveButtons.Clear();
+ }
+ public static byte[] LiveCapture() {
+  Check();var b=Bounds();if(b[2]<1||b[3]<1||(long)b[2]*b[3]>50000000)throw new Exception("DISPLAY_SIZE_UNSUPPORTED");
+  double scale=Math.Min(1,Math.Min(1280.0/b[2],800.0/b[3]));
+  using(var full=new Bitmap(b[2],b[3]))using(var image=new Bitmap(Math.Max(1,(int)(b[2]*scale)),Math.Max(1,(int)(b[3]*scale)))){
+   using(var g=Graphics.FromImage(full)){
+    g.CopyFromScreen(b[0],b[1],0,0,full.Size);
+    var p=CursorPosition();int x=p[0]-b[0],y=p[1]-b[1];
+    using(var edge=new Pen(Color.Black,4))using(var line=new Pen(Color.White,2)){
+     g.DrawLine(edge,x-7,y,x+7,y);g.DrawLine(edge,x,y-7,x,y+7);g.DrawLine(line,x-7,y,x+7,y);g.DrawLine(line,x,y-7,x,y+7);
+    }
+   }
+   using(var g=Graphics.FromImage(image))g.DrawImage(full,0,0,image.Width,image.Height);
+   var codec=Array.Find(ImageCodecInfo.GetImageEncoders(),c=>c.FormatID==ImageFormat.Jpeg.Guid);
+   using(var options=new EncoderParameters(1))using(var output=new MemoryStream()){
+    options.Param[0]=new EncoderParameter(System.Drawing.Imaging.Encoder.Quality,60L);image.Save(output,codec,options);return output.ToArray();
+   }
+  }
  }
 }

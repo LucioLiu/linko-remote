@@ -67,6 +67,25 @@ class PeerHubTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.submit(self.b, self.a)
 
+    def test_long_term_trust_survives_pause_and_can_be_revoked(self):
+        self.call('availability', self.b, enabled=True)
+        code = self.call('code', self.b)['code']
+        approval = self.call('connect', self.a, code=code)['approval']
+        self.call('approve', self.b, approval=approval, allow=True, persistent=True)
+        self.now += 7200
+        self.assertTrue(self.call('state', self.a)['peers'][0]['can_control'])
+        self.assertFalse(self.call('state', self.b)['peers'][0]['can_control'])
+        self.call('availability', self.b, enabled=False)
+        self.assertTrue(self.call('state', self.b)['peers'][0]['trusted_incoming'])
+        self.assertFalse(self.call('state', self.a)['peers'][0]['can_control'])
+        with self.assertRaises(PermissionError):
+            self.submit(self.a, self.b)
+        self.call('availability', self.b, enabled=True)
+        self.assertTrue(self.call('state', self.a)['peers'][0]['can_control'])
+        self.call('disconnect', self.b, peer=self.devices[self.a])
+        with self.assertRaises(PermissionError):
+            self.submit(self.a, self.b)
+
     def test_target_must_approve_each_new_session(self):
         self.call('availability', self.b, enabled=True)
         code = self.call('code', self.b)['code']

@@ -157,7 +157,9 @@ try {
  Write-Host 'Codex remote desktop worker running. Close this window / Ctrl+C to stop.'
  Write-Host "Input enabled: $([bool]$AllowInput). This controls THIS Windows desktop; do not use it concurrently."
  Write-Host 'No listening TCP port, no AI login, no automatic startup. Close this window to stop.'
+ if(-not $RelayConfig){. (Join-Path $PSScriptRoot 'Live-Desktop.ps1')}
  while (-not (Test-WorkerStop)) {
+  if(-not $RelayConfig){Invoke-LiveDesktop}
   if($RelayConfig){
    try {
     $pollTimer=[Diagnostics.Stopwatch]::StartNew()
@@ -297,9 +299,10 @@ try {
   Get-ChildItem -LiteralPath $root -Filter '*.response.json' | Where-Object {$_.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddMinutes(-10)} | Remove-Item
   $previousCleanupMs=$cleanupTimer.Elapsed.TotalMilliseconds
   # Long polling already blocks when idle; only the filesystem mailbox needs a delay.
-  if(-not $RelayConfig){Start-Sleep -Milliseconds 150}
+  if(-not $RelayConfig){Start-Sleep -Milliseconds 15}
  }
 } finally {
+ if('RemoteDesktop' -as [type]){[RemoteDesktop]::LiveRelease()}
  try{if(Get-Command Close-LocalJobHandle -CommandType Function -ErrorAction SilentlyContinue){Close-LocalJobHandle -Wait}}
  finally{if($Persistent -and ('RemoteDesktop' -as [type])){[void][RemoteDesktop]::KeepAwake($false)};$lock.Dispose()}
 }

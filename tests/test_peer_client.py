@@ -11,7 +11,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from lanpilot.peer_client import DesktopClient, LocalHandler, PinnedHub, InstanceLock
+from lanpilot.peer_client import DesktopClient, HubRejection, LocalHandler, PinnedHub, InstanceLock
 from lanpilot.peer_hub import PeerHub
 
 
@@ -25,7 +25,12 @@ class LocalTransport:
 
     def call(self, operation, body=None):
         self.calls.append(operation)
-        value = self.hub.dispatch(operation, self.credential, body or {})
+        try:
+            value = self.hub.dispatch(operation, self.credential, body or {})
+        except PermissionError as error:
+            if operation == 'submit':
+                raise HubRejection(str(error)) from error
+            raise
         if operation == 'submit' and self.drop_submit:
             raise OSError('response was lost after submission')
         return value
@@ -140,6 +145,20 @@ class ClientTests(unittest.TestCase):
         self.assertEqual('complete', recovered['state'])
         self.assertEqual({}, self.a.pending)
 
+    def test_rejected_submission_clears_pending_and_preserves_rejection(self):
+        self.a.api('disconnect', {'peer': self.target})
+        payload = {'peer': self.target, 'request': {'action': 'observe'}}
+        with self.assertRaisesRegex(HubRejection, '尚未取得对方授权'):
+            self.a.api('remote', payload)
+        self.assertEqual({}, self.a.pending)
+        self.assertEqual({}, json.loads(self.a.pending_path.read_text()))
+        self.assertNotIn('recover', self.a.ui_hub.calls)
+
+        approval = self.a.api('access', {'peer': self.target})['approval']
+        self.b.api('approve', {'approval': approval, 'allow': True})
+        submitted = self.a.api('remote', payload)
+        self.assertEqual(submitted['id'], self.b.agent_hub.call('poll')['id'])
+
     def test_local_pending_survives_client_restart(self):
         self.a.ui_hub.drop_submit = True
         value = self.a.api('remote', {'peer': self.target, 'request': {'action': 'observe'}})
@@ -224,7 +243,8 @@ class TLSReconnectTests(unittest.TestCase):
             status = 200
             def read(self, maximum): return b'{"ok":true,"value":{}}'
         class Connection:
-            def __init__(self, *args): events.append('new')
+            def __init__(self, *args): self.sock = None; events.append('new')
+            def connect(self): self.sock = object()
             def request(self, *args): events.append('send')
             def getresponse(self): return Response()
             def close(self): events.append('close')
@@ -233,6 +253,17 @@ class TLSReconnectTests(unittest.TestCase):
             client.call('state')
             client.call('code')
         self.assertEqual(['new','send','close','new','send'],events)
+
+    def test_retries_handshake_before_sending_a_mutation(self):
+        client = PinnedHub({'url': 'https://hub.example', 'pin': 'a'*64}, secrets.token_urlsafe(32))
+        with patch('lanpilot.peer_client.PinnedConnection') as factory:
+            failed, working = factory.return_value, factory.return_value
+            failed.connect.side_effect = [OSError('TLS EOF'), None]
+            working.getresponse().status = 200
+            working.getresponse().read.return_value = b'{"ok":true,"value":{"id":"only-once"}}'
+            self.assertEqual({'id': 'only-once'}, client.call('submit', {}))
+            self.assertEqual(2, working.connect.call_count)
+            working.request.assert_called_once()
 
     def test_changed_certificate_on_automatic_reconnect_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

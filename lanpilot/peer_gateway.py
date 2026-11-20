@@ -31,7 +31,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # UI requests may be minutes apart. Public TCP relays can retire an
         # idle connection without sending a close response to its client.
         # Close after each UI operation; continuous agent polling stays pooled.
-        if self.path not in ('/v2/poll', '/v2/state', '/v2/result', '/v2/register'):
+        if self.path not in ('/v2/poll', '/v2/state', '/v2/result', '/v2/register',
+                              '/v2/live-view', '/v2/live-input', '/v2/live-exchange', '/v2/live-agent-state', '/v2/live-frame'):
             self.close_connection = True
             self.send_header('Connection', 'close')
         self.end_headers()
@@ -39,7 +40,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         operations = {'register', 'name', 'availability', 'code', 'connect', 'access',
-                      'approve', 'disconnect', 'state', 'poll', 'submit', 'result', 'recover'}
+                      'approve', 'disconnect', 'state', 'poll', 'submit', 'result', 'recover',
+                      'live-open', 'live-close', 'live-view', 'live-input', 'live-exchange', 'live-agent-state', 'live-frame'}
         operation = self.path[4:] if self.path.startswith('/v2/') else ''
         if operation not in operations:
             self.close_connection = True
@@ -48,7 +50,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if len(authorization) != 1 or not re.fullmatch('Bearer [A-Za-z0-9_-]{40,90}', authorization[0]):
             self.close_connection = True
             return self.answer(401, {'ok': False, 'error': '身份验证失败'})
-        maximum = 24_000_000 if operation == 'result' else 16000
+        maximum = 24_000_000 if operation == 'result' else 1_500_000 if operation in ('live-exchange', 'live-frame') else 16000
         lengths = self.headers.get_all('Content-Length', [])
         if len(lengths) != 1 or not re.fullmatch('[0-9]{1,8}', lengths[0]) or not 1 <= int(lengths[0]) <= maximum or self.headers.get('Transfer-Encoding'):
             self.close_connection = True
@@ -64,6 +66,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 print('Submit rejected:', type(error).__name__, str(error)[:150], file=sys.stderr, flush=True)
             return self.answer(403, {'ok': False, 'error': str(error)})
         except (ValueError, KeyError, TypeError) as error:
+            if operation.startswith('live-'):
+                print('Live request rejected:', operation, type(error).__name__, str(error)[:100], file=sys.stderr, flush=True)
             if operation == 'submit':
                 print('Submit rejected:', type(error).__name__, str(error)[:150], file=sys.stderr, flush=True)
             return self.answer(400, {'ok': False, 'error': '请求无效或上一操作尚未确认'})
@@ -73,13 +77,13 @@ class PeerGateway(http.server.ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 32
 
-    def __init__(self, home, cert, key, port):
+    def __init__(self, home, cert, key, port, bind='127.0.0.1'):
         self.hub = PeerHub(Path(home) / 'peers.sqlite')
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.context.minimum_version = ssl.TLSVersion.TLSv1_2
         self.context.load_cert_chain(str(cert), str(key))
         self.capacity = threading.BoundedSemaphore(64)
-        super().__init__(('127.0.0.1', port), Handler)
+        super().__init__((bind, port), Handler)
 
     def process_request(self, request, address):
         if not self.capacity.acquire(blocking=False):
@@ -111,8 +115,9 @@ def main():
     parser.add_argument('--cert', type=Path, required=True)
     parser.add_argument('--key', type=Path, required=True)
     parser.add_argument('--port', type=int, required=True)
+    parser.add_argument('--bind', default='127.0.0.1')
     args = parser.parse_args()
-    with PeerGateway(args.home, args.cert, args.key, args.port) as server:
+    with PeerGateway(args.home, args.cert, args.key, args.port, args.bind) as server:
         server.serve_forever()
 
 

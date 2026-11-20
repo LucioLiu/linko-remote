@@ -23,7 +23,9 @@ ROOT=Path(__file__).resolve().parents[1]
 CLIENT_FILES = (
     'desktop.py', 'lanpilot/__init__.py', 'lanpilot/peer_client.py',
     'lanpilot/peer_hub.py', 'lanpilot/updater.py', 'lanpilot/version.py',
+    'lanpilot/live.py', 'lanpilot/live_agent.py', 'lanpilot/live_view.py',
     'windows/Start-Desktop.ps1', 'windows/Desktop.cs',
+    'windows/Live-Desktop.ps1',
     'windows/Relay.cs', 'windows/Discovery.cs', 'windows/LocalJob.ps1',
     'windows/LocalJobHost.ps1', 'windows/LedgerReconcile.cs',
     'ui/index.html', 'ui/style.css', 'ui/app.js',

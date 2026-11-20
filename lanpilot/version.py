@@ -1,3 +1,3 @@
 """Version shared by the UI, installer, updater and release builder."""
-VERSION = '0.8.1-preview.1'
+VERSION = '0.8.2-preview.6'
 TAG = 'v' + VERSION

@@ -58,13 +58,13 @@ final class PeerDesktop {
   let region = [Int((intersection.minX - screen.minX) * sx), Int((intersection.minY - screen.minY) * sy), Int(intersection.width * sx), Int(intersection.height * sy)]
   return (app.processIdentifier, region, window[kCGWindowName as String] as? String ?? app.localizedName ?? "Mac")
  }
- func capture() async throws -> (CGImage, Data) {
+ func capture(showsCursor: Bool = false) async throws -> (CGImage, Data) {
   guard CGPreflightScreenCaptureAccess() else { try fail("SCREEN_RECORDING_PERMISSION_REQUIRED") }
   let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
   guard let chosen = content.displays.first(where: { $0.displayID == display }) else { try fail("DISPLAY_UNAVAILABLE") }
   let config = SCStreamConfiguration()
   config.width = CGDisplayPixelsWide(display); config.height = CGDisplayPixelsHigh(display)
-  config.showsCursor = false
+  config.showsCursor = showsCursor
   let image = try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: chosen, excludingWindows: []), configuration: config)
   let count = image.width * image.height * 4
   var pixels = Data(count: count)
@@ -177,9 +177,88 @@ final class PeerDesktop {
    return ["ok":false,"input_attempted":attempted,"request_id":identifier,"error":(error as? DesktopFailure)?.text ?? "DESKTOP_OPERATION_UNCONFIRMED", "instruction":"Recover this request; do not replay uncertain input."]
   }
  }
+ var liveID = "", liveSeq = 0, liveAck = 0
+ var liveEnded = Set<String>(), liveKeys = Set<String>(), liveButtons = Set<Int>()
+ var liveCaptured: TimeInterval = 0
+ var liveFlags: CGEventFlags {
+  var f: CGEventFlags = []
+  for k in liveKeys { if k.hasPrefix("Shift") { f.insert(.maskShift) }; if k.hasPrefix("Control") { f.insert(.maskControl) }; if k.hasPrefix("Alt") { f.insert(.maskAlternate) }; if k.hasPrefix("Meta") { f.insert(.maskCommand) } }
+  return f
+ }
+ func liveKeyCode(_ code: String) -> CGKeyCode? {
+  let special: [String:CGKeyCode] = ["ShiftLeft":56,"ShiftRight":60,"ControlLeft":59,"ControlRight":62,"AltLeft":58,"AltRight":61,"MetaLeft":55,"MetaRight":54,"Minus":27,"Equal":24,"BracketLeft":33,"BracketRight":30,"Backslash":42,"Semicolon":41,"Quote":39,"Comma":43,"Period":47,"Slash":44,"Backquote":50,"F1":122,"F2":120,"F3":99,"F6":97,"F7":98,"F8":100,"F9":101,"F10":109,"F11":103,"F12":111]
+  if let k = special[code] { return k }
+  if code.hasPrefix("Key") { return keyCode(String(code.dropFirst(3))) }
+  if code.hasPrefix("Digit") { return keyCode(String(code.dropFirst(5))) }
+  return keyCode(code.replacingOccurrences(of:"Arrow",with:"").uppercased().replacingOccurrences(of:"ESCAPE",with:"ESC"))
+ }
+ func liveKey(_ code: String, _ down: Bool) throws {
+  guard let key = liveKeyCode(code), let event = CGEvent(keyboardEventSource:nil, virtualKey:key, keyDown:down) else { try fail("UNSUPPORTED_KEY") }
+  if down { liveKeys.insert(code) } else { liveKeys.remove(code) }
+  event.flags = liveFlags; event.post(tap:.cghidEventTap)
+ }
+ func releaseLive() {
+  for code in Array(liveKeys) { try? liveKey(code,false) }
+  let point = CGEvent(source:nil)?.location ?? .zero
+  for b in liveButtons { CGEvent(mouseEventSource:nil, mouseType:b == 0 ? .leftMouseUp : b == 2 ? .rightMouseUp : .otherMouseUp, mouseCursorPosition:point, mouseButton:b == 0 ? .left : b == 2 ? .right : .center)?.post(tap:.cghidEventTap) }
+  liveButtons.removeAll()
+ }
+ func stopLive(_ reason: String) {
+  releaseLive()
+  if !liveID.isEmpty { liveEnded.insert(liveID); try? writeJSON(["id":liveID,"error":reason],workspace.appendingPathComponent("live-ended.json")) }
+  liveID = ""
+ }
+ func liveTick() async {
+  let controlURL = workspace.appendingPathComponent("live-control.json")
+  guard let data = try? Data(contentsOf:controlURL), let control = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any] else { return }
+  do {
+   guard let identifier = control["id"] as? String, identifier.range(of:"^[a-f0-9]{32}$",options:.regularExpression) != nil, let expires = control["expires"] as? Double, expires > Date().timeIntervalSince1970, expires < Date().timeIntervalSince1970+4, !stopped else { if !liveID.isEmpty { stopLive("连接已结束，按键已释放") }; return }
+   if liveEnded.contains(identifier) { return }
+   if liveID != identifier { if !liveID.isEmpty { stopLive("已切换会话") }; liveID=identifier; liveSeq=0; liveAck=0 }
+   try ensureAccess()
+   let width=CGDisplayPixelsWide(display), height=CGDisplayPixelsHigh(display)
+   let geometry="0,0,\(width),\(height)"
+   let files=try FileManager.default.contentsOfDirectory(at:workspace,includingPropertiesForKeys:nil).filter { $0.lastPathComponent.hasPrefix(identifier+"-") && $0.lastPathComponent.hasSuffix(".live-input.json") }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+   for file in files {
+    let claimed=file.appendingPathExtension("executing"); try FileManager.default.moveItem(at:file,to:claimed)
+    guard let batch=(try JSONSerialization.jsonObject(with:Data(contentsOf:claimed))) as? [String:Any], batch["id"] as? String == identifier, batch["seq"] as? Int == liveAck+1, batch["geometry"] as? String == geometry, let until=batch["expires"] as? Double, until > Date().timeIntervalSince1970, let events=batch["events"] as? [[String:Any]], events.count <= 64 else { try fail("INPUT_EXPIRED_OR_DISPLAY_CHANGED") }
+    for e in events {
+     try ensureAccess(); guard Date().timeIntervalSince1970 < expires && Date().timeIntervalSince1970 < until else { try fail("INPUT_LEASE_EXPIRED") }
+     let kind=e["type"] as? String ?? ""
+     if ["move","down","up"].contains(kind) {
+      guard let x=e["x"] as? Int,let y=e["y"] as? Int, (0...65535).contains(x),(0...65535).contains(y) else { try fail("INVALID_POINTER") }
+      let rect=CGDisplayBounds(display), b=e["button"] as? Int ?? 0
+      let point=CGPoint(x:rect.minX+Double(x)*max(0,rect.width-1)/65535,y:rect.minY+Double(y)*max(0,rect.height-1)/65535)
+      let button: CGMouseButton = b == 0 ? .left : b == 2 ? .right : .center
+      let type: CGEventType
+      if kind == "down" { liveButtons.insert(b); type=b == 0 ? .leftMouseDown : b == 2 ? .rightMouseDown : .otherMouseDown }
+      else if kind == "up" { liveButtons.remove(b); type=b == 0 ? .leftMouseUp : b == 2 ? .rightMouseUp : .otherMouseUp }
+      else { type=liveButtons.contains(0) ? .leftMouseDragged : liveButtons.contains(2) ? .rightMouseDragged : liveButtons.contains(1) ? .otherMouseDragged : .mouseMoved }
+      let event=CGEvent(mouseEventSource:nil,mouseType:type,mouseCursorPosition:point,mouseButton:kind == "move" && liveButtons.contains(2) ? .right : button); event?.flags=liveFlags; event?.post(tap:.cghidEventTap)
+     } else if kind == "keydown" || kind == "keyup" { try liveKey(e["code"] as? String ?? "",kind == "keydown") }
+     else if kind == "release" { releaseLive() }
+     else if kind == "wheel", let amount=e["amount"] as? Int { CGEvent(scrollWheelEvent2Source:nil,units:.line,wheelCount:1,wheel1:Int32(amount),wheel2:0,wheel3:0)?.post(tap:.cghidEventTap) }
+     else if kind == "text",let text=e["text"] as? String,text.count<=500 {
+      for var unit in text.utf16 { guard Date().timeIntervalSince1970 < until else { try fail("TEXT_EXPIRED_PARTIAL_DO_NOT_RETRY") }; let event=CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true); event?.keyboardSetUnicodeString(stringLength:1,unicodeString:&unit); event?.post(tap:.cghidEventTap); let up=CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:false);up?.keyboardSetUnicodeString(stringLength:1,unicodeString:&unit);up?.post(tap:.cghidEventTap) }
+     } else { try fail("INVALID_LIVE_EVENT") }
+    }
+    liveAck += 1;try writeJSON(["id":identifier,"seq":liveAck],workspace.appendingPathComponent("live-receipt.json"));try FileManager.default.removeItem(at:claimed)
+   }
+   if ProcessInfo.processInfo.systemUptime-liveCaptured > 0.12 {
+    let (image,_)=try await capture(showsCursor:true);let scale=min(1,min(1280.0/Double(image.width),800.0/Double(image.height)))
+    let w=max(1,Int(Double(image.width)*scale)), h=max(1,Int(Double(image.height)*scale))
+    guard let context=CGContext(data:nil,width:w,height:h,bitsPerComponent:8,bytesPerRow:0,space:CGColorSpaceCreateDeviceRGB(),bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue) else { try fail("CAPTURE_FAILED") }
+    context.draw(image,in:CGRect(x:0,y:0,width:w,height:h))
+    guard let scaled=context.makeImage(),let jpeg=NSBitmapImageRep(cgImage:scaled).representation(using:.jpeg,properties:[.compressionFactor:0.6]) else { try fail("ENCODING_FAILED") }
+    liveSeq += 1;try writeJSON(["id":identifier,"seq":liveSeq,"geometry":geometry,"created":Date().timeIntervalSince1970,"jpeg_base64":jpeg.base64EncodedString()],workspace.appendingPathComponent("live-frame.json"));liveCaptured=ProcessInfo.processInfo.systemUptime
+   }
+  } catch { stopLive((error as? DesktopFailure)?.text ?? "连续桌面已停止") }
+ }
  func run() async throws {
   try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true, attributes: [.posixPermissions:0o700])
+  defer { releaseLive() }
   while !stopped {
+   await liveTick()
    let files = try FileManager.default.contentsOfDirectory(at: workspace, includingPropertiesForKeys: nil).filter { $0.lastPathComponent.hasSuffix(".request.json") }.sorted { $0.lastPathComponent < $1.lastPathComponent }
    for file in files {
     let identifier = String(file.lastPathComponent.prefix(32))
@@ -194,7 +273,7 @@ final class PeerDesktop {
     let request = try JSONSerialization.jsonObject(with: Data(contentsOf: claimed)) as? [String:Any] ?? [:]
     try writeJSON(await process(identifier,request),response)
    }
-   try await Task.sleep(nanoseconds: 150_000_000)
+   try await Task.sleep(nanoseconds: liveID.isEmpty ? 150_000_000 : 15_000_000)
   }
  }
 }
