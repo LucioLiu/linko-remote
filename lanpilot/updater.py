@@ -224,21 +224,15 @@ class UpdateManager:
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         path = self.directory / info['name']
         partial = path.with_suffix('.zip.part')
-        digest, received = hashlib.sha256(), 0
         try:
-            with self.opener(info['url']) as response, partial.open('wb') as stream:
-                while True:
-                    chunk = response.read(256 * 1024)
-                    if not chunk:
-                        break
-                    received += len(chunk)
-                    if received > info['size']:
-                        raise ValueError('更新包大小与发布记录不一致')
-                    stream.write(chunk)
-                    digest.update(chunk)
-                    self._set(progress=int(received * 100 / info['size']))
-            if received != info['size'] or digest.hexdigest() != info['sha256']:
-                raise ValueError('更新包 SHA-256 校验失败，未安装')
+            for attempt in range(3):
+                try:
+                    self._download_archive(info, partial)
+                    break
+                except (TimeoutError, ConnectionError, http.client.IncompleteRead):
+                    if attempt == 2 or self.stop.is_set():
+                        raise
+                    self._set(progress=0, message=f'下载中断，正在重试（{attempt + 1}/2）…')
             os.replace(partial, path)
             with self.lock:
                 self.archive = path
@@ -246,7 +240,22 @@ class UpdateManager:
         finally:
             partial.unlink(missing_ok=True)
 
-    def prepare_install(self):
+    def _download_archive(self, info, partial):
+        digest, received = hashlib.sha256(), 0
+        with self.opener(info['url']) as response, partial.open('wb') as stream:
+            while chunk := response.read(256 * 1024):
+                received += len(chunk)
+                if received > info['size']:
+                    raise ValueError('更新包大小与发布记录不一致')
+                stream.write(chunk)
+                digest.update(chunk)
+                self._set(progress=int(received * 100 / info['size']))
+        if received < info['size']:
+            raise http.client.IncompleteRead(b'', info['size'] - received)
+        if digest.hexdigest() != info['sha256']:
+            raise ValueError('更新包 SHA-256 校验失败，未安装')
+
+    def prepare_install(self, *, expect_relay=False):
         with self.lock:
             if self.busy or not self.info or self.view['status'] != 'ready' or not self.archive:
                 raise ValueError('请先下载并校验更新')
@@ -267,6 +276,7 @@ class UpdateManager:
             spec = self.directory / ('install-' + uuid.uuid4().hex + '.json')
             value = dict(info, archive=str(archive), home=str(self.home), system=self.system,
                          parent_pid=os.getpid(), app_pid=app_pid, app=app,
+                         expect_relay=expect_relay,
                          previous_python=sys.executable,
                          previous_code=str(Path(__file__).resolve().parents[1]))
             fd = os.open(spec, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -312,6 +322,23 @@ def wait_for_exit(pid, timeout=50):
             return
         time.sleep(0.25)
     raise TimeoutError('旧邻控尚未退出，已保留当前安装')
+
+
+def stop_mac_launcher(app, pid):
+    """Close the old window even if its page lost the update response."""
+    executable = Path(app) / 'Contents/MacOS/LinkoRemote'
+    process = subprocess.run(['/bin/ps', '-ww', '-p', str(pid), '-o', 'comm='],
+                             capture_output=True, text=True)
+    running = process.stdout.strip()
+    if running in ('', '<defunct>'):
+        return
+    if Path(running).resolve() != executable.resolve():
+        raise ValueError('无法确认旧邻控窗口，已保留安装')
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    wait_for_exit(pid)
 
 
 def replace_mac_app(source, target):
@@ -413,9 +440,9 @@ def apply_update(spec_path):
         if archive.parent.resolve() != spec_path.parent.resolve() or hashlib.sha256(archive.read_bytes()).hexdigest() != spec['sha256']:
             raise ValueError('更新包校验失败')
         wait_for_exit(spec['parent_pid'])
-        if spec.get('app_pid'):
-            wait_for_exit(spec['app_pid'])
         stopped = True
+        if spec['system'] == 'macos' and spec.get('app_pid'):
+            stop_mac_launcher(spec['app'], spec['app_pid'])
         with tempfile.TemporaryDirectory(prefix='linko-update-', dir=spec_path.parent) as temporary:
             payload = safe_extract(archive, temporary, spec['system'])
             if spec['system'] == 'windows':
@@ -427,7 +454,8 @@ def apply_update(spec_path):
             deadline = time.monotonic() + 40
             while time.monotonic() < deadline:
                 try:
-                    if local_state(home)['version'] == spec['version']:
+                    state = local_state(home)
+                    if state['version'] == spec['version'] and (not spec.get('expect_relay') or state.get('connected')):
                         result.update(ok=True, message='已更新至 ' + spec['version'] + '，电脑名称与配对已保留。')
                         break
                 except Exception:

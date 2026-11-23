@@ -9,7 +9,7 @@ final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, W
  func applicationDidFinishLaunching(_ notification: Notification) {
   NSApp.setActivationPolicy(.regular)
   window=NSWindow(contentRect:NSRect(x:0,y:0,width:1220,height:860),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
-  window.title="邻控 · Linko Remote";window.minSize=NSSize(width:860,height:680);window.center();window.isReleasedWhenClosed=false
+  window.title="邻控";window.minSize=NSSize(width:860,height:680);window.center();window.isReleasedWhenClosed=false
   let configuration=WKWebViewConfiguration()
   configuration.userContentController.add(self,name:"linkoUpdate")
   view=WKWebView(frame:window.contentView!.bounds,configuration:configuration);view.navigationDelegate=self;view.autoresizingMask=[.width,.height];window.contentView=view
@@ -48,7 +48,7 @@ final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, W
  func webView(_ webView:WKWebView,decidePolicyFor navigationAction:WKNavigationAction,decisionHandler:@escaping(WKNavigationActionPolicy)->Void){
   guard let url=navigationAction.request.url,url.scheme=="http",url.host=="127.0.0.1",url.host!+":"+String(url.port ?? 80)==authority else{decisionHandler(.cancel);return};decisionHandler(.allow)
  }
- @objc func about(){let alert=NSAlert();alert.messageText="邻控 · Linko Remote";let version=Bundle.main.object(forInfoDictionaryKey:"LinkoReleaseVersion") as? String ?? "预览版";alert.informativeText=version+"\n每台电脑，都能彼此连接。";alert.runModal()}
+ @objc func about(){let alert=NSAlert();alert.messageText="邻控";let version=Bundle.main.object(forInfoDictionaryKey:"LinkoReleaseVersion") as? String ?? "预览版";alert.informativeText=version+"\n每台电脑，都能彼此连接。";alert.runModal()}
  @objc func quit(){NSApp.terminate(nil)}
  func applicationWillTerminate(_ notification:Notification){if let process=process,process.isRunning{process.terminate()}}
  func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool{window.makeKeyAndOrderFront(nil);return true}

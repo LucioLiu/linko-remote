@@ -19,6 +19,9 @@ from pathlib import Path
 from desktop import make_request
 from .live import LiveSessions
 
+READ_ONLY_TIMEOUTS = {'observe': 'SCREEN_CAPTURE_TIMED_OUT', 'status': 'STATUS_TIMED_OUT'}
+BEFORE_DELIVERY = 'EXPIRED_OR_ACCESS_REVOKED_BEFORE_DELIVERY'
+
 
 def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
@@ -93,6 +96,26 @@ class PeerHub:
         result = dict(row)
         result['peer'] = self._identity(self._one('SELECT * FROM devices WHERE id=?', (row['caller'],)))
         return result
+
+    def _finish_without_input(self, identifier, error):
+        receipt = {'request_id': identifier, 'ok': False, 'input_attempted': False, 'error': error}
+        self.db.execute('UPDATE commands SET result=? WHERE id=?', (json.dumps(receipt), identifier))
+        return receipt
+
+    def _expire_command(self, command, now):
+        if command['expires'] > now:
+            return None
+        # After delivery, only a read-only request can be retired without a
+        # worker receipt. An input might have run before the reply was lost.
+        error = BEFORE_DELIVERY if not command['delivered'] else READ_ONLY_TIMEOUTS.get(
+            json.loads(command['payload']).get('action'))
+        if error:
+            return self._finish_without_input(command['id'], error)
+        return None
+
+    def has_pending_command(self, target, now):
+        command = self._one('SELECT * FROM commands WHERE target=? AND result IS NULL', (target,))
+        return command is not None and self._expire_command(command, now) is None
 
     def dispatch(self, operation, credential, body, source='local'):
         if not isinstance(body, dict):
@@ -219,6 +242,7 @@ class PeerHub:
                 cap = self._one('SELECT live FROM capabilities WHERE id=?', (peer['id'],))
                 item['live'] = bool(cap and cap['live'])
                 item.update(online=now - peer['seen'] < 20,
+                            accepting_connections=bool(peer['incoming']),
                             trusted_incoming=bool(self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND expires IS NULL',
                                                             (peer['id'], me))),
                             can_control=bool(peer['incoming'] and self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND (expires IS NULL OR expires>?)',
@@ -240,9 +264,7 @@ class PeerHub:
                 permitted = device['incoming'] and self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND (expires IS NULL OR expires>?)',
                                                             (command['caller'], me, now))
                 if command['expires'] <= now or not permitted:
-                    value = {'request_id': command['id'], 'ok': False, 'input_attempted': False,
-                             'error': 'EXPIRED_OR_ACCESS_REVOKED_BEFORE_DELIVERY'}
-                    self.db.execute('UPDATE commands SET result=? WHERE id=?', (json.dumps(value), command['id']))
+                    self._finish_without_input(command['id'], BEFORE_DELIVERY)
                     continue
                 self.db.execute('UPDATE commands SET delivered=1 WHERE id=?', (command['id'],))
                 return {'id': command['id'], 'request': json.loads(command['payload']),
@@ -270,7 +292,7 @@ class PeerHub:
             target = self._one('SELECT * FROM devices WHERE id=?', (peer,))
             if not target or not target['incoming'] or not self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND (expires IS NULL OR expires>?)', (me, peer, now)):
                 raise PermissionError('尚未取得对方授权')
-            if self._one('SELECT 1 FROM commands WHERE target=? AND result IS NULL', (peer,)):
+            if self.has_pending_command(peer, now):
                 raise ValueError('上一操作结果未确认，请先查询原结果')
             self.db.execute('INSERT INTO commands VALUES(?,?,?,?,?,0,NULL,?)', (identifier, me, peer, encoded, now + 45, now))
             return {'id': identifier}
@@ -284,8 +306,10 @@ class PeerHub:
             migrated = self._one('SELECT hash FROM migrated_receipts WHERE id=?', (identifier,))
             if migrated and hmac.compare_digest(migrated['hash'], hashlib.sha256(encoded.encode()).hexdigest()):
                 return {'saved': True}
-            if prior['result'] is not None and json.loads(prior['result']).get('error') == 'SCREEN_CAPTURE_TIMED_OUT':
-                return {'saved': True, 'late_read_only_result': True}
+            if prior['result'] is not None:
+                timeout = READ_ONLY_TIMEOUTS.get(json.loads(prior['payload']).get('action'))
+                if timeout and json.loads(prior['result']).get('error') == timeout:
+                    return {'saved': True, 'late_read_only_result': True}
             if prior['result'] is not None and prior['result'] != encoded:
                 raise PermissionError('不能覆盖已经确认的回执')
             self.db.execute('UPDATE commands SET result=? WHERE id=?', (encoded, identifier))
@@ -307,13 +331,8 @@ class PeerHub:
                 return {'id': identifier, 'state': 'complete', 'result': receipt}
             if row['caller'] != me:
                 raise PermissionError('找不到此操作')
-            # A lost poll response must not block screenshots forever. Only a
-            # read-only observation can be retired without knowing execution.
-            if row['result'] is None and row['expires'] <= now and json.loads(row['payload']).get('action') == 'observe':
-                receipt = {'request_id': identifier, 'ok': False, 'input_attempted': False,
-                           'error': 'SCREEN_CAPTURE_TIMED_OUT'}
-                self.db.execute('UPDATE commands SET result=? WHERE id=?', (json.dumps(receipt), identifier))
+            receipt = self._expire_command(row, now) if row['result'] is None else json.loads(row['result'])
+            if receipt is not None:
                 return {'id': identifier, 'state': 'complete', 'result': receipt}
-            return {'id': row['id'], 'state': 'complete' if row['result'] else 'unconfirmed',
-                    'result': json.loads(row['result']) if row['result'] else None}
+            return {'id': identifier, 'state': 'unconfirmed', 'result': None}
         raise ValueError('不支持的请求')

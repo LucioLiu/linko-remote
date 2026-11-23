@@ -83,7 +83,7 @@ class LiveSessions:
             cap=self.hub._one('SELECT live FROM capabilities WHERE id=?',(target,))
             if not cap or not cap['live']: raise ValueError('请先将对方邻控更新到支持连续桌面的版本')
             if any(x['target']==target for x in self.sessions.values()): raise ValueError('此电脑已有连续桌面会话')
-            if self.hub._one('SELECT 1 FROM commands WHERE target=? AND result IS NULL',(target,)):
+            if self.hub.has_pending_command(target,now):
                 raise ValueError('请先确认此电脑上一操作结果')
             if len(self.sessions)>=32: raise ValueError('连接服务繁忙，请稍候')
             identifier=uuid.uuid4().hex

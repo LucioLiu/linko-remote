@@ -6,7 +6,7 @@
 
 1. 准备仅含 `url`、`pin` 两个字段的 `peer-endpoint.json`，以及校验过的官方 CPython Windows 嵌入式运行时。
 2. 使用全新的输出目录运行 `python3 -m lanpilot.build_unified windows OUTPUT --endpoint ENDPOINT --runtime PYTHON_ZIP --runtime-sha256 SHA256`。
-3. macOS 使用 PyInstaller 冻结 `linko_desktop.py`，同时加入共享 `ui`、编译好的 `native/LinkoDesktop` 和公开 `peer-endpoint.json`。在冻结输出的 `ThirdParty` 中加入 CPython 和 PyInstaller 的许可文本。
+3. macOS 使用 PyInstaller 冻结 `linko_desktop.py`。先用 `swiftc -target "$(uname -m)-apple-macosx14.0" -parse-as-library lanpilot/mac/PeerDesktop.swift -o PATH/LinkoDesktop -framework Cocoa -framework ScreenCaptureKit -framework ApplicationServices` 编译辅助程序。冻结时加入共享 `ui`、该辅助程序到 `native/LinkoDesktop`，以及公开 `peer-endpoint.json`。在冻结输出的 `ThirdParty` 中加入 CPython 和 PyInstaller 的许可文本。
 4. 运行 `python3 -m lanpilot.build_unified macos OUTPUT_APP --endpoint ENDPOINT --engine FROZEN_ENGINE`。构建脚本生成原生外壳、签名应用，并只复制 `CLIENT_FILES` 白名单中的源码。
 5. 用 Python `zipfile` 归档，保证文件名按 UTF-8 编码；为下载包生成 `SHA256SUMS.txt`。
 
@@ -15,6 +15,7 @@
 ## 发布前检查
 
 - 运行完整 Python 测试，并解析 Windows PowerShell 脚本。
+- 用 `vtool -show-build` 核查 macOS 外壳、资源目录及冻结引擎中的两个 `LinkoDesktop` 副本，并核对系统最低版本与 `Info.plist` 一致。
 - 使用新的临时用户数据目录启动产物，确认随机身份、通用名称、空设备列表、空 SSH 列表和默认关闭的接收开关。
 - 验证同一中继中的已有设备和配对不会出现在新身份的列表中。
 - 使用 `python3 -m lanpilot.release_audit ARTIFACTS --deny-file PRIVATE_LIST --report REPORT` 扫描最终归档和嵌套 ZIP。`PRIVATE_LIST` 是仅保存在本地的 JSON 字符串数组，用于排除开发设备名称、设备号和本地路径，不能上传。

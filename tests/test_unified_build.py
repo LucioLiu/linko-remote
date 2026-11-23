@@ -1,16 +1,36 @@
 import hashlib
 import json
 from pathlib import Path
+import plistlib
 import tempfile
 import unittest
 import zipfile
 
 from unittest.mock import patch
 
-from lanpilot.build_unified import windows, copy_code, CLIENT_FILES, ROOT
+from lanpilot.build_unified import mac, windows, copy_code, CLIENT_FILES, ROOT
 
 
 class UnifiedBuildTests(unittest.TestCase):
+    def test_mac_links_both_swift_targets_for_the_minimum_version_in_the_plist(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            engine = root / 'LinkoService'
+            (engine / 'ThirdParty').mkdir(parents=True)
+            (engine / 'LinkoService').touch()
+            output = root / 'Fixture.app'
+            endpoint = {'url': 'https://127.0.0.1:1', 'pin': 'a' * 64}
+            with patch('platform.machine', return_value='arm64'), \
+                 patch('lanpilot.build_unified.subprocess.run') as run:
+                mac(output, endpoint, engine)
+            minimum = plistlib.loads((output / 'Contents/Info.plist').read_bytes())['LSMinimumSystemVersion']
+            self.assertEqual('14.0', minimum)
+            commands = [call.args[0] for call in run.call_args_list if call.args[0][0] == 'swiftc']
+            self.assertEqual(2, len(commands))
+            for command in commands:
+                self.assertIn('-target', command)
+                self.assertEqual('arm64-apple-macosx' + minimum, command[command.index('-target') + 1])
+
     def test_release_payload_uses_an_allowlist_and_rejects_leftover_profiles(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

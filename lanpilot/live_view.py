@@ -14,7 +14,7 @@ class LiveView:
     def start(self):
         self.thread=threading.Thread(target=self.run,daemon=True);self.thread.start()
 
-    def publish(self, value):
+    def publish(self, value, roundtrip=0):
         now=time.monotonic()
         with self.changed:
             previous=self.value.get('frame');frame=value.get('frame')
@@ -22,7 +22,7 @@ class LiveView:
                 value=dict(value,frame=previous)
             if frame and (not previous or previous['seq']!=frame['seq']):
                 self.arrivals=[t for t in self.arrivals if now-t<2];self.arrivals.append(now)
-                self.updated=now-value.get('frame_age_ms',0)/1000
+                self.updated=now-value.get('frame_age_ms',0)/1000-roundtrip
             self.value=value;self.changed.notify_all()
 
     def snapshot(self, touch=True):
@@ -39,7 +39,9 @@ class LiveView:
         try:
             while not self.stop.is_set() and not self.client_stop.is_set() and time.monotonic()-self.ui_seen<12:
                 frame=self.value.get('frame')
-                self.publish(self.hub.call('live-view',{'id':self.id,'after':frame['seq'] if frame else None}))
+                started=time.monotonic()
+                value=self.hub.call('live-view',{'id':self.id,'after':frame['seq'] if frame else None})
+                self.publish(value,time.monotonic()-started)
                 self.stop.wait(.06)
         except Exception as error:
             self.publish(dict(self.value,error=str(error)[:180]))

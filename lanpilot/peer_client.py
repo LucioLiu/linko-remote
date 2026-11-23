@@ -23,7 +23,7 @@ import uuid
 import webbrowser
 
 from desktop import make_request
-from .peer_hub import display_name
+from .peer_hub import READ_ONLY_TIMEOUTS, display_name
 from .version import VERSION
 from .updater import UpdateManager
 from .live_agent import LiveAgent
@@ -32,6 +32,7 @@ from .live_view import LiveView
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / 'ui'
 MAX_BODY = 24_000_000
+STATE_STALE_AFTER = 8
 LEGACY_PREVIEW_ENDPOINT = {'url': 'https://bore.pub:49006',
                            'pin': 'd660698b3705ed323698955c0e36fe0e2be71d11777eee3d2e2bc1ff2dde73af'}
 
@@ -134,7 +135,9 @@ class PinnedHub:
             try:
                 # The gateway bounds idle sockets to 30 seconds. Retire a
                 # locally idle socket before writing, never replay after send.
-                if self.connection and time.monotonic() - self.last_response >= 20:
+                # Start each new command on a fresh connection. Its initial
+                # and subsequent receipt queries can reuse that connection.
+                if self.connection and (operation == 'submit' or time.monotonic() - self.last_response >= 20):
                     self.connection.close()
                     self.connection = None
                 if self.connection is None or self.connection.sock is None:
@@ -214,6 +217,9 @@ class MailboxAgent:
             options = {'creationflags': subprocess.CREATE_NO_WINDOW}
         self.process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options)
 
+    def running(self):
+        return self.process is not None and self.process.poll() is None and not self.stop_path.exists()
+
     def stop(self):
         self.stop_path.write_text('stop')
         # The worker checks this immediately before sending any input. Pending
@@ -229,7 +235,7 @@ class MailboxAgent:
         lifetime = command['valid_for_ms'] / 1000 - elapsed
         if lifetime <= 0:
             return {'ok': False, 'input_attempted': False, 'request_id': identifier, 'error': 'REQUEST_EXPIRED_IN_TRANSIT'}
-        if self.stop_path.exists() or not self.process or self.process.poll() is not None:
+        if not self.running():
             return {'ok': False, 'input_attempted': False, 'request_id': identifier, 'error': 'LOCAL_CONTROL_NOT_ENABLED'}
         request = dict(command['request'], expires=int(time.time() + min(45, lifetime)))
         path = self.workspace / (identifier + '.request.json')
@@ -270,18 +276,25 @@ class DesktopClient:
             atomic_json(self.path, self.config)
         self.agent_hub = hub_factory(self.config['endpoint'], self.config['credential'])
         self.ui_hub = hub_factory(self.config['endpoint'], self.config['credential'])
+        self.command_hub = hub_factory(self.config['endpoint'], self.config['credential'])
         self.live_hub = hub_factory(self.config['endpoint'], self.config['credential'])
         self.live_input_hub = hub_factory(self.config['endpoint'], self.config['credential'])
         self.agent = agent_factory(self.home)
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
         self.operation_lock = threading.RLock()
+        self.command_lock = threading.Lock()
         self.incoming = False
+        self.pause_pending = False
         self.connected = False
+        self.state_seen_at = 0
+        self.state_seen_wall = 0
         self.error = ''
+        self.agent_error = ''
         self.state = {'self': {'name': self.config['name'], 'platform': self.platform},
                       'incoming': False, 'peers': [], 'approvals': [], 'outgoing': []}
         self.permissions = {'screen': False, 'input': False}
+        self.permissions_checked_at = None
         self.pending_path = self.home / 'pending.json'
         self.pending = json.loads(self.pending_path.read_text()) if self.pending_path.exists() else {}
         self.updating = False
@@ -298,6 +311,7 @@ class DesktopClient:
     def _pump(self):
         registered = False
         while not self.stop_event.is_set():
+            waiting_for_worker = False
             try:
                 if not registered:
                     with self.operation_lock:
@@ -309,54 +323,150 @@ class DesktopClient:
                         if self.config.get('resume_trusted_access', True):
                             peers = self.agent_hub.call('state').get('peers', [])
                             if any(peer.get('trusted_incoming') for peer in peers):
-                                self.agent.start()
-                                self.agent_hub.call('availability', {'enabled': True})
-                                self.incoming = True
+                                try:
+                                    self._start_agent()
+                                except (OSError, ValueError, subprocess.SubprocessError):
+                                    # This computer can still reach the relay and make outgoing connections.
+                                    pass
+                                else:
+                                    self._enable_relay_availability(self.agent_hub)
                     registered = True
-                self.permissions = self.agent.permissions()
-                workspace = self.agent.workspace
-                outbox = workspace / 'hub-outbox.json'
-                if outbox.exists():
-                    receipt = json.loads(outbox.read_text(encoding='utf-8-sig'))
-                    self.agent_hub.call('result', receipt)
-                    outbox.unlink()
-                else:
-                    delivery = workspace / 'delivery.json'
-                    if delivery.exists():
-                        command = json.loads(delivery.read_text())
-                        response = workspace / (command['id'] + '.response.json')
-                        if response.exists():
-                            receipt = {'id': command['id'], 'result': json.loads(response.read_text(encoding='utf-8-sig'))}
-                            atomic_json(outbox, receipt)
-                            delivery.unlink()
-                    else:
-                        started = time.monotonic()
-                        command = self.agent_hub.call('poll')
-                        if command:
-                            atomic_json(delivery, command)
-                            result = self.agent.execute(command, time.monotonic() - started)
-                            if result is not None:
-                                atomic_json(outbox, {'id': command['id'], 'result': result})
-                                delivery.unlink()
-                value = self.agent_hub.call('state')
-                with self.lock:
-                    self.state = value
-                    self.connected = True
-                    self.error = ''
+                self._reconcile_incoming()
+                waiting_for_worker = self._sync_commands()
+                if not self._state_is_current(2):
+                    started_wall = time.time()
+                    started = time.monotonic()
+                    value = self.agent_hub.call('state')
+                    with self.lock:
+                        self.state = value
+                        self.state_seen_at = started
+                        self.state_seen_wall = started_wall
+                        self.connected = True
+                        self.error = ''
             except Exception as error:
                 with self.lock:
                     self.connected = False
                     self.error = str(error)[:250]
-            self.stop_event.wait(1)
+            self._refresh_permissions()
+            self.stop_event.wait(.15 if waiting_for_worker else 1)
+
+    def _state_is_current(self, max_age):
+        # Uptime can stop during sleep. Date the snapshot from the start of
+        # the request so a reply delayed across sleep cannot refresh it.
+        wall_age = time.time() - self.state_seen_wall
+        return self.connected and 0 <= wall_age < max_age and time.monotonic() - self.state_seen_at < max_age
+
+    def _refresh_permissions(self):
+        now = time.monotonic()
+        if self.permissions_checked_at is not None and now - self.permissions_checked_at < 5:
+            return
+        self.permissions_checked_at = now
+        try:
+            self.permissions = self.agent.permissions()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            self.permissions = {'screen': False, 'input': False}
+
+    def _start_agent(self):
+        try:
+            self.agent.start()
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            self.agent_error = str(error)[:250]
+            raise
+        self.agent_error = ''
+
+    def _stop_incoming(self):
+        self.incoming = False
+        self.agent.stop()
+        self.live_agent.expire()
+
+    def _enable_relay_availability(self, hub):
+        try:
+            value = hub.call('availability', {'enabled': True})
+        except Exception:
+            # The relay may have accepted the change before the reply was lost.
+            self.pause_pending = True
+            self._stop_incoming()
+            raise
+        self.incoming = True
+        self.pause_pending = False
+        return value
+
+    def _reconcile_incoming(self):
+        if not self.pause_pending and (not self.incoming or self.agent.running()):
+            return
+        with self.operation_lock:
+            if self.incoming and not self.agent.running():
+                self.agent_error = '本机接收进程已停止，请重新开启允许连接'
+                self.pause_pending = True
+                self._stop_incoming()
+            if self.pause_pending:
+                self.agent_hub.call('availability', {'enabled': False})
+                self.pause_pending = False
+
+    def _save_resume_preference(self, enabled):
+        with self.lock:
+            atomic_json(self.path, dict(self.config, resume_trusted_access=enabled))
+            self.config['resume_trusted_access'] = enabled
+
+    def _sync_commands(self):
+        workspace = self.agent.workspace
+        outbox = workspace / 'hub-outbox.json'
+        delivery = workspace / 'delivery.json'
+        if not outbox.exists() and not self._prepare_receipt(outbox):
+            return delivery.exists() and time.time() - delivery.stat().st_mtime < 45
+        receipt = json.loads(outbox.read_text(encoding='utf-8-sig'))
+        self.agent_hub.call('result', receipt)
+        # An interruption between writing the outbox and unlinking delivery
+        # can leave both files. Clear only the delivery this receipt confirms.
+        if delivery.exists() and json.loads(delivery.read_text())['id'] == receipt['id']:
+            delivery.unlink()
+        outbox.unlink()
+        return False
+
+    def _prepare_receipt(self, outbox):
+        workspace = self.agent.workspace
+        delivery = workspace / 'delivery.json'
+        if delivery.exists():
+            command = json.loads(delivery.read_text())
+            identifier = command['id']
+            response = workspace / (identifier + '.response.json')
+            if response.exists():
+                result = json.loads(response.read_text(encoding='utf-8-sig'))
+            else:
+                error = READ_ONLY_TIMEOUTS.get(command['request']['action'])
+                expires = delivery.stat().st_mtime + command['valid_for_ms'] / 1000
+                if not error or time.time() < expires:
+                    return False
+                # A worker can stop after claiming a snapshot and leave no
+                # response. Free the mailbox without executing it again.
+                result = {'request_id': identifier, 'ok': False, 'input_attempted': False, 'error': error}
+        else:
+            started_wall = time.time()
+            started = time.monotonic()
+            command = self.agent_hub.call('poll')
+            if not command:
+                return False
+            identifier = command['id']
+            atomic_json(delivery, command)
+            elapsed = max(time.monotonic() - started, time.time() - started_wall)
+            result = self.agent.execute(command, elapsed)
+        if result is not None:
+            atomic_json(outbox, {'id': identifier, 'result': result})
+            delivery.unlink()
+            return True
+        return False
 
     def local_state(self):
         with self.lock:
             value = dict(self.state)
-            value.update(version=VERSION, connected=self.connected, error=self.error,
+            connected = self._state_is_current(STATE_STALE_AFTER)
+            value.update(version=VERSION, connected=connected, error=self.error,
+                         incoming=self.incoming, pause_pending=self.pause_pending, agent_error=self.agent_error,
                          permissions=self.permissions, ssh=self.config['ssh'], pending=dict(self.pending))
         value['updates'] = self.updater.snapshot()
         value['live_error'] = self.live_agent.error
-        value['live'] = self.live_view.snapshot(touch=False) if self.live_view else None
+        view = self.live_view
+        value['live'] = view.snapshot(touch=False) if view else None
         return value
 
     def api(self, operation, body):
@@ -366,6 +476,18 @@ class DesktopClient:
             if not self.live_view or body.get('id') != self.live_view.id:
                 raise ValueError('连续桌面会话已结束')
             return self.live_view.snapshot()
+        if operation in ('remote', 'recover'):
+            # Keep submission and recovery ordered, but a slow receipt must
+            # not hold the lock or transport used to pause incoming control.
+            with self.command_lock:
+                with self.operation_lock:
+                    if self.updating or self.stop_event.is_set():
+                        raise ValueError('邻控正在退出或更新，请稍后再试')
+                    if operation == 'remote':
+                        submission = self._prepare_submission(body)
+                if operation == 'remote':
+                    return self._submit_remote(submission)
+                return self.recover(body.get('id'))
         with self.operation_lock:
             return self._api(operation, body)
 
@@ -405,7 +527,7 @@ class DesktopClient:
                 peers = self.state.get('peers', [])
                 if self.live_session or self.pending or self.incoming or any(p.get('incoming') or p.get('can_control') for p in peers):
                     raise ValueError('请先结束远程连接、确认原操作结果，并关闭允许连接，再安装更新')
-                value = self.updater.prepare_install()
+                value = self.updater.prepare_install(expect_relay=self._state_is_current(5))
                 self.updating = True
                 return value
         if self.updating:
@@ -414,16 +536,26 @@ class DesktopClient:
             enabled = body.get('enabled')
             if type(enabled) is not bool:
                 raise ValueError('请明确选择是否允许连接')
-            with self.lock:
-                self.config['resume_trusted_access'] = enabled
-                atomic_json(self.path, self.config)
             if enabled:
-                self.agent.start()
-            else:
-                self.agent.stop()
-                self.live_agent.expire()
-            value = self.ui_hub.call(operation, {'enabled': enabled})
-            self.incoming = enabled
+                self._start_agent()
+                value = self._enable_relay_availability(self.ui_hub)
+                try:
+                    self._save_resume_preference(True)
+                except OSError:
+                    self.pause_pending = True
+                    self._stop_incoming()
+                    raise
+                return value
+            self.pause_pending = True
+            self._stop_incoming()
+            self._save_resume_preference(False)
+            try:
+                value = self.ui_hub.call(operation, {'enabled': False})
+            except (RelayIdentityError, HubRejection):
+                raise
+            except (OSError, http.client.HTTPException):
+                return {'incoming': False, 'sync_pending': True}
+            self.pause_pending = False
             return value
         if operation == 'name':
             name = display_name(body.get('name'))
@@ -455,27 +587,6 @@ class DesktopClient:
                 encoded = dict(v=2, **self.config['endpoint'], code=value['code'])
                 value['connection'] = 'linko2:' + base64.urlsafe_b64encode(json.dumps(encoded).encode()).decode().rstrip('=')
             return value
-        if operation == 'remote':
-            peer = body.get('peer')
-            with self.lock:
-                if peer in self.pending:
-                    raise ValueError('此电脑上一操作未确认，请先查询原结果')
-                raw = body.get('request', {})
-                request = make_request(raw.get('action'), **{k: v for k, v in raw.items() if k not in ('action', 'expires')})
-                request.pop('expires')
-                identifier = uuid.uuid4().hex
-                self.pending[peer] = identifier
-                atomic_json(self.pending_path, self.pending)
-            try:
-                self.ui_hub.call('submit', {'peer': peer, 'id': identifier, 'request': request})
-            except HubRejection:
-                self.clear_pending(identifier)
-                raise
-            except Exception:
-                return {'id': identifier, 'state': 'unconfirmed', 'result': None}
-            return self.recover(identifier)
-        if operation == 'recover':
-            return self.recover(body.get('id'))
         if operation == 'ssh-save':
             return self.save_ssh(body)
         if operation == 'ssh-open':
@@ -491,10 +602,42 @@ class DesktopClient:
             return {'opened': sys.platform == 'darwin'}
         raise ValueError('不支持的操作')
 
+    def _prepare_submission(self, body):
+        peer = body.get('peer')
+        raw = body.get('request', {})
+        with self.lock:
+            if peer in self.pending:
+                raise ValueError('此电脑上一操作未确认，请先查询原结果')
+            request = make_request(raw.get('action'), **{k: v for k, v in raw.items() if k not in ('action', 'expires')})
+            request.pop('expires')
+            identifier = uuid.uuid4().hex
+            pending = dict(self.pending)
+            pending[peer] = identifier
+            atomic_json(self.pending_path, pending)
+            self.pending = pending
+        return {'peer': peer, 'id': identifier, 'request': request}
+
+    def _submit_remote(self, submission):
+        identifier = submission['id']
+        try:
+            self.command_hub.call('submit', submission)
+        except (HubRejection, RelayIdentityError):
+            self.clear_pending(identifier)
+            raise
+        except Exception:
+            return {'id': identifier, 'state': 'unconfirmed', 'result': None}
+        try:
+            return self.recover(identifier)
+        except (RelayIdentityError, HubRejection):
+            # The relay has already accepted the submission. Keep its number.
+            raise
+        except (OSError, http.client.HTTPException):
+            return {'id': identifier, 'state': 'unconfirmed', 'result': None}
+
     def recover(self, identifier):
         if not isinstance(identifier, str) or not re.fullmatch('[a-f0-9]{32}', identifier):
             raise ValueError('无效操作编号')
-        result = self.ui_hub.call('recover', {'id': identifier})
+        result = self.command_hub.call('recover', {'id': identifier})
         if result['state'] == 'complete':
             self.clear_pending(identifier)
         return result
@@ -538,10 +681,9 @@ class DesktopClient:
     def close(self):
         self.stop_event.set()
         if self.live_view: self.live_view.close()
-        self.live_agent.expire()
         self.updater.stop.set()
         with self.operation_lock:
-            self.agent.stop()
+            self._stop_incoming()
             try:
                 self.ui_hub.call('availability', {'enabled': False})
             except Exception:
@@ -634,10 +776,11 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
                 return
             value = self.server.client.api(self.path[5:], body)
             data = json.dumps({'ok': True, 'value': value}, ensure_ascii=False, separators=(',', ':')).encode()
-            self.respond(200, data)
-            if self.path == '/api/update-install':
-                self.server.client.agent.stop()
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
+            try:
+                self.respond(200, data)
+            finally:
+                if self.path == '/api/update-install':
+                    threading.Thread(target=self.server.shutdown, daemon=True).start()
         except Exception as error:
             self.respond(400, json.dumps({'ok': False, 'error': str(error)[:250]}, ensure_ascii=False).encode())
 

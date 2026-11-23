@@ -72,6 +72,11 @@ class LiveTests(unittest.TestCase):
   self.call('live-close',self.a,id=ident)
   self.call('submit',self.a,peer=self.ids[self.b],id=uuid.uuid4().hex,request={'action':'observe'})
   with self.assertRaises(ValueError):self.open()
+ def test_expired_snapshot_does_not_block_live_open_without_recovery(self):
+  self.call('submit',self.a,peer=self.ids[self.b],id=uuid.uuid4().hex,request={'action':'observe'})
+  self.call('poll',self.b)
+  self.now+=46
+  self.assertTrue(self.open())
  def test_media_timeout_is_visible_to_the_original_viewer_and_frees_the_target(self):
   from lanpilot.live import MEDIA_FAILURES
   ident=self.open()
@@ -113,6 +118,26 @@ class ReadRecoveryTransportTests(unittest.TestCase):
     self.assertEqual(2,client._call.call_count)
 
 class DurableLiveAcceptanceTests(unittest.TestCase):
+ def test_pause_while_exchange_is_in_flight_never_renews_the_lease(self):
+  import threading
+  from types import SimpleNamespace
+  from lanpilot.live_agent import LiveAgent
+  ident='b'*32;writes=[]
+  client=SimpleNamespace(config={'endpoint':{},'credential':'fixture'},incoming=True,
+                         stop_event=threading.Event(),agent=SimpleNamespace(workspace=Path('.')))
+  class Hub:
+   def call(self,operation,body=None):
+    if operation=='live-agent-state':return {'sessions':[{'id':ident}]}
+    if operation=='live-exchange':
+     client.incoming=False
+     client.stop_event.set()
+     return {'active':True,'lease_ms':2500,'inputs':[]}
+    return {'closed':True}
+  agent=LiveAgent(client,lambda *_:Hub(),lambda _,value:writes.append(value))
+  agent.read=lambda _:{}
+  agent.run()
+  self.assertEqual([{'id':ident,'expires':0}],writes)
+
  def test_first_frame_has_more_time_without_extending_the_active_frame_gap(self):
   from types import SimpleNamespace
   from unittest.mock import patch
@@ -241,11 +266,21 @@ class BackgroundViewTests(unittest.TestCase):
    self.assertGreater(view.snapshot()['frame']['seq'],first['frame']['seq'])
   finally:view.close();view.thread.join(timeout=1)
  def test_stale_frame_is_never_usable_for_input(self):
-  import threading,time
+  import threading
   from lanpilot.live_view import LiveView
   view=LiveView(None,'a'*32,threading.Event())
   view.publish({'id':view.id,'frame':{'seq':1,'geometry':'0,0,100,100','jpeg_base64':'private-image'},'ack':4,'error':'','frame_age_ms':1600})
   self.assertIsNone(view.snapshot()['frame']);self.assertEqual(4,view.snapshot()['ack'])
+ def test_delayed_frame_cannot_be_used_for_input_on_arrival(self):
+  import threading
+  from lanpilot.live_view import LiveView
+  view=LiveView(None,'a'*32,threading.Event())
+  frame={'seq':1,'geometry':'0,0,100,100','jpeg_base64':'fixture'}
+  value={'id':view.id,'frame':frame,'ack':0,'error':'','frame_age_ms':350}
+  view.publish(value,roundtrip=1.3)
+  self.assertIsNone(view.snapshot()['frame'])
+  view.publish(dict(value,frame=dict(frame,seq=2)),roundtrip=.1)
+  self.assertEqual(2,view.snapshot()['frame']['seq'])
 
 class LocalFrameFeedTests(unittest.TestCase):
  def test_feed_requires_local_session_and_delivers_jpeg_without_json_timer(self):

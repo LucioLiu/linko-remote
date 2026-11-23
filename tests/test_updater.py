@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import plistlib
 import secrets
+import subprocess
 import stat
 import tempfile
 import unittest
@@ -11,7 +12,7 @@ from unittest.mock import patch
 import zipfile
 
 from lanpilot.updater import (UpdateManager, select_release, version_key, asset_name,
-                              safe_extract, check_url, replace_mac_app, apply_update)
+                              safe_extract, check_url, replace_mac_app, apply_update, stop_mac_launcher)
 
 
 def release(version='0.8.2-preview.1', data=b'valid-update', **changes):
@@ -79,6 +80,72 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual(before, profile.read_bytes())
             self.assertEqual([], list(manager.directory.glob('*.part')))
             self.assertIsNone(manager.archive)
+
+    def test_interrupted_download_retries_and_revalidates_the_complete_archive(self):
+        data = b'valid-update'
+
+        class Interrupted(io.BytesIO):
+            def read(self, _):
+                part = super().read(3)
+                if self.tell() > 3:
+                    raise TimeoutError('read operation timed out')
+                return part
+
+        with tempfile.TemporaryDirectory() as temporary:
+            replies = iter([io.BytesIO(json.dumps([release(data=data)]).encode()),
+                            Interrupted(data), io.BytesIO(data)])
+            manager = UpdateManager(temporary, current='0.8.1-preview.1', system='windows', machine='AMD64',
+                                    opener=lambda _: next(replies))
+            manager.check()
+            manager.download()
+            self.assertEqual('ready', manager.snapshot()['status'])
+            self.assertEqual(data, manager.archive.read_bytes())
+
+    def test_macos_update_can_stop_only_the_original_launcher(self):
+        app = Path('/Applications/邻控.app')
+        launcher = str(app / 'Contents/MacOS/LinkoRemote')
+        with patch('lanpilot.updater.subprocess.run') as ps, patch('lanpilot.updater.os.kill') as kill, \
+                patch('lanpilot.updater.wait_for_exit') as wait:
+            ps.return_value = subprocess.CompletedProcess([], 0, stdout='/bin/other')
+            with self.assertRaisesRegex(ValueError, '无法确认'):
+                stop_mac_launcher(app, 178)
+            kill.assert_not_called()
+            ps.return_value.stdout = launcher + '\n'
+            stop_mac_launcher(app, 178)
+            self.assertEqual(178, kill.call_args.args[0])
+            wait.assert_called_once_with(178)
+
+    def test_update_waits_for_the_online_relay_to_reconnect(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            cache = home / 'updates'
+            cache.mkdir()
+            archive = cache / 'update.zip'
+            archive.write_bytes(b'valid-update')
+            version = '99.1.0-preview.1'
+            spec = cache / 'install-test.json'
+            spec.write_text(json.dumps({'home': str(home), 'archive': str(archive), 'system': 'windows',
+                        'version': version, 'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
+                        'parent_pid': 12345, 'expect_relay': True}))
+            states = [{'version': version, 'connected': False}, {'version': version, 'connected': True}]
+            with patch('lanpilot.updater.wait_for_exit'), patch('lanpilot.updater.safe_extract', return_value=home), \
+                 patch('lanpilot.updater.subprocess.run'), patch('lanpilot.updater.time.sleep'), \
+                 patch('lanpilot.updater.local_state', side_effect=states) as state:
+                self.assertTrue(apply_update(spec)['ok'])
+            self.assertEqual(2, state.call_count)
+
+            spec.write_text(json.dumps({'home': str(home), 'archive': str(archive), 'system': 'windows',
+                        'version': version, 'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
+                        'parent_pid': 12345, 'expect_relay': True, 'previous_python': 'old-python'}))
+            with patch('lanpilot.updater.wait_for_exit'), patch('lanpilot.updater.safe_extract', return_value=home), \
+                 patch('lanpilot.updater.subprocess.run'), patch('lanpilot.updater.time.sleep'), \
+                 patch('lanpilot.updater.time.monotonic', side_effect=[0, 1, 45]), \
+                 patch('lanpilot.updater.local_state', return_value=states[0]), \
+                 patch('lanpilot.updater.stop_updated_client') as stop, \
+                 patch('lanpilot.updater.restore_windows_launcher') as restore:
+                self.assertFalse(apply_update(spec)['ok'])
+            stop.assert_called_once_with(home, version)
+            restore.assert_called_once()
 
     def test_archive_traversal_link_and_duplicate_paths_are_rejected(self):
         bad_names = ['../outside', 'LinkoRemote-Unified/../outside', '/absolute',

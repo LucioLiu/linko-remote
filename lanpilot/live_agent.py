@@ -90,10 +90,10 @@ class LiveAgent:
                 if not sessions:
                     self.client.stop_event.wait(.3);continue
                 ident=sessions[0]['id']
-                if self.current!=ident:
-                    with self.lock:
-                        self.expire();self.media_at=time.monotonic();self.current=ident
                 with self.lock:
+                    if not self.client.incoming or self.client.stop_event.is_set():continue
+                    if self.current!=ident:
+                        self.expire();self.media_at=time.monotonic();self.current=ident
                     frame_timeout = FRAME_GAP_TIMEOUT if self.last_frame else FIRST_FRAME_TIMEOUT
                     timed_out = time.monotonic()-self.media_at>frame_timeout
                     reason = 'frame_gap' if self.last_frame else 'first_frame_timeout'
@@ -109,7 +109,7 @@ class LiveAgent:
                 started=time.monotonic()
                 value=self.hub.call('live-exchange',body)
                 with self.lock:
-                    if self.current!=ident:continue
+                    if self.current!=ident or not self.client.incoming or self.client.stop_event.is_set():continue
                     if not value['active']: raise RuntimeError('远程输入已停止')
                     self.write(self.root/'live-control.json',{'id':ident,'expires':time.time()+min(2.5,value['lease_ms']/1000)})
                     for batch in value['inputs']:

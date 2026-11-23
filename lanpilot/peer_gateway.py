@@ -30,8 +30,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         # UI requests may be minutes apart. Public TCP relays can retire an
         # idle connection without sending a close response to its client.
-        # Close after each UI operation; continuous agent polling stays pooled.
-        if self.path not in ('/v2/poll', '/v2/state', '/v2/result', '/v2/register',
+        # Keep the command and its receipt queries on one connection. Infrequent
+        # UI changes still use short-lived connections.
+        if self.path not in ('/v2/poll', '/v2/state', '/v2/result', '/v2/register', '/v2/submit', '/v2/recover',
                               '/v2/live-view', '/v2/live-input', '/v2/live-exchange', '/v2/live-agent-state', '/v2/live-frame'):
             self.close_connection = True
             self.send_header('Connection', 'close')

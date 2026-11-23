@@ -151,6 +151,49 @@ class PeerHubTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '未确认'):
             self.submit(self.c, self.b)
 
+    def test_input_expired_while_offline_recovers_without_waiting_for_target(self):
+        self.pair(self.a, self.b)
+        identifier = uuid.uuid4().hex
+        self.call('submit', self.a, peer=self.devices[self.b], id=identifier,
+                  request={'action': 'click', 'frame_id': 'f' * 32, 'x': 1, 'y': 1, 'button': 'left'})
+        self.now += 46
+        recovered = self.call('recover', self.a, id=identifier)
+        self.assertEqual('complete', recovered['state'])
+        self.assertFalse(recovered['result']['input_attempted'])
+        self.assertEqual('EXPIRED_OR_ACCESS_REVOKED_BEFORE_DELIVERY', recovered['result']['error'])
+        self.assertIsNone(self.call('poll', self.b))
+
+    def test_expired_status_does_not_block_another_controller(self):
+        self.pair(self.a, self.b)
+        self.pair(self.c, self.b)
+        identifier = uuid.uuid4().hex
+        self.call('submit', self.a, peer=self.devices[self.b], id=identifier, request={'action': 'status'})
+        self.assertEqual(identifier, self.call('poll', self.b)['id'])
+        self.now += 46
+        replacement = self.submit(self.c, self.b)
+        self.assertEqual(replacement, self.call('poll', self.b)['id'])
+        recovered = self.call('recover', self.a, id=identifier)
+        self.assertEqual('complete', recovered['state'])
+        self.assertEqual('STATUS_TIMED_OUT', recovered['result']['error'])
+        late_result = {'request_id': identifier, 'ok': True, 'input_attempted': False}
+        self.assertTrue(self.call('result', self.b, id=identifier, result=late_result)['saved'])
+        self.assertEqual(recovered, self.call('recover', self.a, id=identifier))
+
+    def test_uncertain_delivered_input_blocks_only_its_target(self):
+        self.pair(self.a, self.b)
+        self.pair(self.a, self.c)
+        identifier = uuid.uuid4().hex
+        self.call('submit', self.a, peer=self.devices[self.b], id=identifier,
+                  request={'action': 'click', 'frame_id': 'f' * 32, 'x': 1, 'y': 1, 'button': 'left'})
+        self.assertEqual(identifier, self.call('poll', self.b)['id'])
+        self.now += 46
+        self.assertEqual('unconfirmed', self.call('recover', self.a, id=identifier)['state'])
+        with self.assertRaisesRegex(ValueError, '未确认'):
+            self.submit(self.a, self.b)
+        other = self.submit(self.a, self.c)
+        self.assertEqual(other, self.call('poll', self.c)['id'])
+        self.assertIsNone(self.call('poll', self.b))
+
     def test_revoke_before_delivery_prevents_input_and_new_commands(self):
         self.pair(self.a, self.b)
         identifier = self.submit(self.a, self.b)

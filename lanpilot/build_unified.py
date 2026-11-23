@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import platform
 import plistlib
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ import zipfile
 from .version import VERSION, TAG
 
 ROOT=Path(__file__).resolve().parents[1]
+MACOS_MINIMUM = '14.0'
 
 
 # Release payloads are intentionally enumerated. Never copy the developer's
@@ -57,10 +59,11 @@ def mac(output, endpoint, engine):
     data={'CFBundleName':'邻控','CFBundleDisplayName':'邻控','CFBundleIdentifier':'local.linko.remote.unified.preview',
           'CFBundleVersion':VERSION.split('-')[0],'CFBundleShortVersionString':VERSION.split('-')[0],
           'LinkoReleaseVersion':VERSION,'CFBundleExecutable':'LinkoRemote','NSHighResolutionCapable':True,
-          'LSMinimumSystemVersion':'14.0','NSAppTransportSecurity':{'NSAllowsLocalNetworking':True},'NSScreenCaptureUsageDescription':'允许可信电脑通过邻控查看本机屏幕。'}
+          'LSMinimumSystemVersion':MACOS_MINIMUM,'NSAppTransportSecurity':{'NSAllowsLocalNetworking':True},'NSScreenCaptureUsageDescription':'允许可信电脑通过邻控查看本机屏幕。'}
     (contents/'Info.plist').write_bytes(plistlib.dumps(data))
-    subprocess.run(['swiftc',str(ROOT/'lanpilot/mac/UnifiedApp.swift'),'-o',str(contents/'MacOS/LinkoRemote'),'-framework','Cocoa','-framework','WebKit'],check=True)
-    subprocess.run(['swiftc','-parse-as-library',str(ROOT/'lanpilot/mac/PeerDesktop.swift'),'-o',str(code/'native/LinkoDesktop'),'-framework','Cocoa','-framework','ScreenCaptureKit','-framework','ApplicationServices'],check=True)
+    swiftc = ['swiftc', '-target', f'{platform.machine()}-apple-macosx{MACOS_MINIMUM}']
+    subprocess.run(swiftc + [str(ROOT/'lanpilot/mac/UnifiedApp.swift'),'-o',str(contents/'MacOS/LinkoRemote'),'-framework','Cocoa','-framework','WebKit'],check=True)
+    subprocess.run(swiftc + ['-parse-as-library',str(ROOT/'lanpilot/mac/PeerDesktop.swift'),'-o',str(code/'native/LinkoDesktop'),'-framework','Cocoa','-framework','ScreenCaptureKit','-framework','ApplicationServices'],check=True)
     shutil.copytree(engine,contents/'Resources/engine',dirs_exist_ok=True)
     notices = engine / 'ThirdParty'
     if not notices.is_dir():
