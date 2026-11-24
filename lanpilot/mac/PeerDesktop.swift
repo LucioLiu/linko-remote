@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import ScreenCaptureKit
 import CryptoKit
+import CoreImage
 
 struct DesktopFailure: Error { let text: String }
 func fail(_ message: String) throws -> Never { throw DesktopFailure(text: message) }
@@ -21,6 +22,42 @@ struct DesktopFrame {
  let window: [Int]
  let focus: CFHashCode
  let input: [UInt32]
+}
+
+private final class LiveCaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate {
+ private let lock = NSLock()
+ private let context = CIContext()
+ private var latest: CGImage?
+ private var failure: Error?
+
+ func image() throws -> CGImage? {
+  lock.lock()
+  defer { lock.unlock() }
+  if let failure { throw failure }
+  return latest
+ }
+
+ func stream(_ stream: SCStream, didStopWithError error: Error) {
+  lock.lock()
+  failure = error
+  latest = nil
+  lock.unlock()
+ }
+
+ func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
+  guard type == .screen, sample.isValid,
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+        let status = attachments.first?[.status] as? Int,
+        status == SCFrameStatus.complete.rawValue,
+        let buffer = sample.imageBuffer else { return }
+  // Render a copy before returning so the capture queue can reuse its surfaces.
+  let source = CIImage(cvPixelBuffer: buffer)
+  guard let image = context.createCGImage(source, from: source.extent, format: .RGBA8,
+                                         colorSpace: CGColorSpace(name: CGColorSpace.sRGB)) else { return }
+  lock.lock()
+  if failure == nil { latest = image }
+  lock.unlock()
+ }
 }
 
 @available(macOS 14.0, *)
@@ -58,13 +95,13 @@ final class PeerDesktop {
   let region = [Int((intersection.minX - screen.minX) * sx), Int((intersection.minY - screen.minY) * sy), Int(intersection.width * sx), Int(intersection.height * sy)]
   return (app.processIdentifier, region, window[kCGWindowName as String] as? String ?? app.localizedName ?? "Mac")
  }
- func capture(showsCursor: Bool = false) async throws -> (CGImage, Data) {
+ func capture() async throws -> (CGImage, Data) {
   guard CGPreflightScreenCaptureAccess() else { try fail("SCREEN_RECORDING_PERMISSION_REQUIRED") }
   let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
   guard let chosen = content.displays.first(where: { $0.displayID == display }) else { try fail("DISPLAY_UNAVAILABLE") }
   let config = SCStreamConfiguration()
   config.width = CGDisplayPixelsWide(display); config.height = CGDisplayPixelsHigh(display)
-  config.showsCursor = showsCursor
+  config.showsCursor = false
   let image = try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: chosen, excludingWindows: []), configuration: config)
   let count = image.width * image.height * 4
   var pixels = Data(count: count)
@@ -180,6 +217,33 @@ final class PeerDesktop {
  var liveID = "", liveSeq = 0, liveAck = 0
  var liveEnded = Set<String>(), liveKeys = Set<String>(), liveButtons = Set<Int>()
  var liveCaptured: TimeInterval = 0
+ private var liveStream: SCStream?
+ private var liveOutput: LiveCaptureOutput?
+ private var liveGeometry: String?
+ private var liveStarted: TimeInterval = 0
+ private let liveQueue = DispatchQueue(label: "linko.screen.frames")
+
+ private func startLiveCapture(width: Int, height: Int, geometry: String) async throws {
+  let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+  guard let screen = content.displays.first(where: { $0.displayID == display }) else { try fail("DISPLAY_UNAVAILABLE") }
+  let config = SCStreamConfiguration()
+  let scale = min(1, 1280.0 / Double(width), 800.0 / Double(height))
+  config.width = max(1, Int(Double(width) * scale))
+  config.height = max(1, Int(Double(height) * scale))
+  config.pixelFormat = kCVPixelFormatType_32BGRA
+  config.minimumFrameInterval = CMTime(value: 1, timescale: 8)
+  config.showsCursor = true
+  let output = LiveCaptureOutput()
+  let stream = SCStream(filter: SCContentFilter(display: screen, excludingWindows: []),
+                        configuration: config, delegate: output)
+  try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: liveQueue)
+  try await stream.startCapture()
+  liveStream = stream
+  liveOutput = output
+  liveGeometry = geometry
+  liveStarted = ProcessInfo.processInfo.systemUptime
+ }
+
  var liveFlags: CGEventFlags {
   var f: CGEventFlags = []
   for k in liveKeys { if k.hasPrefix("Shift") { f.insert(.maskShift) }; if k.hasPrefix("Control") { f.insert(.maskControl) }; if k.hasPrefix("Alt") { f.insert(.maskAlternate) }; if k.hasPrefix("Meta") { f.insert(.maskCommand) } }
@@ -203,21 +267,38 @@ final class PeerDesktop {
   for b in liveButtons { CGEvent(mouseEventSource:nil, mouseType:b == 0 ? .leftMouseUp : b == 2 ? .rightMouseUp : .otherMouseUp, mouseCursorPosition:point, mouseButton:b == 0 ? .left : b == 2 ? .right : .center)?.post(tap:.cghidEventTap) }
   liveButtons.removeAll()
  }
- func stopLive(_ reason: String) {
+ func stopLive(_ reason: String) async {
   releaseLive()
   if !liveID.isEmpty { liveEnded.insert(liveID); try? writeJSON(["id":liveID,"error":reason],workspace.appendingPathComponent("live-ended.json")) }
   liveID = ""
+  let stream = liveStream
+  liveStream = nil
+  liveOutput = nil
+  liveGeometry = nil
+  liveCaptured = 0
+  try? await stream?.stopCapture()
  }
  func liveTick() async {
   let controlURL = workspace.appendingPathComponent("live-control.json")
-  guard let data = try? Data(contentsOf:controlURL), let control = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any] else { return }
+  guard let data = try? Data(contentsOf:controlURL), let control = (try? JSONSerialization.jsonObject(with:data)) as? [String:Any] else {
+   if !liveID.isEmpty { await stopLive("连接已结束，按键已释放") }
+   return
+  }
   do {
-   guard let identifier = control["id"] as? String, identifier.range(of:"^[a-f0-9]{32}$",options:.regularExpression) != nil, let expires = control["expires"] as? Double, expires > Date().timeIntervalSince1970, expires < Date().timeIntervalSince1970+4, !stopped else { if !liveID.isEmpty { stopLive("连接已结束，按键已释放") }; return }
+   guard let identifier = control["id"] as? String, identifier.range(of:"^[a-f0-9]{32}$",options:.regularExpression) != nil, let expires = control["expires"] as? Double, expires > Date().timeIntervalSince1970, expires < Date().timeIntervalSince1970+4, !stopped else { if !liveID.isEmpty { await stopLive("连接已结束，按键已释放") }; return }
    if liveEnded.contains(identifier) { return }
-   if liveID != identifier { if !liveID.isEmpty { stopLive("已切换会话") }; liveID=identifier; liveSeq=0; liveAck=0 }
+   if liveID != identifier { if !liveID.isEmpty { await stopLive("已切换会话") }; liveID=identifier; liveSeq=0; liveAck=0 }
    try ensureAccess()
    let width=CGDisplayPixelsWide(display), height=CGDisplayPixelsHigh(display)
    let geometry="0,0,\(width),\(height)"
+   if let liveGeometry, liveGeometry != geometry { try fail("DISPLAY_CHANGED_RECONNECT") }
+   if liveStream == nil {
+    try await startLiveCapture(width: width, height: height, geometry: geometry)
+   }
+   guard let image = try liveOutput?.image() else {
+    guard ProcessInfo.processInfo.systemUptime - liveStarted < 2 else { try fail("SCREEN_CAPTURE_NO_FRAME") }
+    return
+   }
    let files=try FileManager.default.contentsOfDirectory(at:workspace,includingPropertiesForKeys:nil).filter { $0.lastPathComponent.hasPrefix(identifier+"-") && $0.lastPathComponent.hasSuffix(".live-input.json") }.sorted { $0.lastPathComponent < $1.lastPathComponent }
    for file in files {
     let claimed=file.appendingPathExtension("executing"); try FileManager.default.moveItem(at:file,to:claimed)
@@ -245,14 +326,10 @@ final class PeerDesktop {
     liveAck += 1;try writeJSON(["id":identifier,"seq":liveAck],workspace.appendingPathComponent("live-receipt.json"));try FileManager.default.removeItem(at:claimed)
    }
    if ProcessInfo.processInfo.systemUptime-liveCaptured > 0.12 {
-    let (image,_)=try await capture(showsCursor:true);let scale=min(1,min(1280.0/Double(image.width),800.0/Double(image.height)))
-    let w=max(1,Int(Double(image.width)*scale)), h=max(1,Int(Double(image.height)*scale))
-    guard let context=CGContext(data:nil,width:w,height:h,bitsPerComponent:8,bytesPerRow:0,space:CGColorSpaceCreateDeviceRGB(),bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue) else { try fail("CAPTURE_FAILED") }
-    context.draw(image,in:CGRect(x:0,y:0,width:w,height:h))
-    guard let scaled=context.makeImage(),let jpeg=NSBitmapImageRep(cgImage:scaled).representation(using:.jpeg,properties:[.compressionFactor:0.6]) else { try fail("ENCODING_FAILED") }
+    guard let jpeg = NSBitmapImageRep(cgImage: image).representation(using: .jpeg, properties: [.compressionFactor: 0.6]) else { try fail("ENCODING_FAILED") }
     liveSeq += 1;try writeJSON(["id":identifier,"seq":liveSeq,"geometry":geometry,"created":Date().timeIntervalSince1970,"jpeg_base64":jpeg.base64EncodedString()],workspace.appendingPathComponent("live-frame.json"));liveCaptured=ProcessInfo.processInfo.systemUptime
    }
-  } catch { stopLive((error as? DesktopFailure)?.text ?? "连续桌面已停止") }
+  } catch { await stopLive((error as? DesktopFailure)?.text ?? "连续桌面已停止") }
  }
  func run() async throws {
   try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true, attributes: [.posixPermissions:0o700])
@@ -275,6 +352,7 @@ final class PeerDesktop {
    }
    try await Task.sleep(nanoseconds: liveID.isEmpty ? 150_000_000 : 15_000_000)
   }
+  if !liveID.isEmpty { await stopLive("连接已结束，按键已释放") }
  }
 }
 
