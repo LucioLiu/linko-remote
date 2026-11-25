@@ -25,3 +25,12 @@ lanpilot recover DEVICE REQUEST_ID
 短作业默认为前台执行，这段时间该设备的屏幕请求要等作业返回。需要继续看屏时，在对账清单加 `"execution":"background"`。启动回执返回 `job_id`；用 `{"version":1,"operation":"job-status","job_id":"..."}` 查状态，用同样字段和 `"operation":"job-result"` 取完成结果。每台设备最多一个后台作业线程，仅执行指定清单，持续由请求 ID 标识。宿主进程异常退出而未写回结果会显示未确认；重新运行原任务会产生新的操作。转输超时时，通过 `recover` 查询原请求，后台作业则用原 `job_id` 继续查询。回执包含开始、运行、完成或失败状态，没有逐行进度。每个输入最多 2 万行；对账按批次检查 30 秒时间预算。输出、输入快照和异常回执保留在该 Windows 用户的专用目录，直到用户清理。
 
 要增加本地 CLI 处理器，给 `lanpilot/jobs.py` 增加明确的操作名、字段、权限和输入上限，在 `windows/LocalJob.ps1` 注册固定处理函数或固定的已部署程序；参数来自经过校验的清单，工作目录由请求 ID 创建。新增处理器要验证输出内容和摘要，并通过安装包清单分发对应代码。涉及业务平台的结果应另外读回平台记录，必要时通过 `observe` 查看真实画面。现有处理器支持 CSV 暂存、对账及结果读取。
+
+重新连接后可以直接使用启动回执里的 `job_id`：
+
+```sh
+lanpilot job-status DEVICE JOB_ID
+lanpilot job-result DEVICE JOB_ID
+```
+
+第一条查询原作业进度，第二条在作业成功后取回并校验差异文件。两条都可重复查询。若启动回执丢失，先用 `lanpilot recover DEVICE REQUEST_ID` 取回原启动回执。

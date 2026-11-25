@@ -37,6 +37,21 @@ try{
  $status.operation='job-result'
  $saved=Invoke-JobRequest $tmp ('f'*32) $status
  if($saved.artifact.sha256 -ne $result.artifact.sha256){throw 'async output mismatch'}
+ # A new query process has no access to the launcher's in-memory runspace.
+ $queryScript=Join-Path $env:LOCALAPPDATA 'query-result.ps1'
+ @'
+param($repo,$workspace,$jobId)
+$ErrorActionPreference='Stop'
+. (Join-Path $repo 'windows/LocalJob.ps1')
+$q=[pscustomobject]@{version=1;operation='job-result';job_id=$jobId}
+Invoke-JobRequest $workspace ([guid]::NewGuid().ToString('N')) $q | ConvertTo-Json -Depth 10 -Compress
+'@ | Set-Content -LiteralPath $queryScript
+ $exe=(Get-Process -Id $PID).Path
+ $recovered=(& $exe -NoProfile -File $queryScript $repo $tmp $start.job_id)|ConvertFrom-Json
+ if($LASTEXITCODE -ne 0 -or $recovered.job_state -ne 'succeeded' -or $recovered.job_id -ne $start.job_id){throw 'fresh process lookup failed'}
+ $bytes=[Convert]::FromBase64String($recovered.artifact.content_base64)
+ if([LedgerReconcile]::Sha($bytes) -ne $result.artifact.sha256){throw 'recovered artifact mismatch'}
+ 'PASS fresh process recovered verified CSV by original job ID'
  'PASS asynchronous job finished same artifact without a second execution'
  'PASS native stage/idempotent retry/6-field report/readback/cross-scope receipt'
  # No user-controlled name may escape the dedicated inbox.

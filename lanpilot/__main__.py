@@ -16,6 +16,8 @@ x=s.add_parser('invite');x.add_argument('name');x.add_argument('installer',type=
 x=s.add_parser('invite-route');x.add_argument('--server');x.add_argument('--port',type=int);x.add_argument('--lan-only',action='store_true')
 x=s.add_parser('adopt');x.add_argument('name');x.add_argument('runtime')
 x=s.add_parser('job');x.add_argument('device');x.add_argument('manifest',type=Path)
+for command in ('job-status','job-result'):
+ x=s.add_parser(command,help='按原作业编号查询后台对账');x.add_argument('device');x.add_argument('job_id')
 x=s.add_parser('stage');x.add_argument('device');x.add_argument('scope');x.add_argument('files',nargs='*',type=Path);x.add_argument('--input',nargs=2,action='append',default=[],metavar=('REMOTE_NAME','MAC_PATH'))
 for a in ['status','observe','recover','action']:
  x=s.add_parser(a);x.add_argument('device')
@@ -63,6 +65,12 @@ elif a.command=='job':
  with a.manifest.open('rb') as stream:raw=stream.read(3000001)
  if len(raw)>3000000:p.exit(1,'Job manifest exceeds size limit\n')
  r=b.request(a.device,{'action':'job','manifest':json.loads(raw)})
+elif a.command in ('job-status','job-result'):
+ from .jobs import validate_job
+ manifest={'version':1,'operation':a.command,'job_id':a.job_id}
+ try:validate_job(manifest)
+ except ValueError as e:p.exit(1,str(e)+'\n')
+ r=b.request(a.device,{'action':'job','manifest':manifest})
 elif a.command=='stage':
  from .jobs import stage_manifest
  r=b.request(a.device,{'action':'job','manifest':stage_manifest(a.scope,a.files+[{'name':n,'path':p} for n,p in a.input])})
