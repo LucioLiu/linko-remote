@@ -1,0 +1,4 @@
+{"codec": "h264", "frames": 80, "first_ms": 943, "last_ms": 4563, "steady_fps": 21.8, "delivered_by_4s": 70}
+{"codec": "jpeg", "frames": 80, "first_ms": 1439, "last_ms": 26966, "steady_fps": 3.1, "delivered_by_4s": 6}
+{"codec": "jpeg", "frames": 80, "first_ms": 1094, "last_ms": 17203, "steady_fps": 4.9, "delivered_by_4s": 9}
+{"codec": "h264", "frames": 80, "first_ms": 770, "last_ms": 4966, "steady_fps": 18.8, "delivered_by_4s": 74}
