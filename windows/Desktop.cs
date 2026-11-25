@@ -275,7 +275,15 @@ public static class RemoteDesktop {
  }
  public static string InputStopFile;
  public static long LiveDeadlineUnixMs;
- static void Send(INPUT[] a) {if(LiveDeadlineUnixMs>0&&DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()>LiveDeadlineUnixMs)throw new Exception("LIVE_INPUT_LEASE_EXPIRED");if(!String.IsNullOrEmpty(InputStopFile)&&File.Exists(InputStopFile))throw new Exception("WORKER_STOPPING_BEFORE_INPUT");Check();CheckInputAccess(); if(SendInput((uint)a.Length,a,Marshal.SizeOf(typeof(INPUT)))!=a.Length) throw new Exception("INPUT_NOT_CONFIRMED_POSSIBLE_UIPI_DO_NOT_RETRY");}
+ // Revalidate the mailbox immediately before each live SendInput, including paced text.
+ public static Action LiveInputGuard;
+ static void Send(INPUT[] a) {
+  Check();CheckInputAccess();
+  if(LiveInputGuard!=null)LiveInputGuard();
+  if(LiveDeadlineUnixMs>0&&DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()>=LiveDeadlineUnixMs)throw new Exception("LIVE_INPUT_LEASE_EXPIRED");
+  if(!String.IsNullOrEmpty(InputStopFile)&&File.Exists(InputStopFile))throw new Exception("WORKER_STOPPING_BEFORE_INPUT");
+  if(SendInput((uint)a.Length,a,Marshal.SizeOf(typeof(INPUT)))!=a.Length)throw new Exception("INPUT_NOT_CONFIRMED_POSSIBLE_UIPI_DO_NOT_RETRY");
+ }
  static INPUT Mouse(int x,int y,uint flags,uint data) {var i=new INPUT();i.type=0;i.u.mouse=new MOUSE{x=x,y=y,flags=flags,data=data};return i;}
  static INPUT Key(ushort vk,ushort scan,uint flags) {var i=new INPUT();i.type=1;i.u.key=new KEY{vk=vk,scan=scan,flags=flags};return i;}
  public static void Move(int x,int y) {var b=Bounds();if(x<0||y<0||x>=b[2]||y>=b[3]) throw new Exception("OUT_OF_FRAME"); Send(new[]{Mouse((int)Math.Round(x*65535.0/Math.Max(1,b[2]-1)),(int)Math.Round(y*65535.0/Math.Max(1,b[3]-1)),0xC001,0)});
@@ -314,6 +322,7 @@ public static class RemoteDesktop {
  // one-shot AI actions above keep their exact-frame ownership checks.
  static HashSet<ushort> liveKeys=new HashSet<ushort>();
  static HashSet<int> liveButtons=new HashSet<int>();
+ public static bool LiveHasHeldInput {get {return liveKeys.Count!=0||liveButtons.Count!=0;}}
  static uint Extended(ushort vk) {return (vk==163||vk==165||vk==91||vk==92||(vk>=33&&vk<=46))?1u:0u;}
  public static void LiveKey(ushort vk,bool down) {
   if(down)liveKeys.Add(vk);

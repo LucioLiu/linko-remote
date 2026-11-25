@@ -14,6 +14,7 @@ import time
 
 from PIL import Image, ImageChops, ImageStat
 
+from live_wan_benchmark import TimedViewerHub
 from lanpilot.live_view import LiveView
 from lanpilot.peer_client import PinnedHub, default_home
 
@@ -42,7 +43,8 @@ def measure(peer, count):
         return PinnedHub(config['endpoint'], config['credential'])
     control = hub()
     identifier = control.call('live-open', {'peer': peer})['id']
-    view = LiveView(hub(), identifier, threading.Event())
+    media = TimedViewerHub(config['endpoint'], config['credential'])
+    view = LiveView(media, identifier, threading.Event())
     samples = []
     try:
         view.start()
@@ -57,6 +59,7 @@ def measure(peer, count):
             else:
                 raise RuntimeError('未收到适合操作的新画面')
             before = patches(frame, target)
+            delta_count = len(media.delta_sizes)
             sample = {'seq': seq, 'pixel_ms': None, 'ack_ms': None}
             samples.append(sample)
             start = time.monotonic()
@@ -72,6 +75,7 @@ def measure(peer, count):
                                        for a,b in zip(before, after)]
                     if delta >= 5 and adjacent < 2:
                         sample['pixel_ms'] = round(1000 * (time.monotonic()-start))
+                        sample['observed_delta_payload_bytes'] = sum(media.delta_sizes[delta_count:])
                 if view.snapshot()['ack'] >= seq and sample['ack_ms'] is None:
                     sample['ack_ms'] = round(1000 * (time.monotonic()-start))
                 if sample['pixel_ms'] is not None and sample['ack_ms'] is not None:

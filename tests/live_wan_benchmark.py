@@ -20,6 +20,8 @@ class TimedViewerHub(PinnedHub):
         super().__init__(endpoint, credential)
         self.calls = []
         self.repeats = []
+        self.delta_sizes = []
+        self.delta_requests = []
         self.last_digest = None
         self.duplicate_payloads = 0
 
@@ -33,7 +35,11 @@ class TimedViewerHub(PinnedHub):
             digest = hashlib.sha256(payload.encode('ascii')).digest()
             self.duplicate_payloads += digest == self.last_digest
             self.last_digest = digest
-        if frame and "repeat_after" in frame:
+        if frame and 'delta_base64' in frame:
+            self.delta_sizes.append(len(frame['delta_base64']))
+            self.delta_requests.append(elapsed)
+            return result
+        if frame and 'repeat_after' in frame:
             self.repeats.append(elapsed)
             return result
         self.calls.append((elapsed,
@@ -93,6 +99,8 @@ def measure(peer, seconds):
             'frame_request_ms': ms_summary(duration for duration,size,_ in calls if size),
             'empty_request_ms': ms_summary(duration for duration,size,_ in calls if not size),
             'repeat_request_ms': ms_summary(media.repeats),
+            'delta_request_ms': ms_summary(media.delta_requests),
+            'delta_payload_bytes': sum(media.delta_sizes),
             'full_payload_bytes': sum(sizes),
             'duplicate_full_payloads': media.duplicate_payloads,
             'median_base64_bytes': statistics.median(sizes) if sizes else None,

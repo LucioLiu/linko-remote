@@ -302,7 +302,11 @@ try {
   if(-not $RelayConfig){Start-Sleep -Milliseconds 15}
  }
 } finally {
- if('RemoteDesktop' -as [type]){[RemoteDesktop]::LiveRelease()}
- try{if(Get-Command Close-LocalJobHandle -CommandType Function -ErrorAction SilentlyContinue){Close-LocalJobHandle -Wait}}
- finally{if($Persistent -and ('RemoteDesktop' -as [type])){[void][RemoteDesktop]::KeepAwake($false)};$lock.Dispose()}
+ try{
+  if(Get-Command Stop-LiveDesktopWorker -CommandType Function -ErrorAction SilentlyContinue){Stop-LiveDesktopWorker}
+  elseif('RemoteDesktop' -as [type]){[RemoteDesktop]::LiveRelease()}
+ }finally{
+  try{if(Get-Command Close-LocalJobHandle -CommandType Function -ErrorAction SilentlyContinue){Close-LocalJobHandle -Wait}}
+  finally{if($Persistent -and ('RemoteDesktop' -as [type])){[void][RemoteDesktop]::KeepAwake($false)};$lock.Dispose()}
+ }
 }
