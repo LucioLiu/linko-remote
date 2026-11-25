@@ -19,6 +19,7 @@ class TimedViewerHub(PinnedHub):
     def __init__(self, endpoint, credential):
         super().__init__(endpoint, credential)
         self.calls = []
+        self.repeats = []
         self.last_digest = None
         self.duplicate_payloads = 0
 
@@ -32,6 +33,9 @@ class TimedViewerHub(PinnedHub):
             digest = hashlib.sha256(payload.encode('ascii')).digest()
             self.duplicate_payloads += digest == self.last_digest
             self.last_digest = digest
+        if frame and "repeat_after" in frame:
+            self.repeats.append(elapsed)
+            return result
         self.calls.append((elapsed,
                            len(payload) if payload else 0,
                            result.get('waited_ms')))
@@ -88,6 +92,8 @@ def measure(peer, seconds):
             'frame_interval_ms': ms_summary(b-a for a,b in zip(arrivals, arrivals[1:])),
             'frame_request_ms': ms_summary(duration for duration,size,_ in calls if size),
             'empty_request_ms': ms_summary(duration for duration,size,_ in calls if not size),
+            'repeat_request_ms': ms_summary(media.repeats),
+            'full_payload_bytes': sum(sizes),
             'duplicate_full_payloads': media.duplicate_payloads,
             'median_base64_bytes': statistics.median(sizes) if sizes else None,
             'relay_reported_wait': any(wait is not None for _,_,wait in calls)}

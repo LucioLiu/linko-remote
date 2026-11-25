@@ -33,7 +33,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Keep the command and its receipt queries on one connection. Infrequent
         # UI changes still use short-lived connections.
         if self.path not in ('/v2/poll', '/v2/state', '/v2/result', '/v2/register', '/v2/submit', '/v2/recover',
-                              '/v2/live-view', '/v2/live-input', '/v2/live-exchange', '/v2/live-agent-state', '/v2/live-frame'):
+                              '/v2/live-open', '/v2/live-view', '/v2/live-input', '/v2/live-exchange', '/v2/live-agent-state', '/v2/live-frame'):
             self.close_connection = True
             self.send_header('Connection', 'close')
         self.end_headers()
