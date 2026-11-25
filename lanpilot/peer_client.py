@@ -623,8 +623,9 @@ class DesktopClient:
             value = self.live_input_hub.call(operation, body)
             if operation == 'live-open':
                 self.live_session = value['id']
+                stream_version = value.get('view_stream') if body.get('viewer_transport') == 'stream' else None
                 self.live_view = LiveView(self.live_hub, value['id'], self.stop_event,
-                                          stream_version=value.get('view_stream'))
+                                          stream_version=stream_version)
                 self.live_view.start()
             return value
         if not self.supports_updates and operation.startswith('update-'):

@@ -106,7 +106,7 @@ class LiveStreamTLSTests(unittest.TestCase):
         self.fail('Timed out waiting for live media state')
 
     def open_view(self):
-        session = self.client.api('live-open', {'peer': self.target})
+        session = self.client.api('live-open', {'peer': self.target, 'viewer_transport': 'stream'})
         return session, self.client.live_view
 
     def send(self, identifier, seq, jpeg=b'fixture', repeat_after=None):
@@ -116,6 +116,13 @@ class LiveStreamTLSTests(unittest.TestCase):
         else:
             frame['repeat_after'] = repeat_after
         return self.sender.call('live-frame', {'id': identifier, 'frame': frame})
+
+    def test_default_viewer_uses_confirmed_frame_deltas(self):
+        session = self.client.api('live-open', {'peer': self.target})
+        self.send(session['id'], 1)
+        self.wait_for(lambda: self.client.live_view.snapshot()['frame'] is not None)
+        self.assertIn('/v2/live-view', self.relay.paths)
+        self.assertNotIn('/v2/live-stream', self.relay.paths)
 
     def test_product_stream_coalesces_old_frames_and_reuses_static_jpeg(self):
         self.relay.pause_after = 1
