@@ -218,9 +218,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         continue
                     value['sent_ms'] = int((now - started) * 1000)
                     record = json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode() + b'\n'
-                    # An access unit is indivisible. A large first record gets its own batch.
+                    # Finish with one contiguous access unit when it crosses the
+                    # soft byte limit. A renewal round trip can age it out and
+                    # leave the decoder unable to use the following pictures.
                     if bounded and sent_bytes and sent_bytes + len(record) > AVC_VIEW_BATCH_BYTES:
-                        break
+                        frame = value['frame']
+                        if (len(record) > AVC_VIEW_BATCH_BYTES or not frame or 'avc_base64' not in frame
+                                or after != (True, frame['seq'] - 1)):
+                            break
                     self.stream_chunk(record)
                     if value['frame']:
                         sent_bytes += len(record)

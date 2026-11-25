@@ -417,6 +417,45 @@ class LiveStreamTLSTests(unittest.TestCase):
         _, revoked = self.avc_stream(identifier, connection=connection, after=3, bounded=True)
         self.assertEqual(403, revoked.status)
 
+    def test_bounded_view_delivers_reference_at_byte_limit_before_next_subscription(self):
+        now = self.relay.hub.clock()
+        clock = patch.object(self.relay.hub, 'clock', lambda: now)
+        clock.start()
+        self.addCleanup(clock.stop)
+        identifier = self.open_avc()
+        for seq, unit in ((1, 0), (2, 1)):
+            frame = self.upload_avc(identifier, avc_upload(seq, unit, limit=30_000))
+            self.assertEqual(seq, frame['frame_seq'])
+
+        def sequences(response):
+            with response:
+                updates = [json.loads(line) for line in response if line != b'\n']
+            return [value['frame']['seq'] for value in updates if value['frame']]
+
+        connection, first = self.avc_stream(identifier, bounded=True)
+        delivered = sequences(first)
+        # Emulate the renewal round trip without a real-time sleep. Frame 2
+        # is still in history but has aged out of fresh-frame selection.
+        now += .4
+        self.assertEqual(3, self.upload_avc(identifier, avc_upload(3, 1))['frame_seq'])
+        _, second = self.avc_stream(identifier, connection=connection, after=delivered[-1], bounded=True)
+        renewed = sequences(second)
+        self.assertEqual(([1, 2], [3]), (delivered, renewed))
+
+    def test_bounded_view_defers_a_contiguous_record_larger_than_the_batch_budget(self):
+        identifier = self.open_avc()
+        self.upload_avc(identifier, avc_upload(1, 0, limit=30_000))
+        self.upload_avc(identifier, avc_upload(2, 1, limit=60_000))
+
+        connection, first = self.avc_stream(identifier, bounded=True)
+        with first:
+            self.assertEqual(1, self.read_update(first)['frame']['seq'])
+            self.assertEqual(b'', first.read())
+        _, second = self.avc_stream(identifier, connection=connection, after=1, bounded=True)
+        with second:
+            self.assertEqual(2, self.read_update(second)['frame']['seq'])
+            self.assertEqual(b'', second.read())
+
     def test_avc_preserves_native_bytes_and_resumes_only_on_idr_after_uplink_gap(self):
         identifier = self.open_avc()
         with self.assertRaises(HubRejection):
