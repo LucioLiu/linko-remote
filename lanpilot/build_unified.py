@@ -28,12 +28,13 @@ MACOS_MINIMUM = '14.0'
 CLIENT_FILES = (
     'desktop.py', 'lanpilot/__init__.py', 'lanpilot/peer_client.py',
     'lanpilot/peer_hub.py', 'lanpilot/updater.py', 'lanpilot/version.py',
+    'lanpilot/file_client.py', 'lanpilot/file_transfer.py',
     'lanpilot/live.py', 'lanpilot/live_agent.py', 'lanpilot/live_view.py', 'lanpilot/live_delta.py',
     'windows/Start-Desktop.ps1', 'windows/Desktop.cs',
     'windows/Live-Desktop.ps1',
     'windows/Relay.cs', 'windows/Discovery.cs', 'windows/LocalJob.ps1',
     'windows/LocalJobHost.ps1', 'windows/LedgerReconcile.cs',
-    'ui/index.html', 'ui/style.css', 'ui/app.js',
+    'ui/index.html', 'ui/style.css', 'ui/app.js', 'ui/files.js',
 )
 
 

@@ -42,3 +42,5 @@ SSH 入口使用系统 OpenSSH 和已有配置，保存主机、用户名和端�
 旧 0.7 的 Mac → Windows 后台 MCP、受限文件作业与邀请流程仍保留兼容：[MCP 操作](skill/lanpilot/SKILL.md) · [文件作业](docs/local-jobs.md) · [旧版接入](docs/invitations.md)。统一版的图形会话仅授予取屏与键鼠能力，不授予文件作业权限。
 
 [产品定位](docs/branding.md)。项目与网易 UU 远程没有隶属或集成关系。
+
+统一客户端的配对设备可通过 TLS 中继互传文件，两端使用「文件传输」确认与保存。[文件传输说明](docs/file-transfer.md)

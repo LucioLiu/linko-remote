@@ -20,7 +20,7 @@ function renderDevices() {
  if (!state) return;
  const list = $('devices'), needle = $('device-search').value.trim().toLowerCase();
  const waiting = new Set((state.outgoing || []).filter(item => item.state === 'pending').map(item => item.target));
- const signature=JSON.stringify([state.peers,needle,[...waiting],state.connected,state.pending]);if(renderDevices.signature===signature)return;renderDevices.signature=signature;list.replaceChildren();
+ const signature=JSON.stringify([state.peers,needle,[...waiting],state.connected,state.pending,state.file_version]);if(renderDevices.signature===signature)return;renderDevices.signature=signature;list.replaceChildren();
  const peers = state.peers.filter(peer => (peer.name + peer.id).toLowerCase().includes(needle));
  if (!peers.length) { const empty = textNode('div','','empty'); empty.append(textNode('b','还没有连接过的电脑'),textNode('span','输入对方连接码，开始第一次连接')); list.append(empty); return; }
  for (const peer of peers) {
@@ -42,6 +42,7 @@ function renderDevices() {
   },true);
   connect.disabled=!state.connected || (!awaitingReceipt && (!online || paused || pending || initiatorOnly));
   buttons.append(connect);
+  if (typeof openFiles === 'function') buttons.append(action('传文件', () => openFiles(peer.id)));
   if(peer.can_control || peer.incoming || peer.trusted_incoming) buttons.append(action(peer.trusted_incoming ? '撤销信任并断开' : '断开', async()=>{await api('disconnect',{peer:peer.id}); if(selectedPeer?.id===peer.id) closeRemote(); await refresh();}));
   row.append(icon,meta,status,buttons); list.append(row);
  }
@@ -72,7 +73,7 @@ async function refresh() {
   $('settings-permissions').textContent=controllerOnly?'可发起连接':state.agent_error || (ready?'已就绪':'等待系统权限');
   $('screen-permission').classList.toggle('hidden',controllerOnly); $('input-permission').classList.toggle('hidden',controllerOnly);
   $('screen-permission').disabled=state.permissions.screen; $('input-permission').disabled=state.permissions.input;
-  syncInviteActions(); renderDevices(); renderSSH(); renderUpdates();
+  syncInviteActions(); renderDevices(); renderSSH(); renderUpdates(); if (typeof renderFiles === 'function') renderFiles();
   const approvals=state.connected && state.incoming ? state.approvals : [];
   if(!activeApproval && approvals.length){activeApproval=approvals[0];$('approval-name').textContent=activeApproval.peer.name;$('approval-detail').textContent=platform(activeApproval.peer.platform)+' · '+activeApproval.peer.id;$('approval-permission').textContent=state.supports_long_term_trust
    ? '允许本次连接后，对方可在一小时内操作本机。长期授权可在设备列表撤销。'
@@ -83,7 +84,7 @@ async function refresh() {
   if(selectedPeer && state.pending[selectedPeer.id] && !remotePending){remotePending=state.pending[selectedPeer.id];remotePendingRestored=true;$('remote-state').textContent='上一操作结果未确认，请查询原结果';}
  } catch(e) {note(e.message);} finally {lastStatePoll=false;}
 }
-document.querySelectorAll('.nav').forEach(button=>button.onclick=()=>{document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x===button));document.querySelectorAll('.page').forEach(x=>x.classList.toggle('hidden',x.id!=='page-'+button.dataset.page));$('page-title').textContent=button.dataset.page==='home'?'让远方的电脑，就在手边':button.dataset.page==='ssh'?'连接你的电脑与服务器':'连接与权限，由你决定';});
+document.querySelectorAll('.nav').forEach(button=>button.onclick=()=>{document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x===button));document.querySelectorAll('.page').forEach(x=>x.classList.toggle('hidden',x.id!=='page-'+button.dataset.page));$('page-title').textContent=button.dataset.page==='home'?'让远方的电脑，就在手边':button.dataset.page==='files'?'文件传输':button.dataset.page==='ssh'?'连接你的电脑与服务器':'连接与权限，由你决定';});
 $('refresh').onclick=refresh;$('device-search').oninput=renderDevices;
 $('quit').onclick=async()=>{if(confirm('退出邻控并停止接受连接？')){try{closing=true;await api('shutdown');document.querySelectorAll('button,input').forEach(x=>x.disabled=true);note('邻控已退出，可以关闭这个窗口。',true);}catch(e){closing=false;note(e.message);}}};
 $('incoming').onchange=async()=>{

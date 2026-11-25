@@ -20,12 +20,14 @@ import subprocess
 import sys
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from urllib.parse import parse_qs
 import uuid
 import webbrowser
 
 from desktop import make_request
+from .file_client import ClientFiles
+from .file_transfer import FILE_CHUNK, FILE_CHUNK_BODY, FILE_MAX, FILE_VERSION
 from .live import (AVC_MAX_CAPTURE_AGE_MS, AVC_VIEW_RESPONSE_TIMEOUT, LIVE_AVC_STREAM_RECORD_MAX,
                    LIVE_STREAM_RECORD_MAX, LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE, accepts_avc)
 from .peer_hub import DESKTOP_PLATFORMS, DESKTOP_UNAVAILABLE, READ_ONLY_TIMEOUTS, display_name
@@ -541,6 +543,7 @@ class DesktopClient:
         self.agent_hub = hub_factory(self.config['endpoint'], self.config['credential'])
         self.ui_hub = hub_factory(self.config['endpoint'], self.config['credential'])
         self.command_hub = hub_factory(self.config['endpoint'], self.config['credential'])
+        self.files = ClientFiles(self.home, lambda: hub_factory(self.config['endpoint'], self.config['credential']))
         self.live_hub = hub_factory(self.config['endpoint'], self.config['credential'])
         self.live_input_hub = hub_factory(self.config['endpoint'], self.config['credential'])
         self.agent = agent_factory(self.home, portable=True) if portable else agent_factory(self.home)
@@ -590,7 +593,7 @@ class DesktopClient:
                             return
                         try:
                             registration = {'name': self.config['name'], 'platform': self.platform,
-                                            'live_version': int(self.supports_incoming)}
+                                            'live_version': int(self.supports_incoming), 'file_version': FILE_VERSION}
                             if self.live_agent.avc_enabled:
                                 registration['live_avc'] = 1
                             self.agent_hub.call('register', registration)
@@ -601,7 +604,7 @@ class DesktopClient:
                         # Clear temporary grants before restoring explicitly trusted peers.
                         self.agent_hub.call('availability', {'enabled': False})
                         if self.supports_incoming and self.config.get('resume_trusted_access', True):
-                            peers = self.agent_hub.call('state').get('peers', [])
+                            peers = self.agent_hub.call('state', {'file_version': FILE_VERSION}).get('peers', [])
                             if any(peer.get('trusted_incoming') for peer in peers):
                                 try:
                                     self._start_agent()
@@ -617,7 +620,7 @@ class DesktopClient:
                 if not self._state_is_current(2):
                     started_wall = time.time()
                     started = time.monotonic()
-                    value = self.agent_hub.call('state')
+                    value = self.agent_hub.call('state', {'file_version': FILE_VERSION})
                     with self.lock:
                         self.state = value
                         self.state_seen_at = started
@@ -628,6 +631,7 @@ class DesktopClient:
                 with self.lock:
                     self.connected = False
                     self.error = str(error)[:250]
+            self.files.prune()
             self._refresh_permissions()
             self.stop_event.wait(.15 if waiting_for_worker else 1)
 
@@ -746,6 +750,9 @@ class DesktopClient:
                          portable=self.portable,
                          incoming=self.incoming, pause_pending=self.pause_pending, agent_error=self.agent_error,
                          permissions=self.permissions, ssh=self.config['ssh'], pending=dict(self.pending))
+        value['file_chunk_bytes'] = FILE_CHUNK
+        value['file_max_bytes'] = FILE_MAX
+        value['files'] = self.files.snapshot(value.get('files', []))
         value['updates'] = self.updater.snapshot()
         value['live_error'] = self.live_agent.error
         view = self.live_view
@@ -755,6 +762,10 @@ class DesktopClient:
     def api(self, operation, body):
         if operation == 'state':
             return self.local_state()
+        if operation.startswith('file-'):
+            if self.updating or self.stop_event.is_set():
+                raise ValueError('邻控正在退出或更新')
+            return self.files.api(operation, body, self.state.get('file_version') == FILE_VERSION)
         if operation in ('live-view', 'live-jpeg'):
             view = self.live_view
             if not view or body.get('id') != view.id:
@@ -785,7 +796,7 @@ class DesktopClient:
             if self.stop_event.is_set():
                 raise ValueError('邻控试用版正在退出')
             if operation.startswith(('ssh-', 'update-')):
-                raise ValueError('邻控试用版仅支持远程桌面')
+                raise ValueError('邻控试用版支持远程桌面和文件传输')
         if operation in ('live-open', 'live-input', 'live-close'):
             if self.updating:
                 raise ValueError('正在更新，暂不能连接')
@@ -1008,6 +1019,7 @@ class DesktopClient:
 
     def close(self):
         self.stop_event.set()
+        self.files.close()
         if self.live_view: self.live_view.close()
         self.updater.stop.set()
         with self.operation_lock:
@@ -1044,15 +1056,46 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.valid_host():
             return self.respond(403, b'{}')
+        if self.path.startswith('/file-download/'):
+            return self.file_download()
         if self.path.startswith('/live-feed/'):
             return self.live_feed()
         if self.path.startswith('/live-media/'):
             return self.live_media()
-        files = {'/': ('index.html', 'text/html; charset=utf-8'), '/app.js': ('app.js', 'application/javascript; charset=utf-8'), '/style.css': ('style.css', 'text/css; charset=utf-8')}
+        files = {
+            '/': ('index.html', 'text/html; charset=utf-8'),
+            '/app.js': ('app.js', 'application/javascript; charset=utf-8'),
+            '/files.js': ('files.js', 'application/javascript; charset=utf-8'),
+            '/style.css': ('style.css', 'text/css; charset=utf-8'),
+        }
         if self.path not in files:
             return self.respond(404, b'{}')
         name, mime = files[self.path]
         return self.respond(200, (ASSETS / name).read_bytes(), mime)
+
+    def file_download(self):
+        match = re.fullmatch(r'/file-download/([A-Za-z0-9_-]{43})', self.path)
+        if not match:
+            return self.respond(404, b'{}')
+        try:
+            source, item = self.server.client.files.open_download(match[1])
+        except (ValueError, OSError):
+            return self.respond(404, b'{}')
+        with source:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(item['size']))
+            name = quote(item['name'], safe='')
+            self.send_header('Content-Disposition', "attachment; filename*=UTF-8''" + name)
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self.send_header('Cross-Origin-Resource-Policy', 'same-origin')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.end_headers()
+            try:
+                shutil.copyfileobj(source, self.wfile, length=64 * 1024)
+            except OSError:
+                pass
 
     def live_feed(self):
         parsed = urlsplit(self.path)
@@ -1137,7 +1180,8 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             return self.respond(403, b'{}')
         lengths = self.headers.get_all('Content-Length', [])
-        if len(lengths) != 1 or not lengths[0].isdigit() or not 0 < int(lengths[0]) <= 16000 or self.headers.get('Transfer-Encoding'):
+        maximum = FILE_CHUNK_BODY if self.path == '/api/file-push' else 16000
+        if len(lengths) != 1 or not re.fullmatch('[0-9]{1,8}', lengths[0]) or not 0 < int(lengths[0]) <= maximum or self.headers.get('Transfer-Encoding'):
             self.close_connection = True
             return self.respond(400, b'{}')
         try:
@@ -1166,6 +1210,7 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
 
 def run(home, endpoint, open_browser=False, *, portable=False):
     client = DesktopClient(home, endpoint, portable=True) if portable else DesktopClient(home, endpoint)
+    client.files.clear_stale_parts()
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), LocalHandler)
     server.daemon_threads = True
     server.client = client

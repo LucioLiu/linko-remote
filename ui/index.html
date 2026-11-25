@@ -6,6 +6,7 @@
  <a class="brand" href="#"><span class="brandmark">↔</span><span id="app-name">邻控</span></a>
  <div class="nav-label">工作空间</div>
  <button class="nav active" data-page="home"><span>⌘</span>连接电脑</button>
+ <button class="nav" id="files-nav" data-page="files"><span>⇄</span>文件传输 <small id="files-unread" class="file-badge hidden"></small></button>
  <button class="nav" id="ssh-nav" data-page="ssh"><span>›_</span>SSH 连接</button>
  <button class="nav" data-page="settings"><span>⚙</span>设置与帮助</button>
  <div class="sidebar-bottom"><span class="status-dot" id="service-dot"></span><span id="service-state">正在连接服务</span><small id="version">统一客户端预览</small></div>
@@ -27,6 +28,22 @@
   </div>
   <section class="devices-section"><div class="section-heading"><div><h2>我的电脑</h2><p>连接过的电脑会保存在这里，随时再次发起连接</p></div><input id="device-search" placeholder="搜索名称或设备号" aria-label="搜索电脑"></div><div id="devices" class="device-list"></div></section>
  </section>
+ <section id="page-files" class="page hidden">
+  <article class="card file-send">
+   <h2>发送文件</h2>
+   <p class="muted" id="file-help">对方确认后开始传输。</p>
+   <form id="file-form">
+    <label>接收电脑<select id="file-peer" required></select></label>
+    <label>本机文件<input type="file" id="file-input" required></label>
+    <button class="button primary" id="file-send" disabled>请求发送</button>
+   </form>
+   <p role="status" id="file-feedback" class="hidden"></p>
+  </article>
+  <section class="devices-section">
+   <div class="section-heading"><h2>传输记录</h2></div>
+   <div id="file-list" class="device-list"></div>
+  </section>
+ </section>
  <section id="page-ssh" class="page hidden"><div class="section-heading"><div><h2>SSH 连接</h2><p>使用系统终端连接电脑或服务器，保留正常的主机身份校验。</p></div><button class="button primary" id="add-ssh">添加 SSH</button></div><div id="ssh-list" class="device-list"></div></section>
  <section id="page-settings" class="page hidden"><article class="card settings-card"><h2>连接与权限</h2><p>每台电脑都能发起和接受连接。你可以在设备列表管理已授权的电脑。</p><dl><dt>客户端版本</dt><dd id="settings-version">—</dd><dt>连接服务</dt><dd id="settings-network">—</dd><dt>本机权限</dt><dd id="settings-permissions">—</dd></dl><p class="muted">退出或关闭本机连接权限后，其他电脑不能继续发起新的操作。操作结果不明时，请先查询原结果，避免重复执行。</p><p class="muted">0.7 旧配对保留在原客户端中，不会被此预览版覆盖。统一版需要两端都启动此客户端。</p><div class="update-card"><h2>软件更新</h2><p class="muted">从 GitHub 检查新版。安装会重新启动邻控，电脑名称、配对和 SSH 设置会保留。</p><label class="update-option"><input type="checkbox" id="auto-update-check" checked>自动检查新版本</label><p id="update-state" role="status">正在读取更新状态…</p><progress id="update-progress" class="hidden" max="100" value="0"></progress><div class="row-actions"><button class="button secondary" id="check-updates">检查更新</button><button class="button primary hidden" id="download-update">下载更新</button><button class="button primary hidden" id="install-update">安装并重启</button></div><details id="update-notes-box" class="hidden"><summary>查看更新说明</summary><pre id="update-notes"></pre></details><p class="muted" id="update-last-result"></p></div><button class="button secondary" id="quit">退出邻控并停止接受连接</button></article></section>
 </main>
@@ -34,4 +51,4 @@
 <dialog id="ssh-dialog"><form method="dialog"><h2>添加 SSH 连接</h2><label>名称<input name="name" required maxlength="100" placeholder="例如：示例服务器"></label><label>主机<input name="host" required placeholder="IP、域名或 SSH 配置别名"></label><div class="field-row"><label>用户名<input name="user" placeholder="沿用系统配置"></label><label>端口<input name="port" type="number" min="1" max="65535" value="22"></label></div><div class="dialog-actions"><button value="cancel" formnovalidate class="button secondary">取消</button><button value="save" class="button primary">保存连接</button></div></form></dialog>
 <dialog id="approval-dialog"><h2>有电脑希望连接你</h2><p><strong id="approval-name"></strong></p><p class="muted" id="approval-detail"></p><p id="approval-permission">请核对对方身份。</p><div class="dialog-actions"><button id="deny" class="button secondary">拒绝</button><button id="approve-persistent" class="button secondary hidden">长期授权</button><button id="approve" class="button primary">允许本次连接</button></div></dialog>
 <dialog id="remote-dialog" class="remote-dialog"><div class="remote-header"><div><strong id="remote-name">远程电脑</strong><small id="remote-state">等待画面</small></div><div><button class="button secondary" id="remote-mode">连续桌面</button><button class="button secondary" id="remote-refresh">取新画面</button><button class="button secondary" id="remote-recover">查询原结果</button><button class="icon-button" id="remote-close" aria-label="关闭远程桌面">×</button></div></div><div class="remote-canvas"><img tabindex="0" id="remote-image" alt="远程电脑画面" draggable="false"><canvas tabindex="0" id="remote-video" class="hidden" aria-label="远程电脑画面"></canvas><div id="remote-placeholder">先取得画面，再进行操作</div></div><div class="remote-toolbar"><input id="remote-text" placeholder="输入要发送的文字" maxlength="2000" aria-label="远程输入文字"><button class="button primary" id="send-text">发送文字</button><button class="button secondary key" data-key="ENTER">Enter</button><button class="button secondary key" data-key="TAB">Tab</button><button class="button secondary key" data-key="ESC">Esc</button><button class="button secondary key" data-key="BACKSPACE">退格</button></div><p class="remote-help">连续桌面中，点击画面后可直接使用键鼠、拖拽和滚轮。切回本机或关闭窗口会释放按键。逐步操作保留逐次画面校验。</p></dialog>
-<script src="/app.js"></script></body></html>
+<script src="/app.js"></script><script src="/files.js"></script></body></html>

@@ -15,6 +15,7 @@ import threading
 import time
 from pathlib import Path
 
+from .file_transfer import FILE_CHUNK_BODY, FILE_OPERATIONS
 from .live import (AVC_BATCH_BODY_MAX, AVC_BATCH_FRAMES, AVC_VIEW_BATCH_BYTES,
                    AVC_VIEW_BATCH_SECONDS, LIVE_AVC_STREAM_RECORD_MAX,
                    LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE, accepts_avc, accepts_bounded_view)
@@ -37,7 +38,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # idle connection without sending a close response to its client.
         # Keep the command and its receipt queries on one connection. Infrequent
         # UI changes still use short-lived connections.
-        if self.path not in ('/v2/poll', '/v2/state', '/v2/result', '/v2/register', '/v2/submit', '/v2/recover',
+        if self.path not in ('/v2/file-push', '/v2/file-pull', '/v2/poll', '/v2/state', '/v2/result', '/v2/register', '/v2/submit', '/v2/recover',
                               '/v2/live-open', '/v2/live-view', '/v2/live-input', '/v2/live-exchange', '/v2/live-agent-state', '/v2/live-frame',
                               '/v2/live-avc-batch'):
             self.close_connection = True
@@ -51,7 +52,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                       'live-open', 'live-close', 'live-view', 'live-input', 'live-exchange', 'live-agent-state', 'live-frame',
                       'live-stream', 'live-avc-batch', 'live-avc-upload'}
         operation = self.path[4:] if self.path.startswith('/v2/') else ''
-        if operation not in operations:
+        if operation not in operations | FILE_OPERATIONS:
             self.close_connection = True
             return self.answer(404, {'ok': False, 'error': 'Not found'})
         authorization = self.headers.get_all('Authorization', [])
@@ -60,7 +61,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.answer(401, {'ok': False, 'error': '身份验证失败'})
         if operation == 'live-avc-upload':
             return self.upload_avc(authorization[0][7:])
-        maximum = {'result': 24_000_000, 'live-exchange': 1_500_000,
+        maximum = {'file-push': FILE_CHUNK_BODY, 'result': 24_000_000, 'live-exchange': 1_500_000,
                    'live-frame': LIVE_AVC_STREAM_RECORD_MAX, 'live-avc-batch': AVC_BATCH_BODY_MAX}.get(operation, 16000)
         lengths = self.headers.get_all('Content-Length', [])
         if len(lengths) != 1 or not re.fullmatch('[0-9]{1,8}', lengths[0]) or not 1 <= int(lengths[0]) <= maximum or self.headers.get('Transfer-Encoding'):
@@ -266,6 +267,10 @@ class PeerGateway(http.server.ThreadingHTTPServer):
         self.stream_capacity = threading.BoundedSemaphore(24)
         self.upload_capacity = threading.BoundedSemaphore(12)
         super().__init__((bind, port), Handler)
+
+    def service_actions(self):
+        with self.hub.lock:
+            self.hub.files.prune(self.hub.clock())
 
     def process_request(self, request, address):
         if not self.capacity.acquire(blocking=False):

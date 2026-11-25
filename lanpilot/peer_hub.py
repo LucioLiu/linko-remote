@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 
 from desktop import make_request
+from .file_transfer import FILE_OPERATIONS, FILE_VERSION, RelayFiles
 from .live import LIVE_WAIT_MS, LiveSessions
 from .live_delta import encode_delta
 
@@ -69,6 +70,7 @@ class PeerHub:
         CREATE TABLE IF NOT EXISTS migrated_receipts (id TEXT PRIMARY KEY, hash TEXT);
         ''')
         self.live = LiveSessions(self)
+        self.files = RelayFiles()
 
     def close(self):
         self.db.close()
@@ -129,6 +131,15 @@ class PeerHub:
         with self.lock:
             # Failed guesses count too. Commit rate accounting before opening
             # the operation transaction, which may legitimately roll back.
+            if operation in FILE_OPERATIONS:
+                now = self.clock()
+                self.files.prune(now)
+                me = self._device(credential)['id']
+                if operation == 'file-offer':
+                    self._rate(me, operation, 20)
+                    return self.files.offer(me, body, now, lambda peer: self._one(
+                        'SELECT 1 FROM contacts WHERE a=? AND b=?', tuple(sorted((me, peer)))))
+                return self.files.dispatch(operation, me, body, now)
             if operation == 'register':
                 self._rate(source, operation, 20)
             elif operation in ('connect', 'access'):
@@ -196,6 +207,7 @@ class PeerHub:
                 self.db.execute('INSERT OR IGNORE INTO live_avc_capabilities VALUES(?)', (identifier,))
             else:
                 self.db.execute('DELETE FROM live_avc_capabilities WHERE id=?', (identifier,))
+            self.files.advertise(identifier, body.get('file_version'), now)
             return {'id': identifier, 'name': name, 'platform': platform}
         device = self._device(credential)
         me = device['id']
@@ -276,6 +288,8 @@ class PeerHub:
                             (me, peer, peer, me))
             return {'disconnected': True}
         if operation == 'state':
+            self.files.prune(now)
+            self.files.advertise(me, body.get('file_version'), now)
             peers = self.db.execute('SELECT d.* FROM devices d JOIN contacts c ON '
                                    '(c.a=? AND c.b=d.id) OR (c.b=? AND c.a=d.id)', (me, me)).fetchall()
             result = []
@@ -283,6 +297,7 @@ class PeerHub:
                 item = self._identity(peer)
                 cap = self._one('SELECT live FROM capabilities WHERE id=?', (peer['id'],))
                 item['live'] = bool(cap and cap['live'])
+                item['file_transfer'] = self.files.supports(peer['id'], now)
                 item.update(online=now - peer['seen'] < 20,
                             accepting_connections=bool(peer['incoming']),
                             trusted_incoming=bool(self._one('SELECT 1 FROM grants WHERE caller=? AND target=? AND expires IS NULL',
@@ -297,6 +312,7 @@ class PeerHub:
             outgoing = self.db.execute('SELECT id,state,target FROM approvals WHERE caller=? AND expires>?', (me, now)).fetchall()
             return {'self': self._identity(device), 'incoming': bool(device['incoming']), 'peers': result,
                     'supports_long_term_trust': True,
+                    'file_version': FILE_VERSION, 'files': self.files.snapshot(me),
                     'approvals': [self._approval(row) for row in approvals],
                     'outgoing': [dict(row) for row in outgoing]}
         if operation == 'poll':

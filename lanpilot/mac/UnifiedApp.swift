@@ -2,11 +2,17 @@ import Cocoa
 import UniformTypeIdentifiers
 import WebKit
 
-final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, WKScriptMessageHandlerWithReply {
+final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, WKScriptMessageHandlerWithReply, WKDownloadDelegate {
  var window: NSWindow!
  var view: WKWebView!
  var process: Process?
  var authority: String?
+ private struct SaveDestination {
+  let temporary: URL
+  let final: URL
+  let replace: Bool
+ }
+ private var fileDownloads: [ObjectIdentifier: SaveDestination] = [:]
  func applicationDidFinishLaunching(_ notification: Notification) {
   NSApp.setActivationPolicy(.regular)
   window=NSWindow(contentRect:NSRect(x:0,y:0,width:1220,height:860),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
@@ -71,15 +77,82 @@ final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, W
   guard isLocalMainFrame(frame) else {completionHandler(nil);return}
   let panel=NSOpenPanel()
   panel.canChooseDirectories=false
-  if let type=UTType(filenameExtension:"linko"){panel.allowedContentTypes=[type]}
+  panel.allowsMultipleSelection=parameters.allowsMultipleSelection
   panel.beginSheetModal(for:window){result in completionHandler(result == .OK ? panel.urls : nil)}
  }
  func webView(_ webView:WKWebView,decidePolicyFor navigationAction:WKNavigationAction,decisionHandler:@escaping(WKNavigationActionPolicy)->Void){
-  guard let url=navigationAction.request.url,url.scheme=="http",url.host=="127.0.0.1",url.host!+":"+String(url.port ?? 80)==authority else{decisionHandler(.cancel);return};decisionHandler(.allow)
+  guard let url=navigationAction.request.url,url.scheme=="http",url.host=="127.0.0.1",url.host!+":"+String(url.port ?? 80)==authority else{decisionHandler(.cancel);return}
+  decisionHandler(navigationAction.shouldPerformDownload && isFileDownload(url) ? .download : .allow)
+ }
+ private func isFileDownload(_ url: URL?) -> Bool {
+  guard let url, url.scheme == "http", url.host == "127.0.0.1",
+        let port = url.port, "127.0.0.1:\(port)" == authority,
+        url.query == nil else { return false }
+  return url.path.range(of: #"^/file-download/[A-Za-z0-9_-]{43}$"#, options: .regularExpression) != nil
+ }
+ func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+  guard isFileDownload(response.response.url), let http = response.response as? HTTPURLResponse else {
+   decisionHandler(.allow)
+   return
+  }
+  decisionHandler(http.statusCode == 200 ? .download : .cancel)
+ }
+ func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+  download.delegate = self
+ }
+ func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+  download.delegate = self
+ }
+ func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String,
+               completionHandler: @escaping (URL?) -> Void) {
+  guard isFileDownload(response.url), (response as? HTTPURLResponse)?.statusCode == 200 else {
+   completionHandler(nil)
+   showSaveError()
+   return
+  }
+  let panel = NSSavePanel()
+  panel.nameFieldStringValue = (suggestedFilename as NSString).lastPathComponent
+  panel.canCreateDirectories = true
+  panel.beginSheetModal(for: window) { result in
+   guard result == .OK, let destination = panel.url else { completionHandler(nil); return }
+   let temporary = destination.deletingLastPathComponent().appendingPathComponent(".linko-\(UUID().uuidString).part")
+   self.fileDownloads[ObjectIdentifier(download)] = SaveDestination(
+    temporary: temporary, final: destination, replace: FileManager.default.fileExists(atPath: destination.path))
+   completionHandler(temporary)
+  }
+ }
+ func downloadDidFinish(_ download: WKDownload) {
+  guard let saved = fileDownloads.removeValue(forKey: ObjectIdentifier(download)) else { return }
+  let files = FileManager.default
+  do {
+   if saved.replace {
+    _ = try files.replaceItemAt(saved.final, withItemAt: saved.temporary)
+   } else {
+    try files.moveItem(at: saved.temporary, to: saved.final)
+   }
+  } catch {
+   try? files.removeItem(at: saved.temporary)
+   showSaveError()
+  }
+ }
+ func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+  if let saved = fileDownloads.removeValue(forKey: ObjectIdentifier(download)) {
+   try? FileManager.default.removeItem(at: saved.temporary)
+   showSaveError()
+  }
+ }
+ private func showSaveError() {
+  let alert = NSAlert()
+  alert.messageText = "文件保存失败"
+  alert.informativeText = "请回到文件传输记录重新选择保存位置。"
+  alert.beginSheetModal(for: window)
  }
  @objc func about(){let alert=NSAlert();alert.messageText="邻控";let version=Bundle.main.object(forInfoDictionaryKey:"LinkoReleaseVersion") as? String ?? "预览版";alert.informativeText=version+"\n每台电脑，都能彼此连接。";alert.runModal()}
  @objc func quit(){NSApp.terminate(nil)}
- func applicationWillTerminate(_ notification:Notification){if let process=process,process.isRunning{process.terminate()}}
+ func applicationWillTerminate(_ notification: Notification) {
+  for saved in fileDownloads.values { try? FileManager.default.removeItem(at: saved.temporary) }
+  if let process, process.isRunning { process.terminate() }
+ }
  func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool{window.makeKeyAndOrderFront(nil);return true}
  func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool{return true}
 }
