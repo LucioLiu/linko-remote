@@ -1,6 +1,30 @@
 import Cocoa
 import UniformTypeIdentifiers
 
+func jobReceiptMessage(_ receipt:[String:Any], id:String) -> (title:String, detail:String) {
+ let retry = "可用同一作业编号再次查询。"
+ if receipt["state"] as? String == "unconfirmed" {return ("查询未确认",retry)}
+ guard receipt["ok"] as? Bool == true else {
+  return ("查询失败",receipt["error"] as? String ?? retry)
+ }
+ guard let result = receipt["result"] as? [String:Any], result["job_id"] as? String == id else {
+  return ("作业回执不匹配",retry)
+ }
+ switch result["job_state"] as? String {
+ case "started","starting":return ("正在启动",retry)
+ case "running":return ("正在对账",retry)
+ case "failed":return ("对账失败",result["error"] as? String ?? "未收到详细原因。")
+ case "unconfirmed":return ("执行结果未确认","尚未取得完成回执。"+retry)
+ case "succeeded":
+  guard let artifact=result["artifact"] as? [String:Any],let path=artifact["local_path"] as? String else{
+   return ("对账完成，差异文件待取回",retry)
+  }
+  let count=(result["report"] as? [String:Any])?["discrepancy_count"] as? Int
+  return ("差异文件已取回",(count.map{"差异 "+String($0)+" 项。\n"} ?? "")+path)
+ default:return ("作业状态未知",retry)
+ }
+}
+
 final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
  var window:NSWindow!;var status:NSStatusItem!;var timer:Timer?;var busy=false
  var table=NSTableView();var search=NSSearchField();var summary=NSTextField(labelWithString:"")
@@ -45,6 +69,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
   button("编辑电脑名称",#selector(renameDevice),NSRect(x:22,y:74,width:142,height:32),v)
   button("打开所选电脑",#selector(openSelected),NSRect(x:174,y:74,width:144,height:32),v)
   button("复制给 AI 的指令",#selector(copyPrompt),NSRect(x:328,y:74,width:165,height:32),v)
+  button("查询后台作业…",#selector(queryJob),NSRect(x:500,y:74,width:136,height:32),v)
   button("导出 Windows 客户端",#selector(exportClient),NSRect(x:643,y:74,width:215,height:32),v)
   summary=label("正在读取设备…",12,false,NSRect(x:30,y:29,width:822,height:28),v);summary.textColor = .secondaryLabelColor
   return v
@@ -101,6 +126,37 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
  }
  @objc func copyCode(){guard !currentCode.isEmpty,expires>Date().timeIntervalSince1970 else{return};copy(clipboardCode)}
  func copy(_ text:String){NSPasteboard.general.clearContents();NSPasteboard.general.setString(text,forType:.string)}
+ @objc func queryJob(){
+  guard table.selectedRow >= 0, rows[table.selectedRow]["ssh"] == nil,
+        let device = rows[table.selectedRow]["id"] as? String else {
+   notice("先选择一台 Windows 电脑","请选择执行对账的已配对设备。");return
+  }
+  let name = rows[table.selectedRow]["name"] as? String ?? device
+  let dialog = NSAlert()
+  dialog.messageText = "查询后台作业"
+  dialog.informativeText = "输入「"+name+"」启动回执里的 job_id。作业完成后会取回差异 CSV。"
+  let field = NSTextField(frame:NSRect(x:0,y:0,width:320,height:26))
+  field.stringValue = UserDefaults.standard.string(forKey:"lastJobID."+device) ?? ""
+  dialog.accessoryView=field;dialog.window.initialFirstResponder=field
+  dialog.addButton(withTitle:"查询");dialog.addButton(withTitle:"取消")
+  guard dialog.runModal() == .alertFirstButtonReturn else{return}
+  let id = field.stringValue.trimmingCharacters(in:.whitespacesAndNewlines)
+  guard id.count == 32, id.range(of:"^[a-f0-9]{32}$",options:.regularExpression) != nil else{
+   notice("编号无效","请从启动回执复制 32 位 job_id。");return
+  }
+  UserDefaults.standard.set(id,forKey:"lastJobID."+device)
+  run(["job-result",device,id]){reply in
+   switch reply {
+   case .failure(let error):self.notice(name+" · 查询失败",error.localizedDescription)
+   case .success(let bytes):
+    guard let receipt=(try? JSONSerialization.jsonObject(with:bytes)) as? [String:Any] else{
+     self.notice(name+" · 查询未确认","回执无法读取。请使用原作业编号再查。");return
+    }
+    let message=jobReceiptMessage(receipt,id:id)
+    self.notice(name+" · "+message.title,message.detail)
+   }
+  }
+ }
  @objc func exportClient(){
   let panel=NSSavePanel();panel.nameFieldStringValue="邻控-Windows-验证码接入.zip";guard panel.runModal() == .OK,let path=panel.url else{return}
   run(["windows-client",path.path,"--controller",localName]){r in switch r{case .success:self.notice("Windows 客户端已导出","这份客户端可以重复使用，不含验证码或私钥。Windows 解压后双击「打开邻控.cmd」，输入本面板的验证码即可接入。请通过自己的可信下载渠道提供此包。")
