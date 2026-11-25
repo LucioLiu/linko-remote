@@ -24,7 +24,7 @@ import uuid
 import webbrowser
 
 from desktop import make_request
-from .live import LIVE_STREAM_RECORD_MAX, LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE
+from .live import LIVE_AVC_STREAM_RECORD_MAX, LIVE_STREAM_RECORD_MAX, LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE
 from .peer_hub import DESKTOP_PLATFORMS, DESKTOP_UNAVAILABLE, READ_ONLY_TIMEOUTS, display_name
 from .version import VERSION
 from .updater import UpdateManager
@@ -123,16 +123,21 @@ class PinnedConnection(http.client.HTTPSConnection):
 class HubRejection(PermissionError):
     """The relay confirmed it rejected an operation before accepting it."""
 
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
 
 class RelayIdentityError(PermissionError):
     """No request may be sent when the relay certificate changes."""
 
 
 class LiveStream:
-    def __init__(self, host, port, pin, credential, identifier):
+    def __init__(self, host, port, pin, credential, identifier, *, accept_avc=False):
         self.connection = PinnedConnection(host, port, pin)
         self.credential = credential
         self.identifier = identifier
+        self.accept_avc = accept_avc
 
     def abort(self):
         sock = self.connection.sock
@@ -146,12 +151,16 @@ class LiveStream:
         """Return False when the viewer should switch to legacy polling."""
         headers = {'Authorization': 'Bearer ' + self.credential, 'Content-Type': 'application/json'}
         after = None
+        limit = LIVE_AVC_STREAM_RECORD_MAX if self.accept_avc else LIVE_STREAM_RECORD_MAX
         try:
             self.connection.connect()
             self.connection.sock.settimeout(LIVE_STREAM_SECONDS + 2)
             self.connection.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             while active():
-                payload = json.dumps({'id': self.identifier, 'after': after}, separators=(',', ':')).encode()
+                request = {'id': self.identifier, 'after': after}
+                if self.accept_avc:
+                    request['accept_avc'] = 1
+                payload = json.dumps(request, separators=(',', ':')).encode()
                 started = time.monotonic()
                 self.connection.request('POST', '/v2/live-stream', payload, headers)
                 with self.connection.getresponse() as response:
@@ -163,12 +172,12 @@ class LiveStream:
                     if not response.chunked or response.getheader('Content-Type') != LIVE_STREAM_TYPE:
                         raise ValueError('连续画面连接响应无效')
                     while active():
-                        raw = response.readline(LIVE_STREAM_RECORD_MAX + 1)
+                        raw = response.readline(limit + 1)
                         if not raw:
                             break
                         if raw == b'\n':
                             continue
-                        if len(raw) > LIVE_STREAM_RECORD_MAX or not raw.endswith(b'\n'):
+                        if len(raw) > limit or not raw.endswith(b'\n'):
                             raise ValueError('连续画面消息无效')
                         value = json.loads(raw)
                         if not isinstance(value, dict) or value.get('id') != self.identifier:
@@ -179,6 +188,13 @@ class LiveStream:
                         frame = value['frame']
                         if frame and ('delta_after' in frame or 'delta_base64' in frame):
                             raise ValueError('连续画面格式无效')
+                        if frame and 'avc_base64' in frame and not self.accept_avc:
+                            raise ValueError('连续画面格式无效')
+                        if frame and 'avc_base64' in frame and (
+                            not isinstance(frame['avc_base64'], str) or type(frame.get('idr')) is not bool
+                            or type(frame.get('seq')) is not int or not isinstance(frame.get('geometry'), str)
+                        ):
+                            raise ValueError('无效的 H.264 画面')
                         # Both clocks measure elapsed time within this batch.
                         # Include the request flight time and any downstream
                         # queueing when applying the existing frame age limit.
@@ -196,6 +212,10 @@ class LiveStream:
             raise
         except (OSError, http.client.HTTPException):
             return False
+        except (ValueError, KeyError, TypeError):
+            if self.accept_avc:
+                return False
+            raise
         finally:
             self.connection.close()
 
@@ -213,19 +233,24 @@ class PinnedHub:
         self.connection = None
         self.last_response = 0
 
-    def live_stream(self, identifier):
-        return LiveStream(self.host, self.port, self.pin, self.credential, identifier)
+    def live_stream(self, identifier, *, accept_avc=False):
+        return LiveStream(self.host, self.port, self.pin, self.credential, identifier,
+                          accept_avc=accept_avc)
 
     def call(self, operation, body=None):
         # Read-only recovery may use a fresh connection after a relay closes an
         # idle TLS socket. Never retry a command submission or any input.
+        # An AVC retry would reuse a stale capture age and can hide a lost
+        # acknowledgement. Let the live sender recover with a new IDR.
+        frame = body.get('frame') if operation == 'live-frame' and body else None
+        avc_upload = isinstance(frame, dict) and 'avc_base64' in frame
         for attempt in range(3):
             try:
                 return self._call(operation, body)
             except (HubRejection, RelayIdentityError):
                 raise
             except (OSError, http.client.HTTPException):
-                if operation not in ('state', 'recover', 'live-view', 'live-agent-state', 'live-exchange', 'live-frame') or attempt == 2:
+                if avc_upload or operation not in ('state', 'recover', 'live-view', 'live-agent-state', 'live-exchange', 'live-frame') or attempt == 2:
                     raise
 
     def _call(self, operation, body=None):
@@ -249,7 +274,7 @@ class PinnedHub:
                     raise ValueError('连接服务响应过大')
                 answer = json.loads(raw)
                 if response.status in (400, 401, 403) and answer.get('ok') is False:
-                    raise HubRejection(answer.get('error', '连接请求未完成'))
+                    raise HubRejection(answer.get('error', '连接请求未完成'), response.status)
                 if response.status != 200 or not answer.get('ok'):
                     raise PermissionError(answer.get('error', '连接请求未完成'))
                 self.last_response = time.monotonic()
@@ -406,6 +431,10 @@ class DesktopClient:
         self.updater = UpdateManager(self.home, lambda: self.supports_updates and self.config.get('auto_update_check', True),
                                      system=self.platform)
         self.live_agent = LiveAgent(self, hub_factory, atomic_json)
+        self.live_agent.avc_enabled = (
+            self.platform == 'windows' and self.supports_incoming and
+            (ROOT / 'windows/video/lanpilot-avc.exe').is_file()
+        )
         self.live_session = None
         self.live_view = None
 
@@ -426,8 +455,11 @@ class DesktopClient:
                         if self.stop_event.is_set():
                             return
                         try:
-                            self.agent_hub.call('register', {'name': self.config['name'], 'platform': self.platform,
-                                                             'live_version': int(self.supports_incoming)})
+                            registration = {'name': self.config['name'], 'platform': self.platform,
+                                            'live_version': int(self.supports_incoming)}
+                            if self.live_agent.avc_enabled:
+                                registration['live_avc'] = 1
+                            self.agent_hub.call('register', registration)
                         except HubRejection as error:
                             if self.platform == 'linux':
                                 raise ValueError('Linux 电脑注册失败，请检查连接服务是否支持 Linux：' + str(error)) from error
@@ -588,10 +620,16 @@ class DesktopClient:
     def api(self, operation, body):
         if operation == 'state':
             return self.local_state()
-        if operation == 'live-view':
-            if not self.live_view or body.get('id') != self.live_view.id:
+        if operation in ('live-view', 'live-jpeg'):
+            view = self.live_view
+            if not view or body.get('id') != view.id:
                 raise ValueError('连续桌面会话已结束')
-            return self.live_view.snapshot()
+            if operation == 'live-jpeg':
+                if not view.media_feed:
+                    raise ValueError('当前会话已使用 JPEG')
+                view.request_jpeg()
+                return {'accepted': True}
+            return view.snapshot()
         if operation in ('remote', 'recover'):
             # Keep submission and recovery ordered, but a slow receipt must
             # not hold the lock or transport used to pause incoming control.
@@ -623,9 +661,11 @@ class DesktopClient:
             value = self.live_input_hub.call(operation, body)
             if operation == 'live-open':
                 self.live_session = value['id']
-                stream_version = value.get('view_stream') if body.get('viewer_transport') == 'stream' else None
+                avc = type(body.get('accept_avc')) is int and body['accept_avc'] == 1 and value.get('live_avc') == 1
+                stream_version = 1 if avc else (
+                    value.get('view_stream') if body.get('viewer_transport') == 'stream' else None)
                 self.live_view = LiveView(self.live_hub, value['id'], self.stop_event,
-                                          stream_version=stream_version)
+                                          stream_version=stream_version, avc=avc)
                 self.live_view.start()
             return value
         if not self.supports_updates and operation.startswith('update-'):
@@ -858,6 +898,8 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
             return self.respond(403, b'{}')
         if self.path.startswith('/live-feed/'):
             return self.live_feed()
+        if self.path.startswith('/live-media/'):
+            return self.live_media()
         files = {'/': ('index.html', 'text/html; charset=utf-8'), '/app.js': ('app.js', 'application/javascript; charset=utf-8'), '/style.css': ('style.css', 'text/css; charset=utf-8')}
         if self.path not in files:
             return self.respond(404, b'{}')
@@ -888,7 +930,7 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
             while not view.stop.is_set() and not self.server.client.stop_event.is_set():
                 with view.changed:
                     frame = view.value.get('frame')
-                    if not frame or frame['seq'] == sequence:
+                    if not frame or 'jpeg_base64' not in frame or frame['seq'] == sequence:
                         view.changed.wait(.5)
                         continue
                     sequence = frame['seq']
@@ -900,6 +942,47 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
         except (OSError, ValueError):
             pass
+
+    def live_media(self):
+        identifier = self.path.removeprefix('/live-media/')
+        view = getattr(self.server.client, 'live_view', None)
+        if (not view or not view.media_feed or view.id != identifier
+                or not hmac.compare_digest(self.headers.get('X-Linko-Session', ''), self.server.nonce)
+                or self.headers.get('Origin') not in (None, 'http://' + self.server.authority)):
+            return self.respond(403, b'{}')
+        if not view.media_reader.acquire(blocking=False):
+            return self.respond(409, b'{}')
+        try:
+            self.close_connection = True
+            self.connection.settimeout(1)
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            started = time.monotonic()
+            self.send_response(200)
+            self.send_header('Content-Type', LIVE_STREAM_TYPE)
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            after = 0
+            while view.active():
+                with view.changed:
+                    record = view.next_media(after)
+                    if record is None:
+                        view.changed.wait(.25)
+                        record = view.next_media(after)
+                now = time.monotonic()
+                if record is None:
+                    line = b'\n'
+                else:
+                    after, frame, captured, _ = record
+                    line = json.dumps({'frame': frame, 'sent_ms': round((now-started)*1000),
+                                       'frame_age_ms': round((now-captured)*1000)},
+                                      separators=(',', ':')).encode() + b'\n'
+                self.wfile.write(line)
+        except OSError:
+            pass
+        finally:
+            view.media_reader.release()
 
     def do_POST(self):
         if not self.valid_host() or self.headers.get('Origin') not in (None, 'http://' + self.server.authority) or not hmac.compare_digest(self.headers.get('X-Linko-Session', ''), self.server.nonce):

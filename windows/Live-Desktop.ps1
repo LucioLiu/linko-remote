@@ -4,6 +4,14 @@ $script:liveId='';$script:liveSeq=0;$script:liveAck=0;$script:liveDeadline=0
 $script:liveEnded=New-Object 'System.Collections.Generic.HashSet[string]'
 $script:liveTimer=[Diagnostics.Stopwatch]::StartNew()
 $script:liveControlPath=Join-Path $root 'live-control.json'
+$script:liveAvcPath=Join-Path $PSScriptRoot 'video/lanpilot-avc.exe'
+$script:liveAvc=$null
+$script:liveAvcDisabled=$false
+$script:liveAvcKey=0
+$script:liveAvcDeadline=0
+$script:liveAvcNativeDeadline=0
+$script:liveAvcStarted=$false
+$script:liveAvcTimer=[Diagnostics.Stopwatch]::new()
 
 function Write-LiveJson($Name,$Value){
  $path=Join-Path $root $Name
@@ -28,7 +36,82 @@ function Get-LiveControl {
  return $control
 }
 
+function Stop-LiveAvc {
+ if($script:liveAvc){
+  $script:liveAvc.Dispose()
+  $script:liveAvc=$null
+ }
+ $script:liveAvcDeadline=0
+}
+
+function Invoke-LiveAvc($Control,[string]$Geometry){
+ if($Control.live_avc -ne 1 -or $script:liveAvcDisabled){
+  Stop-LiveAvc
+  return $false
+ }
+ try{
+  if(-not $script:liveAvc){
+   if(-not (Test-Path -LiteralPath $script:liveAvcPath -PathType Leaf)){
+    $script:liveAvcDisabled=$true
+    return $false
+   }
+   if(-not ('LiveAvc' -as [type])){
+    Add-Type -Path (Join-Path $PSScriptRoot 'video/LiveAvc.cs')
+   }
+  }
+
+  # Sample the native clock first so conversion cannot extend the wall-clock lease.
+  $tick=[LiveAvc]::GetTickCount64()
+  $deadline=Get-CurrentLiveDeadline -Avc
+  if($deadline -eq 0){Stop-LiveAvc;return $false}
+  $remaining=[Math]::Min(4000,$deadline-[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+  if($remaining -le 0){Suspend-LiveSession;return $true}
+  if($deadline -ne $script:liveAvcDeadline){
+   $script:liveAvcDeadline=$deadline
+   $script:liveAvcNativeDeadline=[uint64]($tick+$remaining)
+  }
+  if(-not $script:liveAvc){
+   $script:liveAvc=[LiveAvc]::Start($script:liveAvcPath,$script:liveAvcNativeDeadline)
+   $script:liveAvcTimer.Restart()
+  }
+  $script:liveAvc.Maintain($script:liveAvcNativeDeadline,($Control.avc_key -gt $script:liveAvcKey))
+  $script:liveAvcKey=$Control.avc_key
+  $frame=$script:liveAvc.TakeFrame()
+  if($frame -and ($script:liveAvcStarted -or $frame.Idr)){
+   $frameGeometry=@($frame.X,$frame.Y,$frame.Width,$frame.Height) -join ','
+   if($frameGeometry -ne $Geometry){throw 'AVC desktop bounds changed'}
+   $now=[LiveAvc]::GetTickCount64()
+   if($frame.CaptureTick -le $now -and $now-$frame.CaptureTick -lt 1000){
+    $base64=[Convert]::ToBase64String($frame.Bytes)
+    $publicationDeadline=Get-CurrentLiveDeadline -Avc
+    if($publicationDeadline -eq 0){Stop-LiveAvc;return $false}
+    if([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge $publicationDeadline){
+     Suspend-LiveSession
+     return $true
+    }
+    try{
+     Write-LiveJson 'live-frame.json' @{id=$script:liveId;seq=$frame.Sequence;capture_tick=$frame.CaptureTick;idr=$frame.Idr;avc_base64=$base64}
+    }catch [IO.IOException]{
+     # A concurrent mailbox reader can briefly prevent replacement on Windows.
+     # Let the next iteration publish a fresh record or time out to JPEG.
+     if($script:liveAvcTimer.ElapsedMilliseconds -lt 2000){return $true}
+     throw
+    }
+    $script:liveAvcStarted=$true
+    $script:liveAvcTimer.Restart()
+   }
+  }
+  if($script:liveAvcTimer.ElapsedMilliseconds -ge 2000){throw 'AVC capture timed out'}
+  return $true
+ }catch{
+  Stop-LiveAvc
+  $script:liveAvcDisabled=$true
+  return $false
+ }
+}
+
 function Stop-LiveSession([string]$Reason,[string]$Id=$script:liveId){
+ Stop-LiveAvc
  [RemoteDesktop]::LiveDeadlineUnixMs=0
  [RemoteDesktop]::LiveRelease()
  $script:liveId=''
@@ -59,6 +142,11 @@ function Test-LivePendingInput {
 }
 
 function Suspend-LiveSession {
+ if($script:liveAvc){
+  Stop-LiveAvc
+  # The helper's frame sequence restarts at one. Resume this session with JPEG.
+  $script:liveAvcDisabled=$true
+ }
  if([RemoteDesktop]::LiveHasHeldInput){
   Stop-LiveSession '连续桌面租约已过期，按键已释放'
   return
@@ -69,12 +157,13 @@ function Suspend-LiveSession {
  if(Test-LivePendingInput){Stop-LiveSession '连续桌面租约已过期，键鼠回执未确认'}
 }
 
-function Get-CurrentLiveDeadline {
+function Get-CurrentLiveDeadline([switch]$Avc) {
  if(Test-WorkerStop){throw '连续桌面工作进程已停止'}
  $control=Get-LiveControl
  if(-not $control -or $control.id -ne $script:liveId -or $control.expires -eq 0){
   throw '连续桌面授权已结束'
  }
+ if($Avc -and $control.live_avc -ne 1){return 0}
  # A renewal never lengthens an operation already using a previous lease.
  return [Math]::Min($script:liveDeadline,[long][Math]::Floor($control.expires*1000))
 }
@@ -114,6 +203,7 @@ function Invoke-LiveDesktop {
   $now=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   if(-not $script:liveId){
    $script:liveId=$control.id;$script:liveSeq=0;$script:liveAck=0
+   $script:liveAvcDisabled=$false;$script:liveAvcStarted=$false;$script:liveAvcKey=0
   }elseif($script:liveDeadline -eq 0){
    if($now -ge $deadline){return}
    # Recheck after a fresh lease arrives to catch input posted during the gap.
@@ -158,6 +248,10 @@ function Invoke-LiveDesktop {
    Write-LiveJson 'live-receipt.json' @{id=$script:liveId;seq=[int]$batch.seq}
    $script:liveAck=[int]$batch.seq
    Remove-Item -LiteralPath $claimed
+  }
+  if($script:liveAvc -or ($control.live_avc -eq 1 -and -not $script:liveAvcDisabled)){
+   if(-not (Test-LiveCaptureLease)){return}
+   if(Invoke-LiveAvc $control $geometry){return}
   }
   if((Test-LiveCaptureLease) -and $script:liveTimer.ElapsedMilliseconds -ge 120){
    # Pace from capture start. Discard any frame completed after lease loss.

@@ -252,12 +252,18 @@ $('install-update').onclick=async()=>{
 // No input HTTP request is retried. A missing acknowledgement pauses control.
 let live=null,liveOpening=false;
 const liveImage=$('remote-image');
+const liveVideo=$('remote-video');
 let liveClosing=null;
+const liveFrameLimit=1500;
 function stopLive(){
  const prior=live;live=null;
  if(prior){
   clearTimeout(prior.timer);clearTimeout(prior.inputTimer);
+  prior.mediaAbort?.abort();
+  closeLiveDecoder(prior);
   liveImage.removeAttribute('src');remoteFrame=null;
+  liveVideo.classList.add('hidden');
+  liveVideo.width=liveVideo.height=1;
   $('remote-placeholder').classList.remove('hidden');
   liveClosing=api('live-close',{id:prior.id}).finally(()=>{liveClosing=null;});
  }
@@ -267,12 +273,168 @@ function stopLive(){
 async function startLive(){
  if(!selectedPeer || liveOpening || remoteBusy || liveClosing)return;if(remotePending){$('remote-state').textContent='请先查询上一操作结果';return;}
  liveOpening=true;const peer=selectedPeer;
- try{const value=await api('live-open',{peer:peer.id});if(selectedPeer!==peer){await api('live-close',{id:value.id});return;}
+ const acceptAvc=Boolean(window.webkit?.messageHandlers?.linkoUpdate &&
+   window.VideoDecoder && window.EncodedVideoChunk && window.createImageBitmap);
+ try{const value=await api('live-open',{peer:peer.id,...(acceptAvc?{viewer_transport:'stream',accept_avc:1}:{})});if(selectedPeer!==peer){await api('live-close',{id:value.id});return;}
   remoteFrame=null;
-  liveImage.src='/live-feed/'+value.id+'?session='+encodeURIComponent(nonce);
-  live={id:value.id,seq:0,ack:0,queue:[],sending:false,frame:null,arrivals:[],frameAt:0,halt:false};
+  const canvas=acceptAvc && value.live_avc===1;
+  live={id:value.id,seq:0,ack:0,queue:[],sending:false,frame:null,frameAt:0,halt:false,
+   canvas,mediaAt:performance.now(),pendingFrames:new Map()};
+  if(canvas){
+   liveImage.removeAttribute('src');
+   live.mediaAbort=new AbortController();
+   watchLiveMedia(live);
+  }else liveImage.src='/live-feed/'+value.id+'?session='+encodeURIComponent(nonce);
   $('remote-mode').textContent='逐步操作';$('remote-refresh').textContent='重新连接';$('remote-recover').hidden=true;$('remote-state').textContent='正在建立连续画面…';pollLive(live);pumpLive(live);
  }catch(e){$('remote-state').textContent=e.message;}finally{liveOpening=false;}
+}
+function closeLiveDecoder(session){
+ const decoder=session.decoder;
+ session.decoder=null;session.pendingFrames.clear();session.avcSequence=null;
+ if(decoder && decoder.state!=='closed')decoder.close();
+}
+function presentLiveFrame(session, frame, capturedAt){
+ if(session.frame && (session.frame.geometry!==frame.geometry || session.frame.codec!==frame.codec))
+  session.queue=[];
+ session.frame=frame;
+ session.frameAt=capturedAt;
+ $('remote-placeholder').classList.add('hidden');
+}
+function drawLiveMedia(session, pixels, frame, capturedAt, width, height){
+ if(live!==session || performance.now()-capturedAt>=liveFrameLimit)return;
+ if(liveVideo.width!==width || liveVideo.height!==height){
+  liveVideo.width=width;liveVideo.height=height;
+ }
+ session.canvasContext ||= liveVideo.getContext('2d',{alpha:false});
+ session.canvasContext.drawImage(pixels,0,0,width,height);
+ liveVideo.classList.remove('hidden');
+ session.mediaAt=performance.now();
+ presentLiveFrame(session,frame,capturedAt);
+}
+async function requestLiveJpeg(session){
+ if(live!==session || session.jpeg)return;
+ session.jpeg=true;
+ closeLiveDecoder(session);
+ session.frame=null;session.frameAt=0;session.queue=[];
+ if(!session.halt)$('remote-state').textContent='正在切换到 JPEG 画面，键鼠已暂停';
+ await api('live-jpeg',{id:session.id});
+}
+function failLiveMedia(session, error){
+ if(live!==session)return;
+ session.halt=true;session.queue=[];
+ $('remote-state').textContent='画面连接中断，已停止键鼠：'+error.message;
+ stopLive().catch(showLiveCloseError);
+}
+function liveBytes(encoded){
+ if(Uint8Array.fromBase64)return Uint8Array.fromBase64(encoded);
+ const binary=atob(encoded), bytes=new Uint8Array(binary.length);
+ for(let i=0;i<bytes.length;i++)bytes[i]=binary.charCodeAt(i);
+ return bytes;
+}
+function avcUnit(frame){
+ const bytes=liveBytes(frame.avc_base64);
+ const header=new DataView(bytes.buffer);
+ if(bytes.length<=48 || bytes.length>48+2*1024*1024 || header.getUint32(0)!==0x4c504131 ||
+    header.getUint32(4,true)!==bytes.length-48 || !Number.isSafeInteger(frame.seq) ||
+    frame.seq<=0 || header.getBigUint64(8,true)!==BigInt(frame.seq) ||
+    typeof frame.idr!=='boolean' || header.getUint32(28,true)!==Number(frame.idr))
+  throw new Error('无效的 H.264 帧头');
+ const width=header.getUint16(24,true),height=header.getUint16(26,true);
+ const dimensions=[header.getInt32(32,true),header.getInt32(36,true),
+  header.getUint32(40,true),header.getUint32(44,true)];
+ if(width<2 || height<2 || width>1920 || height>1080 || width%2 || height%2 ||
+    width>dimensions[2] || height>dimensions[3] || dimensions.join(',')!==frame.geometry)
+  throw new Error('无效的 H.264 画面尺寸');
+ return {data:bytes.subarray(48),width,height};
+}
+function avcCodec(data){
+ for(let i=2;i+4<data.length;i++){
+  if(data[i-2]===0 && data[i-1]===0 && data[i]===1 && (data[i+1]&31)===7)
+   return 'avc1.'+Array.from(data.subarray(i+2,i+5),byte=>byte.toString(16).padStart(2,'0')).join('');
+ }
+ throw new Error('H.264 关键帧缺少 SPS');
+}
+function decodeLiveAvc(session, frame, capturedAt){
+ const {data,width,height}=avcUnit(frame);
+ const format=`${frame.geometry}:${width}x${height}`;
+ if(session.decoder && (frame.seq!==session.avcSequence+1 || format!==session.avcFormat ||
+    session.pendingFrames.size>=8)){
+  closeLiveDecoder(session);
+  session.frame=null;session.queue=[];
+ }
+ if(!session.decoder){
+  if(!frame.idr)return;
+  const decoder=new VideoDecoder({
+   output(pixels){
+    try{
+     if(session.decoder!==decoder)return;
+     const record=session.pendingFrames.get(pixels.timestamp);
+     session.pendingFrames.delete(pixels.timestamp);
+     if(record && pixels.displayWidth===record.width && pixels.displayHeight===record.height)
+      drawLiveMedia(session,pixels,record.frame,record.capturedAt,record.width,record.height);
+    }catch(e){requestLiveJpeg(session).catch(error=>failLiveMedia(session,error));}
+    finally{pixels.close();}
+   },
+   error(){
+    if(session.decoder===decoder)requestLiveJpeg(session).catch(error=>failLiveMedia(session,error));
+   },
+  });
+  session.decoder=decoder;session.avcFormat=format;
+  decoder.configure({codec:avcCodec(data),optimizeForLatency:true});
+ }
+ session.avcSequence=frame.seq;
+ session.pendingFrames.set(frame.seq,{frame:{seq:frame.seq,geometry:frame.geometry,codec:'H.264'},
+  capturedAt,width,height});
+ session.decoder.decode(new EncodedVideoChunk({type:frame.idr?'key':'delta',timestamp:frame.seq,data}));
+}
+async function receiveLiveMedia(session){
+ const started=performance.now();
+ const response=await fetch('/live-media/'+session.id,{
+  headers:{'X-Linko-Session':nonce},signal:session.mediaAbort.signal,
+ });
+ if(!response.ok || !response.body)throw new Error('无法读取本地画面');
+ const reader=response.body.getReader(), decoder=new TextDecoder();
+ let buffered='';
+ try{
+  while(live===session){
+   const {value,done}=await reader.read();
+   if(done)break;
+   buffered+=decoder.decode(value,{stream:true});
+   let end;
+   while(live===session && (end=buffered.indexOf('\n'))!==-1){
+    if(end>2_800_000)throw new Error('画面消息过大');
+    const line=buffered.slice(0,end);
+    buffered=buffered.slice(end+1);
+    if(!line)continue;
+    const {frame,frame_age_ms,sent_ms}=JSON.parse(line);
+    const now=performance.now(), capturedAt=now-frame_age_ms-Math.max(0,now-started-sent_ms);
+    if(!Number.isFinite(capturedAt) || now-capturedAt>=liveFrameLimit)continue;
+    if(frame.avc_base64){
+     if(!session.jpeg){
+      try{decodeLiveAvc(session,frame,capturedAt);}
+      catch(e){await requestLiveJpeg(session);}
+     }
+    }else{
+     session.jpeg=true;
+     if(session.decoder){
+      closeLiveDecoder(session);
+      session.frame=null;session.queue=[];
+     }
+     const bytes=liveBytes(frame.jpeg_base64);
+     const bitmap=await createImageBitmap(new Blob([bytes],{type:'image/jpeg'}));
+     try{drawLiveMedia(session,bitmap,{seq:frame.seq,geometry:frame.geometry,codec:'JPEG'},
+      capturedAt,bitmap.width,bitmap.height);}
+     finally{bitmap.close();}
+    }
+   }
+   if(buffered.length>2_800_000)throw new Error('画面消息过大');
+  }
+ }finally{await reader.cancel().catch(()=>{});}
+ if(live===session)throw new Error('本地画面已结束');
+}
+async function watchLiveMedia(session){
+ try{await receiveLiveMedia(session);}
+ catch(e){failLiveMedia(session,e);}
 }
 async function restartLive(){
  const peer=selectedPeer;
@@ -301,23 +463,31 @@ async function pollLive(session){
    await stopLive().catch(showLiveCloseError);
    return;
   }
-  const frame=value.frame;
-  if(frame && (!session.frame || frame.seq!==session.frame.seq)){
-   const now=performance.now();session.arrivals=session.arrivals.filter(t=>now-t<2000);session.arrivals.push(now);session.frame=frame;session.frameAt=now-value.frame_age_ms;
-   $('remote-placeholder').classList.add('hidden');
-   if(!session.halt)$('remote-state').textContent='连续桌面 · '+Number(value.fps || 0).toFixed(1)+' 帧/秒 · 点击画面使用键鼠';
-  }else if(performance.now()-session.frameAt>2000 && !session.halt){$('remote-state').textContent='正在等待新画面，键鼠已暂停';}
+  const now=performance.now(), frame=value.frame;
+  if(session.canvas){
+   if(!session.jpeg && now-session.mediaAt>4000)await requestLiveJpeg(session);
+  }else if(frame && (!session.frame || frame.seq!==session.frame.seq)){
+   presentLiveFrame(session,frame,now-value.frame_age_ms);
+  }
+  if(!session.halt){
+   if(session.frame && now-session.frameAt<liveFrameLimit){
+    const codec=session.frame.codec?' · '+session.frame.codec:'';
+    $('remote-state').textContent='连续桌面'+codec+' · '+Number(value.fps || 0).toFixed(1)+' 帧/秒 · 点击画面使用键鼠';
+   }else if(now-session.mediaAt>liveFrameLimit){
+    $('remote-state').textContent='正在等待新画面，键鼠已暂停';
+   }
+  }
  }catch(e){if(live===session){session.halt=true;session.queue=[];$('remote-state').textContent='连接中断，已停止键鼠：'+e.message;stopLive().catch(showLiveCloseError);}}
  if(live===session)session.timer=setTimeout(()=>pollLive(session),80);
 }
 function queueLive(event){
- const s=live;if(!s || s.halt || !s.frame || performance.now()-s.frameAt>1500)return;
+ const s=live;if(!s || s.halt || !s.frame || performance.now()-s.frameAt>=liveFrameLimit)return;
  if(s.queue.length>=128){s.halt=true;s.queue=[];$('remote-state').textContent='网络拥堵，已停止输入，请重新连接画面';stopLive();return;}
  if(event.type==='move' && s.queue.at(-1)?.type==='move')s.queue[s.queue.length-1]=event;else s.queue.push(event);
 }
 async function pumpLive(session){
  if(live!==session)return;
- if(!session.halt && session.frame && performance.now()-session.frameAt>1500)session.queue=[];
+ if(!session.frame || performance.now()-session.frameAt>=liveFrameLimit)session.queue=[];
  if(!session.halt && session.queue.length && session.seq-session.ack<6 && !session.sending){
   session.sending=true;const events=session.queue.splice(0,64),seq=++session.seq;
   try{await api('live-input',{id:session.id,seq,geometry:session.frame.geometry,events});}
@@ -326,20 +496,21 @@ async function pumpLive(session){
  }
  if(live===session)session.inputTimer=setTimeout(()=>pumpLive(session),30);
 }
-function livePoint(e){const r=liveImage.getBoundingClientRect();return {x:Math.max(0,Math.min(65535,Math.round((e.clientX-r.left)/r.width*65535))),y:Math.max(0,Math.min(65535,Math.round((e.clientY-r.top)/r.height*65535)))};}
-liveImage.addEventListener('pointermove',e=>{if(live)queueLive({type:'move',...livePoint(e)});});
-liveImage.addEventListener('pointerdown',e=>{if(!live)return;e.preventDefault();liveImage.focus();liveImage.setPointerCapture(e.pointerId);queueLive({type:'down',button:e.button,...livePoint(e)});});
-liveImage.addEventListener('pointerup',e=>{if(!live)return;e.preventDefault();queueLive({type:'up',button:e.button,...livePoint(e)});if(liveImage.hasPointerCapture(e.pointerId))liveImage.releasePointerCapture(e.pointerId);});
-liveImage.addEventListener('pointercancel',()=>queueLive({type:'release'}));
-liveImage.addEventListener('contextmenu',e=>{if(live)e.preventDefault();});
-liveImage.addEventListener('wheel',e=>{if(live){e.preventDefault();queueLive({type:'wheel',amount:e.deltaY>0?-1:1});}},{passive:false});
+function livePoint(e){const r=e.currentTarget.getBoundingClientRect();return {x:Math.max(0,Math.min(65535,Math.round((e.clientX-r.left)/r.width*65535))),y:Math.max(0,Math.min(65535,Math.round((e.clientY-r.top)/r.height*65535)))};}
 const liveCodes=new Set(["KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ", "Digit0", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "Enter", "Tab", "Escape", "Backspace", "Delete", "Space", "ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown", "Home", "End", "PageUp", "PageDown", "ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight", "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash", "Semicolon", "Quote", "Comma", "Period", "Slash", "Backquote"]);
-for(const type of ['keydown','keyup'])liveImage.addEventListener(type,e=>{if(!live || e.isComposing || !liveCodes.has(e.code))return;e.preventDefault();queueLive({type,code:e.code});});
-liveImage.addEventListener('compositionend',e=>{if(live && e.data)queueLive({type:'text',text:e.data.slice(0,500)});});
-function releaseLiveInput(){const s=live;if(!s)return;if(s.halt)return;if(s.frame && performance.now()-s.frameAt<=1500)queueLive({type:'release'});else api('live-close',{id:s.id}).catch(()=>{});}
-liveImage.addEventListener('blur',releaseLiveInput);
+function releaseLiveInput(){const s=live;if(!s)return;if(s.halt)return;if(s.frame && performance.now()-s.frameAt<liveFrameLimit)queueLive({type:'release'});else api('live-close',{id:s.id}).catch(()=>{});}
+for(const surface of [liveImage,liveVideo]){
+ surface.addEventListener('pointermove',e=>{if(live)queueLive({type:'move',...livePoint(e)});});
+ surface.addEventListener('pointerdown',e=>{if(!live)return;e.preventDefault();surface.focus();surface.setPointerCapture(e.pointerId);queueLive({type:'down',button:e.button,...livePoint(e)});});
+ surface.addEventListener('pointerup',e=>{if(!live)return;e.preventDefault();queueLive({type:'up',button:e.button,...livePoint(e)});if(surface.hasPointerCapture(e.pointerId))surface.releasePointerCapture(e.pointerId);});
+ surface.addEventListener('pointercancel',()=>queueLive({type:'release'}));
+ surface.addEventListener('contextmenu',e=>{if(live)e.preventDefault();});
+ surface.addEventListener('wheel',e=>{if(live){e.preventDefault();queueLive({type:'wheel',amount:e.deltaY>0?-1:1});}},{passive:false});
+ for(const type of ['keydown','keyup'])surface.addEventListener(type,e=>{if(!live || e.isComposing || !liveCodes.has(e.code))return;e.preventDefault();queueLive({type,code:e.code});});
+ surface.addEventListener('compositionend',e=>{if(live && e.data)queueLive({type:'text',text:e.data.slice(0,500)});});
+ surface.addEventListener('blur',releaseLiveInput);
+ surface.addEventListener('paste',e=>{if(live){e.preventDefault();const text=e.clipboardData?.getData('text/plain') || '';if(text.length>500){$('remote-state').textContent='每次最多粘贴 500 字，请分段发送';return;}if(text)queueLive({type:'text',text});}});
+}
 window.addEventListener('blur',releaseLiveInput);
 document.addEventListener('visibilitychange',()=>{if(document.hidden && live)releaseLiveInput();});
 $('remote-dialog').addEventListener('cancel',()=>closeRemote());
-
-liveImage.addEventListener('paste',e=>{if(live){e.preventDefault();const text=e.clipboardData?.getData('text/plain') || '';if(text.length>500){$('remote-state').textContent='每次最多粘贴 500 字，请分段发送';return;}if(text)queueLive({type:'text',text});}});

@@ -36,6 +36,39 @@ public static class RemoteDesktop {
   return new byte[]{1,2,3};
  }
 }
+
+// Native process substitute for the worker lifecycle checks below.
+public sealed class LiveAvc : IDisposable {
+ public sealed class Frame {
+  public ulong Sequence = 1, CaptureTick = 1000;
+  public int X, Y, Width = 800, Height = 600;
+  public bool Idr = true;
+  public byte[] Bytes = new byte[]{76,80,65,49};
+ }
+ public static int Launches, Stops, Keys;
+ public static ulong Deadline;
+ public static bool Fail;
+ public static Frame Next;
+ public static Action BeforeTake;
+ public static ulong GetTickCount64() {return 1000;}
+ public static LiveAvc Start(string path, ulong deadline) {
+  Launches++;
+  Deadline = deadline;
+  return new LiveAvc();
+ }
+ public void Maintain(ulong deadline, bool requestKey) {
+  Deadline = deadline;
+  if(requestKey)Keys++;
+  if(Fail)throw new Exception("fixture encoder failure");
+ }
+ public Frame TakeFrame() {
+  if(BeforeTake!=null)BeforeTake();
+  var frame=Next;
+  Next=null;
+  return frame;
+ }
+ public void Dispose() {Stops++;}
+}
 '@
 
 $source=Join-Path $PSScriptRoot '../windows/Live-Desktop.ps1'
@@ -45,8 +78,10 @@ $script:workerStop=$false
 function Test-WorkerStop {return $script:workerStop}
 function Assert($Condition,[string]$Message){if(-not $Condition){throw $Message}}
 function Now-Live {return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()/1000.0}
-function Write-Control($Expires){
- Write-LiveJson 'live-control.json' @{id=$id;expires=$Expires}
+function Write-Control($Expires,[switch]$Avc,[int]$Key=0){
+ $control=@{id=$id;expires=$Expires}
+ if($Avc){$control.live_avc=1;$control.avc_key=$Key}
+ Write-LiveJson 'live-control.json' $control
 }
 function Write-Batch([int]$Seq,$Events,[double]$Expires=((Now-Live)+1.5)){
  $prefix='{0}-{1:D10}' -f $id,$Seq
@@ -77,7 +112,10 @@ function Run-Case([string]$Name,[scriptblock]$Body){
  [RemoteDesktop]::DuringCapture=$null
  [RemoteDesktop]::Captures=[RemoteDesktop]::Sends=[RemoteDesktop]::Checks=0
  [RemoteDesktop]::LiveRelease()
+ [LiveAvc]::Launches=[LiveAvc]::Stops=[LiveAvc]::Keys=0
+ [LiveAvc]::Fail=$false;[LiveAvc]::Next=$null;[LiveAvc]::BeforeTake=$null
  . $source
+ $script:liveAvcPath=Join-Path $root 'fixture.exe'
  & $Body
  Write-Output "PASS $Name"
 }
@@ -196,6 +234,58 @@ try{
    Assert-Ended
    Assert ([RemoteDesktop]::Sends -eq 1 -and $script:liveAck -eq 0) 'Partial batch was continued or acknowledged'
   }
+ }
+ Run-Case 'AVC negotiation without a built helper uses JPEG' {
+  Write-Control ((Now-Live)+2.5) -Avc
+  Invoke-Tick
+  Assert ([LiveAvc]::Launches -eq 0 -and $script:liveSeq -eq 1) 'Missing helper prevented JPEG'
+ }
+ Run-Case 'AVC capture, renewal, IDR command and revoke use the active worker lease' {
+  [IO.File]::WriteAllText($script:liveAvcPath,'')
+  Write-Control ((Now-Live)+1) -Avc
+  [LiveAvc]::Next=[LiveAvc+Frame]::new()
+  Invoke-Tick
+  $frame=Get-Content -LiteralPath (Join-Path $root 'live-frame.json') -Raw|ConvertFrom-Json
+  $first=[LiveAvc]::Deadline
+  Assert ($frame.id -eq $id -and $frame.seq -eq 1 -and $frame.idr -and $frame.avc_base64 -eq 'TFBBMQ==') 'Missing complete AVC frame'
+  Assert ($first -gt 1000 -and $first -le 2000 -and [RemoteDesktop]::Captures -eq 0) 'Initial native lease or exclusive capture incorrect'
+  Write-Control ((Now-Live)+2.5) -Avc -Key 1
+  Invoke-LiveDesktop
+  Invoke-LiveDesktop
+  Assert ([LiveAvc]::Keys -eq 1 -and [LiveAvc]::Deadline -gt $first -and [LiveAvc]::Deadline -le 3500) 'Renewal or IDR command incorrect'
+  Write-Control 0
+  Invoke-LiveDesktop
+  Assert ([LiveAvc]::Stops -eq 1 -and -not $script:liveId) 'Revoke did not stop native capture'
+ }
+ Run-Case 'AVC failure falls back to JPEG for the rest of the session' {
+  [IO.File]::WriteAllText($script:liveAvcPath,'')
+  Write-Control ((Now-Live)+2.5) -Avc
+  [LiveAvc]::Fail=$true
+  Invoke-Tick
+  Invoke-Tick
+  Assert ([LiveAvc]::Launches -eq 1 -and [LiveAvc]::Stops -eq 1 -and $script:liveSeq -eq 2) 'Failed helper restarted or blocked JPEG'
+ }
+ Run-Case 'missing first AVC reference frame times out to JPEG' {
+  [IO.File]::WriteAllText($script:liveAvcPath,'')
+  Write-Control ((Now-Live)+2.5) -Avc
+  [LiveAvc]::Next=[LiveAvc+Frame]::new()
+  [LiveAvc]::Next.Idr=$false
+  Invoke-Tick
+  Assert (-not (Test-Path (Join-Path $root 'live-frame.json'))) 'Dependent frame published before an IDR'
+  $script:liveAvcTimer=[pscustomobject]@{ElapsedMilliseconds=2000}
+  Invoke-Tick
+  Assert ([LiveAvc]::Stops -eq 1 -and $script:liveSeq -eq 1) 'First-frame timeout did not fall back'
+ }
+ Run-Case 'AVC frame completing after lease expiration is discarded' {
+  [IO.File]::WriteAllText($script:liveAvcPath,'')
+  Write-Control ((Now-Live)+2.5) -Avc
+  [LiveAvc]::Next=[LiveAvc+Frame]::new()
+  [LiveAvc]::BeforeTake=[Action]{Write-Control ((Now-Live)-0.1) -Avc}
+  Invoke-Tick
+  Assert ([LiveAvc]::Stops -eq 1 -and -not (Test-Path (Join-Path $root 'live-frame.json'))) 'Expired AVC frame escaped'
+  Write-Control ((Now-Live)+2.5) -Avc
+  Invoke-Tick
+  Assert ([LiveAvc]::Launches -eq 1 -and $script:liveSeq -eq 1) 'Renewal after expiration should resume in JPEG'
  }
  Run-Case 'capture completing after expiry is discarded' {
   [RemoteDesktop]::DuringCapture=[Action]{Write-Control ((Now-Live)-0.1)}

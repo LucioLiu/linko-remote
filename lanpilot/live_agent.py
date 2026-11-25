@@ -10,6 +10,14 @@ from .live import LIVE_WAIT_MS
 
 FIRST_FRAME_TIMEOUT = 15
 FRAME_GAP_TIMEOUT = 8
+AVC_FALLBACK_TIMEOUT = 4
+
+
+def windows_tick_ms():
+    import ctypes
+    tick = ctypes.windll.kernel32.GetTickCount64
+    tick.restype = ctypes.c_uint64
+    return tick()
 
 
 class LiveAgent:
@@ -21,9 +29,24 @@ class LiveAgent:
         self.current=None;self.known=set();self.last_frame=0
         self.upload_base = None
         self.repeat_uploads = sys.platform == 'win32'
+        self.avc_enabled = False
+        self.reset_avc()
         self.error=''
         self.media_at=0
         self.lock=threading.RLock()
+
+    def reset_avc(self):
+        self.avc_active = False
+        self.avc_seen = 0
+        self.avc_seq = 0
+        self.avc_key = 0
+        self.avc_waiting_key = False
+        self.avc_lease = 0
+
+    def request_avc_key(self):
+        if not self.avc_waiting_key:
+            self.avc_waiting_key = True
+            self.avc_key += 1
 
     def expire(self):
         with self.lock:
@@ -31,6 +54,7 @@ class LiveAgent:
                 self.write(self.root/'live-control.json',{'id':self.current,'expires':0})
             self.current=None;self.known.clear();self.last_frame=0
             self.upload_base = None
+            self.reset_avc()
 
     def read(self,name):
         try: return json.loads((self.root/name).read_text(encoding='utf-8-sig'))
@@ -49,12 +73,17 @@ class LiveAgent:
             try:
                 if ident:
                     frame=self.read('live-frame.json')
-                    if frame.get('id')==ident and frame.get('seq',0)>self.last_frame and time.time()-frame.get('created',0)<1:
-                        started = time.monotonic()
-                        self.upload_frame(ident, frame)
-                        # Include upload time in the send interval. Slow links
-                        # still send only the newest frame, with one in flight.
-                        delay = max(.01, delay - (time.monotonic()-started))
+                    if self.avc_active:
+                        delay = .02
+                    started = time.monotonic()
+                    if frame.get('id') == ident:
+                        if 'avc_base64' in frame:
+                            self.upload_avc(ident, frame)
+                        elif frame.get('seq', 0) > self.last_frame and time.time() - frame.get('created', 0) < 1:
+                            self.upload_frame(ident, frame)
+                    # Include upload time in the send interval. Slow links
+                    # still send only the newest frame, with one in flight.
+                    delay = max(.01, delay - (time.monotonic() - started))
             except PermissionError as error:
                 self.end(ident,error)
             except (OSError, http.client.HTTPException):
@@ -65,10 +94,64 @@ class LiveAgent:
                 self.end(ident,error)
             self.client.stop_event.wait(delay)
 
+    def upload_avc(self, ident, frame):
+        with self.lock:
+            if (self.current != ident or not self.avc_active or not self.client.incoming or
+                    self.client.stop_event.is_set() or time.monotonic() >= self.avc_lease):
+                return
+            seq = frame['seq']
+            if seq <= self.avc_seen:
+                return
+            self.avc_seen = seq
+            age = windows_tick_ms() - frame['capture_tick']
+            if not 0 <= age < 1000:
+                self.request_avc_key()
+                return
+            if frame['idr']:
+                self.avc_waiting_key = False
+            elif self.avc_waiting_key or not self.avc_seq or seq != self.avc_seq + 1:
+                self.request_avc_key()
+                return
+
+        payload = {'avc_base64': frame['avc_base64'], 'capture_age_ms': age}
+        try:
+            value = self.frame_hub.call('live-frame', {'id': ident, 'frame': payload})
+        except PermissionError as error:
+            if getattr(error, 'status', None) != 400:
+                raise
+            with self.lock:
+                if self.current == ident:
+                    self.avc_active = False
+            return
+        except (OSError, http.client.HTTPException):
+            with self.lock:
+                if self.current == ident and self.avc_active:
+                    self.request_avc_key()
+            return
+
+        with self.lock:
+            if self.current != ident:
+                return
+            if not value['active']:
+                raise RuntimeError('连续画面已停止')
+            if not self.avc_active:
+                return
+            # A relay that confirms the downgrade may still have acknowledged
+            # the last AVC frame before the viewer changed transport.
+            if value.get('frame_seq') == seq:
+                self.avc_seq = seq
+                self.media_at = time.monotonic()
+            if value.get('live_avc', 1) != 1:
+                self.avc_active = False
+            elif value.get('need_idr') or value.get('frame_seq') != seq:
+                self.request_avc_key()
+
     def upload_frame(self, ident, frame):
         with self.lock:
             if self.current != ident:
                 return
+            # The worker has switched codecs for the rest of this session.
+            self.avc_active = False
             base = self.upload_base
             # A lost response leaves the relay's current base uncertain.
             self.upload_base = None
@@ -132,9 +215,12 @@ class LiveAgent:
                     starting = self.current!=ident
                     if starting:
                         self.expire();self.media_at=time.monotonic();self.current=ident
-                    frame_timeout = FRAME_GAP_TIMEOUT if self.last_frame else FIRST_FRAME_TIMEOUT
-                    timed_out = time.monotonic()-self.media_at>frame_timeout
-                    reason = 'frame_gap' if self.last_frame else 'first_frame_timeout'
+                    if self.avc_active and time.monotonic() - self.media_at > AVC_FALLBACK_TIMEOUT:
+                        self.avc_active = False
+                    has_frame = self.last_frame or self.avc_seq
+                    frame_timeout = FRAME_GAP_TIMEOUT if has_frame else FIRST_FRAME_TIMEOUT
+                    timed_out = time.monotonic() - self.media_at > frame_timeout
+                    reason = 'frame_gap' if has_frame else 'first_frame_timeout'
                 if timed_out:
                     self.end(ident,'画面传输超时，已释放键鼠，请重新连接',reason)
                     continue
@@ -152,7 +238,15 @@ class LiveAgent:
                 with self.lock:
                     if self.current!=ident or not self.client.incoming or self.client.stop_event.is_set():continue
                     if not value['active']: raise RuntimeError('远程输入已停止')
-                    self.write(self.root/'live-control.json',{'id':ident,'expires':time.time()+min(2.5,value['lease_ms']/1000)})
+                    lease = min(2.5, value['lease_ms'] / 1000)
+                    if starting:
+                        self.avc_active = self.avc_enabled and sessions[0].get('live_avc') == 1
+                    self.avc_active = self.avc_active and value.get('live_avc') == 1
+                    control = {'id': ident, 'expires': time.time() + lease}
+                    if self.avc_active:
+                        self.avc_lease = time.monotonic() + lease
+                        control.update(live_avc=1, avc_key=self.avc_key)
+                    self.write(self.root/'live-control.json', control)
                     for batch in value['inputs']:
                         transit = max(0, time.monotonic() - started - relay_wait)
                         self.accept(ident, batch, transit)

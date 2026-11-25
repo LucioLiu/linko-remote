@@ -8,7 +8,7 @@ import zipfile
 
 from unittest.mock import patch
 
-from lanpilot.build_unified import mac, windows, copy_code, CLIENT_FILES, ROOT
+from lanpilot.build_unified import mac, windows, copy_code, CLIENT_FILES, ROOT, WINDOWS_AVC
 
 
 class UnifiedBuildTests(unittest.TestCase):
@@ -48,6 +48,27 @@ class UnifiedBuildTests(unittest.TestCase):
             (output / 'client.json').write_text('{"credential":"must-not-ship"}')
             with self.assertRaisesRegex(ValueError, 'Unexpected files'):
                 copy_code(output, {'url': 'https://example.test', 'pin': 'a' * 64})
+
+    def test_optional_windows_avc_helper_is_packaged_and_hashed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / 'python.zip'
+            with zipfile.ZipFile(runtime, 'w') as archive:
+                archive.writestr('python315._pth', 'python315.zip')
+            output = root / 'package'
+            helper = root / 'prebuilt-x64.exe'
+            helper.write_bytes(b'fixture executable')
+            checksum = hashlib.sha256(runtime.read_bytes()).hexdigest()
+            endpoint = {'url': 'https://example.test', 'pin': 'a' * 64}
+            windows(output, endpoint, runtime, checksum, helper)
+            name = 'code/' + WINDOWS_AVC
+            manifest = json.loads((output / 'checksums.json').read_text())
+            self.assertEqual(helper.read_bytes(), (output / name).read_bytes())
+            self.assertEqual(hashlib.sha256(helper.read_bytes()).hexdigest(), manifest[name])
+            self.assertIn('code/windows/video/LiveAvc.cs', manifest)
+            windows(output, endpoint, runtime, checksum)
+            self.assertFalse((output / name).exists())
+            self.assertNotIn(name, json.loads((output / 'checksums.json').read_text()))
 
     def test_repeated_build_has_a_verifiable_manifest_without_self_reference(self):
         with tempfile.TemporaryDirectory() as temporary:

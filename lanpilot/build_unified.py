@@ -19,6 +19,7 @@ import zipfile
 from .version import VERSION, TAG
 
 ROOT=Path(__file__).resolve().parents[1]
+WINDOWS_AVC = 'windows/video/lanpilot-avc.exe'
 MACOS_MINIMUM = '14.0'
 
 
@@ -36,17 +37,20 @@ CLIENT_FILES = (
 )
 
 
-def copy_code(destination, endpoint, files=CLIENT_FILES):
+def copy_code(destination, endpoint, files=CLIENT_FILES, extra_files=None):
     destination.mkdir(parents=True, exist_ok=True)
-    allowed = set(files) | {'peer-endpoint.json', 'release.json', 'native/LinkoDesktop'}
+    extra_files = extra_files or {}
+    allowed = set(files) | set(extra_files) | {'peer-endpoint.json', 'release.json', 'native/LinkoDesktop'}
     unexpected = [p.relative_to(destination).as_posix() for p in destination.rglob('*')
                   if p.is_file() and p.relative_to(destination).as_posix() not in allowed]
     if unexpected:
         raise ValueError('Unexpected files in release code directory: ' + ', '.join(unexpected))
-    for name in files:
+    sources = {name: ROOT / name for name in files}
+    sources.update(extra_files)
+    for name, source in sources.items():
         target = destination / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ROOT / name, target)
+        shutil.copy2(source, target)
     (destination / 'peer-endpoint.json').write_text(json.dumps(endpoint))
     (destination / 'release.json').write_text(json.dumps({'version': VERSION, 'tag': TAG}))
 
@@ -73,11 +77,16 @@ def mac(output, endpoint, engine):
     subprocess.run(['codesign','--force','--deep','--sign','-',str(output)],check=True)
 
 
-def windows(output, endpoint, runtime, expected):
+def windows(output, endpoint, runtime, expected, avc_helper=None):
     if hashlib.sha256(runtime.read_bytes()).hexdigest()!=expected:
         raise ValueError('Embedded Python archive checksum mismatch')
     output.mkdir(parents=True,exist_ok=True)
-    copy_code(output/'code',endpoint)
+    files = CLIENT_FILES + ('windows/video/LiveAvc.cs',)
+    extra = {WINDOWS_AVC: avc_helper} if avc_helper is not None else None
+    # An existing build may be repackaged as JPEG-only.
+    if extra is None:
+        (output / 'code' / WINDOWS_AVC).unlink(missing_ok=True)
+    copy_code(output/'code', endpoint, files, extra)
     with zipfile.ZipFile(runtime) as archive:
         for entry in archive.infolist():
             if entry.filename.startswith(('/', '\\')) or '..' in Path(entry.filename).parts:
@@ -133,11 +142,12 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument('platform',choices=['macos','windows','linux']);parser.add_argument('output',type=Path)
     parser.add_argument('--endpoint',type=Path,required=True);parser.add_argument('--runtime',type=Path);parser.add_argument('--runtime-sha256')
     parser.add_argument('--engine',type=Path)
+    parser.add_argument('--avc-helper', type=Path, help='Prebuilt Windows AVC helper matching the embedded Python architecture')
     args=parser.parse_args();endpoint=json.loads(args.endpoint.read_text())
     if set(endpoint)!={'url','pin'}:raise ValueError('Endpoint metadata must contain only public URL and certificate pin')
     if args.platform=='macos':mac(args.output.resolve(),endpoint,args.engine)
     elif args.platform=='linux':linux(args.output.resolve(),endpoint)
-    else:windows(args.output.resolve(),endpoint,args.runtime,args.runtime_sha256)
+    else:windows(args.output.resolve(),endpoint,args.runtime,args.runtime_sha256,args.avc_helper)
     print(args.output.resolve())
 
 
