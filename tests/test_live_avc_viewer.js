@@ -10,7 +10,7 @@ const viewer = app.slice(app.indexOf('let live=null'), app.indexOf('function liv
 
 function fixture() {
  const elements = new Map(), calls = [];
- let clock = 0, status = {ack: 0};
+ let clock = 0, status = {ack: 0}, sendInput = async () => {};
  const context = vm.createContext({
   $(id) {
    if (!elements.has(id)) {
@@ -32,12 +32,14 @@ function fixture() {
   remoteFrame: null,
   fetch: () => new Promise(() => {}),
   nonce: 'fixture',
+  queueMicrotask,
   setTimeout() {},
   clearTimeout() {},
   async api(operation, body) {
    calls.push({operation, body});
    if (operation === 'live-open') return {id: 'fixture', live_avc: 1};
    if (operation === 'live-view') return status;
+   if (operation === 'live-input') return sendInput(body);
    return {};
   },
  });
@@ -55,6 +57,9 @@ function fixture() {
    `drawLiveMedia(live, {}, {seq:1,geometry:'0,0,1280,720',codec:'H.264'}, performance.now()-${captureAge}, 1280, 720)`),
   queue: () => run("queueLive({type:'move',x:1,y:1})"),
   fallback: () => calls.filter(({operation}) => operation === 'live-jpeg').length,
+  inputs: () => calls.filter(({operation}) => operation === 'live-input').map(({body}) => body),
+  onInput: (handler) => { sendInput = handler; },
+  acknowledge: (ack) => { status = {ack}; },
   revoke: () => { status = {ack: 0, error: '授权已撤销'}; },
  };
 }
@@ -110,4 +115,80 @@ test('authorization loss closes even after the startup deadline', async () => {
  assert.equal(viewer.run('live'), null);
  assert.equal(viewer.calls.at(-1).operation, 'live-close');
  assert.match(viewer.elements.get('remote-state').textContent, /授权已撤销/);
+});
+
+test('input submits without timers, coalesces moves, and drains in order after acceptance', async () => {
+ const viewer = fixture();
+ let accept;
+ viewer.onInput(({seq}) => seq === 1 ? new Promise((resolve) => { accept = resolve; }) : Promise.resolve());
+ await viewer.start();
+ viewer.draw(0);
+ viewer.run(`
+  queueLive({type:'move',x:1,y:1});
+  queueLive({type:'move',x:2,y:2});
+  queueLive({type:'down',x:2,y:2,button:0});
+ `);
+ await new Promise(setImmediate);
+ viewer.run(`
+  queueLive({type:'move',x:3,y:3});
+  queueLive({type:'move',x:4,y:4});
+  queueLive({type:'up',x:4,y:4,button:0});
+  queueLive({type:'keydown',code:'KeyA'});
+  queueLive({type:'keyup',code:'KeyA'});
+ `);
+ await new Promise(setImmediate);
+ assert.equal(viewer.inputs().length, 1);
+ accept();
+ await new Promise(setImmediate);
+ assert.deepEqual(JSON.parse(JSON.stringify(viewer.inputs().map(({seq, events}) => [seq, events]))), [
+  [1, [{type:'move',x:2,y:2}, {type:'down',x:2,y:2,button:0}]],
+  [2, [{type:'move',x:4,y:4}, {type:'up',x:4,y:4,button:0},
+       {type:'keydown',code:'KeyA'}, {type:'keyup',code:'KeyA'}]],
+ ]);
+});
+
+test('an acknowledgement reopens the send window without reviving input queued on a stale frame', async () => {
+ const viewer = fixture();
+ await viewer.start();
+ viewer.draw(0);
+ for (let i = 0; i < 6; i++) {
+  viewer.queue();
+  await new Promise(setImmediate);
+ }
+ viewer.queue();
+ await new Promise(setImmediate);
+ assert.equal(viewer.inputs().length, 6);
+ viewer.acknowledge(1);
+ await viewer.poll();
+ assert.equal(viewer.inputs().at(-1).seq, 7);
+
+ viewer.queue();
+ viewer.at(1500);
+ viewer.draw(0);
+ viewer.acknowledge(2);
+ await viewer.poll();
+ assert.equal(viewer.inputs().length, 7);
+ viewer.queue();
+ await new Promise(setImmediate);
+ assert.equal(viewer.inputs().at(-1).seq, 8);
+});
+
+test('uncertain submission halts other queued input and never retries', async () => {
+ const viewer = fixture();
+ let rejectInput;
+ viewer.onInput(() => new Promise((_, reject) => { rejectInput = reject; }));
+ await viewer.start();
+ viewer.draw(0);
+ viewer.queue();
+ await new Promise(setImmediate);
+ viewer.queue();
+ rejectInput(new Error('connection lost'));
+ await new Promise(setImmediate);
+ viewer.acknowledge(1);
+ await viewer.poll();
+ viewer.queue();
+ assert.equal(viewer.inputs().length, 1);
+ assert.equal(viewer.run('live.queue.length'), 0);
+ assert.equal(viewer.run('live.halt'), true);
+ assert.equal(viewer.calls.filter(({operation}) => operation === 'live-close').length, 1);
 });

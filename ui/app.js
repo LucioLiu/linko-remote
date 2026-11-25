@@ -260,7 +260,7 @@ const liveAvcFrameGapTimeout=4000;
 function stopLive(){
  const prior=live;live=null;
  if(prior){
-  clearTimeout(prior.timer);clearTimeout(prior.inputTimer);
+  clearTimeout(prior.timer);
   prior.mediaAbort?.abort();
   closeLiveDecoder(prior);
   liveImage.removeAttribute('src');remoteFrame=null;
@@ -287,7 +287,7 @@ async function startLive(){
    live.mediaAbort=new AbortController();
    watchLiveMedia(live);
   }else liveImage.src='/live-feed/'+value.id+'?session='+encodeURIComponent(nonce);
-  $('remote-mode').textContent='逐步操作';$('remote-refresh').textContent='重新连接';$('remote-recover').hidden=true;$('remote-state').textContent='正在建立连续画面…';pollLive(live);pumpLive(live);
+  $('remote-mode').textContent='逐步操作';$('remote-refresh').textContent='重新连接';$('remote-recover').hidden=true;$('remote-state').textContent='正在建立连续画面…';pollLive(live);
  }catch(e){$('remote-state').textContent=e.message;}finally{liveOpening=false;}
 }
 function closeLiveDecoder(session){
@@ -295,8 +295,12 @@ function closeLiveDecoder(session){
  session.decoder=null;session.pendingFrames.clear();session.avcSequence=null;
  if(decoder && decoder.state!=='closed')decoder.close();
 }
+function freshLiveInputFrame(session){
+ return session.frame && performance.now()-session.frameAt<liveFrameLimit;
+}
 function presentLiveFrame(session, frame, capturedAt){
- if(session.frame && (session.frame.geometry!==frame.geometry || session.frame.codec!==frame.codec))
+ if(!freshLiveInputFrame(session) ||
+    session.frame.geometry!==frame.geometry || session.frame.codec!==frame.codec)
   session.queue=[];
  session.frame=frame;
  session.frameAt=capturedAt;
@@ -475,6 +479,7 @@ async function pollLive(session){
   }else if(frame && (!session.frame || frame.seq!==session.frame.seq)){
    presentLiveFrame(session,frame,now-value.frame_age_ms);
   }
+  scheduleLiveInput(session);
   if(!session.halt){
    if(session.frame && now-session.frameAt<liveFrameLimit){
     const codec=session.frame.codec?' · '+session.frame.codec:'';
@@ -487,20 +492,34 @@ async function pollLive(session){
  if(live===session)session.timer=setTimeout(()=>pollLive(session),80);
 }
 function queueLive(event){
- const s=live;if(!s || s.halt || !s.frame || performance.now()-s.frameAt>=liveFrameLimit)return;
+ const s=live;if(!s || s.halt)return;
+ if(!freshLiveInputFrame(s)){s.queue=[];return;}
  if(s.queue.length>=128){s.halt=true;s.queue=[];$('remote-state').textContent='网络拥堵，已停止输入，请重新连接画面';stopLive();return;}
  if(event.type==='move' && s.queue.at(-1)?.type==='move')s.queue[s.queue.length-1]=event;else s.queue.push(event);
+ scheduleLiveInput(s);
+}
+function scheduleLiveInput(session){
+ if(live!==session || session.halt || !session.queue.length)return;
+ if(!freshLiveInputFrame(session)){session.queue=[];return;}
+ if(session.inputScheduled || session.sending || session.seq-session.ack>=6)return;
+ // Combine events queued in the same turn without waiting for a background timer.
+ session.inputScheduled=true;
+ queueMicrotask(()=>{
+  session.inputScheduled=false;
+  pumpLive(session);
+ });
 }
 async function pumpLive(session){
- if(live!==session)return;
- if(!session.frame || performance.now()-session.frameAt>=liveFrameLimit)session.queue=[];
- if(!session.halt && session.queue.length && session.seq-session.ack<6 && !session.sending){
-  session.sending=true;const events=session.queue.splice(0,64),seq=++session.seq;
-  try{await api('live-input',{id:session.id,seq,geometry:session.frame.geometry,events});}
-  catch(e){if(live===session){session.halt=true;session.queue=[];$('remote-state').textContent='键鼠结果未确认，已停止输入：'+e.message;api('live-close',{id:session.id}).catch(()=>{});}}
-  finally{session.sending=false;}
+ if(live!==session || session.halt)return;
+ if(!freshLiveInputFrame(session)){session.queue=[];return;}
+ if(!session.queue.length || session.seq-session.ack>=6 || session.sending)return;
+ session.sending=true;const events=session.queue.splice(0,64),seq=++session.seq;
+ try{await api('live-input',{id:session.id,seq,geometry:session.frame.geometry,events});}
+ catch(e){if(live===session){session.halt=true;session.queue=[];$('remote-state').textContent='键鼠结果未确认，已停止输入：'+e.message;api('live-close',{id:session.id}).catch(()=>{});}}
+ finally{
+  session.sending=false;
+  scheduleLiveInput(session);
  }
- if(live===session)session.inputTimer=setTimeout(()=>pumpLive(session),30);
 }
 function livePoint(e){const r=e.currentTarget.getBoundingClientRect();return {x:Math.max(0,Math.min(65535,Math.round((e.clientX-r.left)/r.width*65535))),y:Math.max(0,Math.min(65535,Math.round((e.clientY-r.top)/r.height*65535)))};}
 const liveCodes=new Set(["KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ", "Digit0", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "Enter", "Tab", "Escape", "Backspace", "Delete", "Space", "ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown", "Home", "End", "PageUp", "PageDown", "ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight", "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash", "Semicolon", "Quote", "Comma", "Period", "Slash", "Backquote"]);
