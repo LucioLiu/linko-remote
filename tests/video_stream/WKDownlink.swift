@@ -5,6 +5,7 @@ import Vision
 final class Harness: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler {
     var view: WKWebView!
     var timer: Timer?
+    let office = CommandLine.arguments.count > 5 && CommandLine.arguments[5] == "office"
     let quality = CommandLine.arguments[2] == "--quality"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -12,7 +13,10 @@ final class Harness: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKSc
         config.websiteDataStore = .nonPersistent()
         config.userContentController.add(self, name: "linkoUpdate")
         config.userContentController.add(self, name: "wanMeasurement")
-        view = WKWebView(frame: NSRect(x: 0, y: 0, width: 1220, height: 860), configuration: config)
+        let sizeIndex = quality && CommandLine.arguments.count == 5 ? 3 : (office ? 6 : nil)
+        let width = sizeIndex.map { Double(CommandLine.arguments[$0])! } ?? 1220
+        let height = sizeIndex.map { Double(CommandLine.arguments[$0 + 1])! } ?? 860
+        view = WKWebView(frame: NSRect(x: 0, y: 0, width: width, height: height), configuration: config)
         view.navigationDelegate = self
         view.load(URLRequest(url: URL(string: CommandLine.arguments[1])!))
         DispatchQueue.main.asyncAfter(deadline: .now() + (quality ? 90 : 50)) { exit(1) }
@@ -62,6 +66,20 @@ final class Harness: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKSc
             const now = performance.now();
             if (frame.codec === 'H.264') firstDraw.add(session);
             post('draw', {seq: frame.seq, codec: frame.codec, estimated_age_ms: now-capturedAt});
+            if (\(office)) {
+              const r = liveVideo.getBoundingClientRect();
+              const sx = r.width / 1280 * devicePixelRatio, sy = r.height / 720 * devicePixelRatio;
+              const w = Math.round(384*sx), h = Math.round(144*sy);
+              const crop = document.createElement('canvas');
+              crop.width = w; crop.height = h;
+              crop.getContext('2d').drawImage(liveVideo, 0, 58, 384, 144, 0, 0, w, h);
+              const point = livePoint({currentTarget:liveVideo, clientX:r.left+r.width*0.31, clientY:r.top+r.height*0.18});
+              post('office_draw', {seq:frame.seq, idr:frameKinds.get(frame.seq), png:crop.toDataURL().split(',')[1],
+                geometry:frame.geometry, point, canvas:[liveVideo.width,liveVideo.height], dpr:devicePixelRatio,
+                viewport:[innerWidth,innerHeight], rect:[r.x,r.y,r.width,r.height],
+                roiRaster:[w,h], fit:getComputedStyle(liveVideo).objectFit});
+              return result;
+            }
             if (now-pixelAt >= 965) {
               pixelAt = now;
               pixelContext.drawImage(liveVideo, 0, 0, 32, 18);
@@ -115,7 +133,7 @@ final class Harness: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKSc
               post('input_dropped', {seq:pending});
               pending=0;
             }
-            if (!pending && now>=nextProbe && now-start<(duration-2)*1000 && live?.frame?.codec==='H.264' && now-live.frameAt<1150) {
+            if (!\(office) && !pending && now>=nextProbe && now-start<(duration-2)*1000 && live?.frame?.codec==='H.264' && now-live.frameAt<1150) {
               const seq=live.seq+1;
               queueLive({type:'move',x:seq,y:1});
               if (live.queue.length) {
@@ -262,7 +280,7 @@ if ["--ocr", "--ocr-boxes"].contains(CommandLine.arguments[1]) {
     let results = try encoded.map { sample -> [Observation] in
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
-        request.recognitionLanguages = ["en-US"]
+        request.recognitionLanguages = CommandLine.arguments.contains("--office-ocr") ? ["zh-Hans", "en-US"] : ["en-US"]
         request.usesLanguageCorrection = false
         if #available(macOS 13.0, *) { request.automaticallyDetectsLanguage = false }
         let handler = VNImageRequestHandler(data: Data(base64Encoded: sample)!)

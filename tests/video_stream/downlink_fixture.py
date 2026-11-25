@@ -125,7 +125,8 @@ def preencode(profile, gop=GOP):
 def hub_endpoint(port, pin):
     return {'url': f'https://127.0.0.1:{port}', 'pin': pin}
 
-def trial(root, binary, engine, endpoints, duration, fixture, label, hold_local_media_ms, profile, adaptive=False, gop=GOP):
+def trial(root, binary, engine, endpoints, duration, fixture, label, hold_local_media_ms, profile,
+          adaptive=False, gop=GOP, office=None):
     width, height, _, _ = ALL_PROFILES[profile]
     from lanpilot import live_agent
     from lanpilot.live import AVC_HEADER
@@ -225,19 +226,26 @@ def trial(root, binary, engine, endpoints, duration, fixture, label, hold_local_
                 index_start, seen_key = index, key
             offset = index - index_start
             current_profile = next_profile
-            unit = fixture[current_profile][index_start, offset]
+            if office:
+                unit, offset, tag = office.encode(seq, offset == 0)
+            else:
+                unit = fixture[current_profile][index_start, offset]
+                tag = {}
             seq += 1
             record = AVC_HEADER.pack(b'LPA1', len(unit), seq, tick, width, height,
                                      int(offset == 0), 0, 0, WIDTH, HEIGHT) + unit
             captures[seq] = {'seq':seq, 'captured_ms':captured, 'key':offset == 0, 'bytes':len(unit), 'profile':current_profile,
-                             'scene_index':index, 'gop_offset':offset}
+                             'scene_index':index, 'gop_offset':offset, **tag}
             path = root / (f'live-avc-{seq % 8}.json' if control.get('avc_batch') else 'live-frame.json')
             atomic_json(path, {'id':session, 'seq':seq, 'capture_tick':tick,
                         'idr':offset == 0, 'avc_base64':base64.b64encode(record).decode('ascii')})
     def collect(proc):
         for line in proc.stdout:
             try:
-                events.append(json.loads(line))
+                event = json.loads(line)
+                events.append(event)
+                if office and event['kind'] == 'draw' and event['codec'] == 'H.264':
+                    office.first_draw.set()
             except json.JSONDecodeError:
                 continue
     def close_hub(hub):
@@ -271,8 +279,10 @@ def trial(root, binary, engine, endpoints, duration, fixture, label, hold_local_
             if any(thread.is_alive() for thread in active_threads):
                 raise RuntimeError('Test sender threads failed to stop')
         stack.callback(stop_threads)
-        view = subprocess.Popen([str(binary), browser_url, target, str(duration), str(hold_local_media_ms)], text=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        viewer_args = [str(binary), browser_url, target, str(duration), str(hold_local_media_ms)]
+        if office:
+            viewer_args.extend(office.viewer)
+        view = subprocess.Popen(viewer_args, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         stack.callback(view.stdout.close)
         stack.callback(terminate, view)
         reader = threading.Thread(target=collect, args=(view,), daemon=True)
@@ -289,6 +299,8 @@ def trial(root, binary, engine, endpoints, duration, fixture, label, hold_local_
     if mailbox_errors:
         raise RuntimeError(f'Input geometry or sequencing failed: {mailbox_errors}')
     result['sender_events'] = sender_events
+    if office:
+        return result
     samples = [e for e in events if e['kind'] == 'text_sample']
     for sample in samples:
         capture = captures[sample['seq']]
