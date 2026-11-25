@@ -23,7 +23,7 @@ class ScrollingText:
         self.panel_height = self.bottom - self.top
         self.step = 26
         self.period = self.step * 72
-        self.font = ImageFont.load_default(size=14)
+        self.font = self.font_for_text()
         self.bar_font = ImageFont.load_default(size=16)
         self.page = Image.new("RGB", (width, height), "#edf1f6")
         page = ImageDraw.Draw(self.page)
@@ -43,6 +43,10 @@ class ScrollingText:
             for column, x in enumerate(range(12, width, 212)):
                 strip.text((x, y + 4), f"{row:03d}   Ref {row * 17 + column:04d}   Review",
                            font=self.font, fill="#253c59")
+
+    @staticmethod
+    def font_for_text():
+        return ImageFont.load_default(size=14)
 
     def frame(self, index):
         frame = self.page.copy()

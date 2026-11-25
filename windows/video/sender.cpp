@@ -234,11 +234,15 @@ public:
     ~BufferLock() { buffer_->Unlock(); }
 };
 
-void codec_setting(ICodecAPI* codec, const GUID& key, ULONG value) {
+HRESULT set_codec_u32(ICodecAPI* codec, const GUID& key, ULONG value) {
     VARIANT setting{};
     setting.vt = VT_UI4;
     setting.ulVal = value;
-    mf(codec->SetValue(&key, &setting), "Set encoder numeric property");
+    return codec->SetValue(&key, &setting);
+}
+
+void codec_setting(ICodecAPI* codec, const GUID& key, ULONG value) {
+    mf(set_codec_u32(codec, key, value), "Set encoder numeric property");
 }
 
 class Encoder {
@@ -275,7 +279,8 @@ class Encoder {
     }
 
 public:
-    void init(unsigned width, unsigned height, unsigned fps, unsigned bitrate, unsigned buffer_bytes = 0) {
+    void init(unsigned width, unsigned height, unsigned fps, unsigned bitrate, unsigned buffer_bytes = 0,
+              unsigned gop_seconds = 2) {
         fps_ = fps;
         input_size_ = width * height * 3 / 2;
         mf(CoCreateInstance(encoder_clsid, nullptr, CLSCTX_INPROC_SERVER,
@@ -295,7 +300,10 @@ public:
         auto input = type(MFVideoFormat_NV12, width, height, fps);
         mf(input->SetUINT32(MF_MT_DEFAULT_STRIDE, width), "NV12 stride");
         mf(transform_->SetInputType(0, input.Get(), 0), "set NV12 input");
-        codec_setting(codec_.Get(), CODECAPI_AVEncMPVGOPSize, 2 * fps);
+        // Let low-bitrate P frames refine the desktop for longer between
+        // scheduled IDRs. Explicit recovery requests still force an IDR.
+        if (gop_seconds == 2 || FAILED(set_codec_u32(codec_.Get(), CODECAPI_AVEncMPVGOPSize, gop_seconds * fps)))
+            codec_setting(codec_.Get(), CODECAPI_AVEncMPVGOPSize, 2 * fps);
         mf(transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0), "begin streaming");
         mf(transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0), "start stream");
     }
@@ -401,7 +409,7 @@ void run(Session& session, unsigned max_width, unsigned max_height, unsigned fps
                     auto replacement = std::make_unique<Encoder>();
                     const bool low = profile == profile_low;
                     replacement->init(desktop.width, desktop.height, fps,
-                                      low ? low_bitrate : bitrate, low ? low_buffer_bytes : 0);
+                                      low ? low_bitrate : bitrate, low ? low_buffer_bytes : 0, low ? 3 : 2);
                     encoder = std::move(replacement);
                     active_profile = profile;
                 }

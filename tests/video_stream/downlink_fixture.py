@@ -1,8 +1,9 @@
 """Loopback-only synthetic Windows capture and offscreen product viewer fixture."""
 import base64
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import ExitStack
 from fractions import Fraction
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -17,8 +18,10 @@ from types import SimpleNamespace
 
 import av
 from PIL import Image
+from benchmark import ScrollingText
 
 WIDTH, HEIGHT, FPS, GOP, SCENE_FRAMES = 1280, 720, 20, 20, 60
+AVC_SAMPLE_ROI = (8, 52, 432, 156)
 
 PROFILES = {
     'reference': (1280, 720, 3500, 400),
@@ -27,6 +30,9 @@ PROFILES = {
     '540p': (960, 540, 750, 100),
     '360p': (640, 360, 750, 100),
 }
+EXPERIMENTAL_PROFILES = {'vbv175': (1280, 720, 750, 175)}
+ALL_PROFILES = PROFILES | EXPERIMENTAL_PROFILES
+
 
 def wall():
     return time.time_ns() / 1e6
@@ -65,9 +71,20 @@ def check(result, description):
         raise RuntimeError(f'{description}: exit {result.returncode}')
     return result.stdout.strip()
 
-def preencode(profile):
-    width, height, kbps, vbv = PROFILES[profile]
-    from benchmark import ScrollingText
+def encoder_for(width, height, kbps, vbv, gop=GOP):
+    encoder = av.CodecContext.create('libx264', 'w')
+    encoder.width, encoder.height = width, height
+    encoder.time_base, encoder.framerate = Fraction(1, FPS), FPS
+    encoder.pix_fmt, encoder.gop_size, encoder.max_b_frames, encoder.thread_count = 'yuv420p', gop, 0, 1
+    encoder.options = {'profile': 'baseline', 'preset': 'veryfast', 'tune': 'zerolatency',
+                       'x264-params': f'annexb=1:repeat-headers=1:scenecut=0:open-gop=0:'
+                                      f'vbv-maxrate={kbps}:vbv-bufsize={vbv}:vbv-init=0.65'}
+    encoder.bit_rate = kbps * 1000
+    return encoder
+
+
+def preencode(profile, gop=GOP):
+    width, height, kbps, vbv = ALL_PROFILES[profile]
     scene = ScrollingText(WIDTH, HEIGHT, 'full')
     pictures = []
     for i in range(SCENE_FRAMES):
@@ -77,18 +94,11 @@ def preencode(profile):
         pictures.append(av.VideoFrame.from_image(source).reformat(format='yuv420p'))
     fixture, digest = {}, hashlib.sha256()
     for start in range(SCENE_FRAMES):
-        encoder = av.CodecContext.create('libx264', 'w')
-        encoder.width, encoder.height = width, height
-        encoder.time_base, encoder.framerate = Fraction(1, FPS), FPS
-        encoder.pix_fmt, encoder.gop_size, encoder.max_b_frames, encoder.thread_count = 'yuv420p', GOP, 0, 1
-        encoder.options = {'profile': 'baseline', 'preset': 'veryfast', 'tune': 'zerolatency',
-                           'x264-params': 'annexb=1:repeat-headers=1:scenecut=0:open-gop=0'}
-        encoder.bit_rate = kbps * 1000
-        encoder.options['x264-params'] += f':vbv-maxrate={kbps}:vbv-bufsize={vbv}:vbv-init=0.65'
+        encoder = encoder_for(width, height, kbps, vbv, gop)
         decoder = av.CodecContext.create('h264', 'r')
         decoder.thread_count = 1
         last = None
-        for offset in range(min(GOP, SCENE_FRAMES - start)):
+        for offset in range(min(gop, SCENE_FRAMES - start)):
             picture = pictures[start + offset]
             picture.pts = offset
             packet, = encoder.encode(picture)
@@ -105,7 +115,7 @@ def preencode(profile):
         if encoder.encode(None) or decoder.decode(None):
             raise RuntimeError('Fixture codec delayed output')
     return fixture, {'width': width, 'height': height, 'target_fps': FPS,
-                     'max_gop': GOP, 'scene_cycle_frames': SCENE_FRAMES,
+                     'max_gop': gop, 'scene_cycle_frames': SCENE_FRAMES,
                      'verified_access_units': len(fixture), 'sha256_ordered_access_units': digest.hexdigest(),
                      'idr_payload_bytes': ms_data(len(v) for (_, offset), v in fixture.items() if offset == 0),
                      'p_payload_bytes': ms_data(len(v) for (_, offset), v in fixture.items() if offset != 0),
@@ -115,8 +125,8 @@ def preencode(profile):
 def hub_endpoint(port, pin):
     return {'url': f'https://127.0.0.1:{port}', 'pin': pin}
 
-def trial(root, binary, engine, endpoints, duration, fixture, label, hold_local_media_ms, profile, adaptive=False):
-    width, height, _, _ = PROFILES[profile]
+def trial(root, binary, engine, endpoints, duration, fixture, label, hold_local_media_ms, profile, adaptive=False, gop=GOP):
+    width, height, _, _ = ALL_PROFILES[profile]
     from lanpilot import live_agent
     from lanpilot.live import AVC_HEADER
     from lanpilot.peer_client import PinnedHub, atomic_json
@@ -211,7 +221,7 @@ def trial(root, binary, engine, endpoints, duration, fixture, label, hold_local_
             index = seq % SCENE_FRAMES
             key = control['avc_key']
             next_profile = ('small-idr' if control.get('avc_profile') == 2 else 'reference') if adaptive else profile
-            if key != seen_key or index == 0 or index - index_start >= GOP or next_profile != current_profile:
+            if key != seen_key or index == 0 or index - index_start >= gop or next_profile != current_profile:
                 index_start, seen_key = index, key
             offset = index - index_start
             current_profile = next_profile
@@ -219,7 +229,8 @@ def trial(root, binary, engine, endpoints, duration, fixture, label, hold_local_
             seq += 1
             record = AVC_HEADER.pack(b'LPA1', len(unit), seq, tick, width, height,
                                      int(offset == 0), 0, 0, WIDTH, HEIGHT) + unit
-            captures[seq] = {'seq':seq, 'captured_ms':captured, 'key':offset == 0, 'bytes':len(unit), 'profile':current_profile}
+            captures[seq] = {'seq':seq, 'captured_ms':captured, 'key':offset == 0, 'bytes':len(unit), 'profile':current_profile,
+                             'scene_index':index, 'gop_offset':offset}
             path = root / (f'live-avc-{seq % 8}.json' if control.get('avc_batch') else 'live-frame.json')
             atomic_json(path, {'id':session, 'seq':seq, 'capture_tick':tick,
                         'idr':offset == 0, 'avc_base64':base64.b64encode(record).decode('ascii')})
@@ -279,27 +290,93 @@ def trial(root, binary, engine, endpoints, duration, fixture, label, hold_local_
         raise RuntimeError(f'Input geometry or sequencing failed: {mailbox_errors}')
     result['sender_events'] = sender_events
     samples = [e for e in events if e['kind'] == 'text_sample']
+    for sample in samples:
+        capture = captures[sample['seq']]
+        if sample['idr'] != capture['key']:
+            raise RuntimeError('Canvas sample frame type differs from the capture')
+        sample.update(scene_index=capture['scene_index'], gop_offset=capture['gop_offset'],
+                      profile=capture['profile'])
     measure_text(binary, samples)
     result['summary']['text_phrases_exact'] = sum(row['exact_phrases'] for row in samples)
     result['summary']['text_phrases_total'] = sum(len(row['expected']) for row in samples)
+    result['summary']['text_by_frame_type'] = {}
+    for key in (True, False):
+        rows = [row for row in samples if row['idr'] == key]
+        chars = sum(row['reference_characters'] for row in rows)
+        result['summary']['text_by_frame_type']['idr' if key else 'p'] = {
+            'samples': len(rows), 'exact': sum(row['exact_phrases'] for row in rows),
+            'phrases': sum(len(row['expected']) for row in rows),
+            'cer': sum(row['character_edits'] for row in rows) / chars if chars else None,
+        }
     return result
 
 
-def expected_text(sequence):
-    scroll = ((sequence - 1) % SCENE_FRAMES) * 7
-    rows = [row for row in range((52 + scroll) // 26, (156 + scroll) // 26 + 1)
-            if 52 <= row * 26 + 4 - scroll and row * 26 + 20 - scroll <= 156]
-    return [f'{row % 72:03d}REF{(row % 72) * 17 + col:04d}REVIEW'
-            for row in rows for col in (0, 1)]
+def normalize(text):
+    return re.sub(r'[^A-Z0-9]', '', text.upper())
+
+
+def edit_distance(source, target):
+    previous = list(range(len(target) + 1))
+    for i, left in enumerate(source, 1):
+        row = [i]
+        for j, right in enumerate(target, 1):
+            row.append(min(row[-1] + 1, previous[j] + 1, previous[j - 1] + (left != right)))
+        previous = row
+    return previous[-1]
+
+
+@lru_cache(maxsize=SCENE_FRAMES)
+def text_slots(scene_index):
+    # Use the synthetic font's actual glyph bounds, including only complete
+    # lines. ScrollingText uses y+4 and x=12+212*column.
+    origin_x, origin_y, right, bottom = AVC_SAMPLE_ROI
+    scroll = scene_index * 7
+    font = ScrollingText.font_for_text()
+    slots = []
+    for row in range((origin_y + scroll) // 26, (bottom + scroll) // 26 + 1):
+        number = row % 72
+        for col in (0, 1):
+            text = f'{number:03d}   Ref {number * 17 + col:04d}   Review'
+            a, b, c, d = font.getbbox(text)
+            x, y = 12 + col * 212, row * 26 + 4 - scroll
+            if x + a >= origin_x and x + c <= right and y + b >= origin_y and y + d <= bottom:
+                slots.append((normalize(text), x - origin_x, (b + d)/2 + y - origin_y))
+    return slots
+
+
+def score_text(slots, observations):
+    # Vision can return columns in either order. Score fixed screen slots
+    # using each observation's position and count missing text as deletions.
+    width = AVC_SAMPLE_ROI[2] - AVC_SAMPLE_ROI[0]
+    height = AVC_SAMPLE_ROI[3] - AVC_SAMPLE_ROI[1]
+    matched = defaultdict(list)
+    extra = 0
+    for observation in observations:
+        x, y, _, h = observation['box']
+        x, y = x * width, (y + h / 2) * height
+        text = normalize(observation['text'])
+        candidates = [(abs(y - cy), index) for index, (_, left, cy) in enumerate(slots)
+                      if left - 8 <= x < left + 165 and abs(y - cy) < 12]
+        if candidates:
+            matched[min(candidates)[1]].append((x, text))
+        else:
+            # Exclude text from lines whose glyph bounds straddle the ROI edge.
+            if slots and min(slot[2] for slot in slots) - 12 <= y <= max(slot[2] for slot in slots) + 12:
+                extra += len(text)
+    expected = [slot[0] for slot in slots]
+    observed = [''.join(part for _, part in sorted(matched[i])) for i in range(len(slots))]
+    chars = sum(map(len, expected))
+    errors = extra + sum(edit_distance(left, right) for left, right in zip(expected, observed, strict=True))
+    return {'expected': expected, 'matched': observed, 'observations': observations,
+            'edits': errors, 'chars': chars, 'exact': sum(a == b for a, b in zip(expected, observed, strict=True))}
 
 
 def pristine_text(binary):
     from io import BytesIO
-    from benchmark import ScrollingText
     scene = ScrollingText(WIDTH, HEIGHT, 'full')
     samples = []
     for sequence in (1, 9, 21, 37, 53):
-        image = Image.fromarray(scene.frame(sequence - 1)).crop((8, 52, 432, 156))
+        image = Image.fromarray(scene.frame(sequence - 1)).crop(AVC_SAMPLE_ROI)
         png = BytesIO()
         image.save(png, format='PNG')
         samples.append({'seq': sequence, 'png': base64.b64encode(png.getvalue()).decode()})
@@ -313,12 +390,14 @@ def measure_text(binary, samples):
     if not samples:
         return
     images = [event.pop('png') for event in samples]
-    recognized = subprocess.run([str(binary), '--ocr'], input=json.dumps(images), text=True,
-                                capture_output=True, check=True, timeout=30)
-    for event, lines, png in zip(samples, json.loads(recognized.stdout), images, strict=True):
-        expected = expected_text(event['seq'])
-        text = re.sub(r'[^A-Z0-9]', '', ''.join(lines).upper())
-        event.update(expected=expected, recognized=lines, exact_phrases=sum(value in text for value in expected),
+    recognized = subprocess.run([str(binary), '--ocr-boxes'], input=json.dumps(images), text=True,
+                                capture_output=True, check=True, timeout=60)
+    for event, observations, png in zip(samples, json.loads(recognized.stdout), images, strict=True):
+        index = event.get('scene_index', (event['seq'] - 1) % SCENE_FRAMES)
+        score = score_text(text_slots(index), observations)
+        event.update(expected=score['expected'], recognized=[o['text'] for o in observations],
+                     matched=score['matched'], exact_phrases=score['exact'], character_edits=score['edits'],
+                     reference_characters=score['chars'],
                      png_sha256=hashlib.sha256(base64.b64decode(png)).hexdigest())
 
 

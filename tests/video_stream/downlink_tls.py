@@ -162,7 +162,7 @@ def run_trial(root, source, label, args):
             with (root / (profile + '.pkl')).open('rb') as file:
                 units[profile] = pickle.load(file)
         result = fixture.trial(root / (label + '-view'), root / 'wk', source / 'linko_desktop.py',
-                               (direct, endpoint), args.seconds, units, label, args.hold_local_media_ms, args.profile, args.adaptive)
+                               (direct, endpoint), args.seconds, units, label, args.hold_local_media_ms, args.profile, args.adaptive, args.gop)
         result.update(relay_events=relay_events, route_probe=probe,
                       load_average_before=load_before, load_average_after=os.getloadavg())
         subscriptions = [e for e in relay_events if e['kind'] == 'subscribe']
@@ -186,8 +186,8 @@ def run_trial(root, source, label, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seconds', type=int, choices=range(8, 31), default=18)
-    parser.add_argument('--profiles', nargs='+', choices=fixture.PROFILES)
-    parser.add_argument('--profile', choices=fixture.PROFILES, default='reference', help=argparse.SUPPRESS)
+    parser.add_argument('--profiles', nargs='+', choices=fixture.ALL_PROFILES)
+    parser.add_argument('--profile', choices=fixture.ALL_PROFILES, default='reference', help=argparse.SUPPRESS)
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--rates', nargs='+', type=float, help='Run each downlink rate using the same fixtures')
     parser.add_argument('--adaptive', action='store_true', help='Exercise negotiated runtime profiles')
@@ -196,6 +196,8 @@ def main():
     parser.add_argument('--recover-mbps', type=float, default=12)
     parser.add_argument('--mbps', type=float, default=1.6)
     parser.add_argument('--rtt-ms', type=int, default=600)
+    parser.add_argument('--gop', type=int, choices=range(1, fixture.SCENE_FRAMES + 1),
+                        default=fixture.GOP, metavar='FRAMES')
     parser.add_argument('--hold-local-media-ms', type=int, default=0)
     parser.add_argument('--modes', nargs='+', choices=('direct', 'slow'), default=['direct', 'slow'])
     parser.add_argument('--output', type=Path, default=Path('downlink-results.json'))
@@ -236,7 +238,7 @@ def main():
         profiles = ['reference', 'small-idr'] if args.adaptive else args.profiles or ['reference']
         metadata = {}
         for profile in profiles:
-            units, metadata[profile] = fixture.preencode(profile)
+            units, metadata[profile] = fixture.preencode(profile, args.gop)
             with (root / (profile + '.pkl')).open('wb') as file:
                 pickle.dump(units, file)
         sources = ({'adaptive': candidate} if args.adaptive else
@@ -271,7 +273,8 @@ def main():
                         [sys.executable, __file__, '--worker',
                          str(root), str(sources[variant]), label, '--pin', pin, '--seconds', str(args.seconds),
                          '--profile', profile, '--mbps', str(rate), '--rtt-ms', str(args.rtt_ms),
-                         '--hold-local-media-ms', str(args.hold_local_media_ms), *adaptive],
+                         '--hold-local-media-ms', str(args.hold_local_media_ms),
+                         '--gop', str(args.gop), *adaptive],
                         capture_output=True, text=True, timeout=args.seconds + 60,
                         env=dict(os.environ, PYTHONPATH=str(sources[variant])))
                     if result.returncode != 0:
