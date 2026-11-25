@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 
 from desktop import make_request
-from .live import LiveSessions
+from .live import LIVE_WAIT_MS, LiveSessions
 
 READ_ONLY_TIMEOUTS = {'observe': 'SCREEN_CAPTURE_TIMED_OUT', 'status': 'STATUS_TIMED_OUT'}
 BEFORE_DELIVERY = 'EXPIRED_OR_ACCESS_REVOKED_BEFORE_DELIVERY'
@@ -128,14 +128,29 @@ class PeerHub:
             elif operation in ('connect', 'access'):
                 self._rate(source, 'connect-source', 60)
                 self._rate(str(credential), 'connect-client', 10)
-            self.db.execute('BEGIN IMMEDIATE')
-            try:
-                result = self._dispatch(operation, credential, body, source)
-                self.db.execute('COMMIT')
-                return result
-            except BaseException:
-                self.db.execute('ROLLBACK')
-                raise
+            result = self._dispatch_committed(operation, credential, body, source)
+            if operation in ('availability', 'disconnect'):
+                self.live.prune(self.clock())
+            wait_ms = body.get('wait_ms')
+            if operation in ('live-view', 'live-exchange') and type(wait_ms) is int and wait_ms > 0:
+                waited = self.live.wait_for_update(operation, body, result, min(wait_ms, LIVE_WAIT_MS))
+                if waited is not None:
+                    if operation == 'live-exchange':
+                        # The initial call already committed the prior receipt and frame.
+                        body = {'id': body['id'], 'ack': body.get('ack', 0)}
+                    result = self._dispatch_committed(operation, credential, body, source)
+                result['waited_ms'] = round((waited or 0) * 1000)
+            return result
+
+    def _dispatch_committed(self, operation, credential, body, source):
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            result = self._dispatch(operation, credential, body, source)
+            self.db.execute('COMMIT')
+            return result
+        except BaseException:
+            self.db.execute('ROLLBACK')
+            raise
 
     def _dispatch(self, operation, credential, body, source):
         now = self.clock()

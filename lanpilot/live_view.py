@@ -2,6 +2,8 @@
 import threading
 import time
 
+from .live import LIVE_WAIT_MS
+
 
 class LiveView:
     def __init__(self, hub, identifier, stop_event):
@@ -40,9 +42,13 @@ class LiveView:
             while not self.stop.is_set() and not self.client_stop.is_set() and time.monotonic()-self.ui_seen<12:
                 frame=self.value.get('frame')
                 started=time.monotonic()
-                value=self.hub.call('live-view',{'id':self.id,'after':frame['seq'] if frame else None})
-                self.publish(value,time.monotonic()-started)
-                self.stop.wait(.06)
+                value=self.hub.call('live-view',{'id':self.id,'after':frame['seq'] if frame else None,
+                                                 'after_ack':self.value['ack'],'wait_ms':LIVE_WAIT_MS})
+                # The relay reports age at send time, after its frame wait.
+                transit = max(0, time.monotonic()-started-value.get('waited_ms', 0)/1000)
+                self.publish(value,transit)
+                if 'waited_ms' not in value:
+                    self.stop.wait(.06)
         except Exception as error:
             self.publish(dict(self.value,error=str(error)[:180]))
         finally:

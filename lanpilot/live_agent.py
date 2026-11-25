@@ -5,6 +5,7 @@ import http.client
 import threading
 import time
 
+from .live import LIVE_WAIT_MS
 
 FIRST_FRAME_TIMEOUT = 15
 FRAME_GAP_TIMEOUT = 8
@@ -40,15 +41,20 @@ class LiveAgent:
         # delay key-up delivery. Only the newest captured frame is uploaded.
         while not self.client.stop_event.is_set():
             ident=self.current
+            delay = .06
             try:
                 if ident:
                     frame=self.read('live-frame.json')
                     if frame.get('id')==ident and frame.get('seq',0)>self.last_frame and time.time()-frame.get('created',0)<1:
+                        started = time.monotonic()
                         value=self.frame_hub.call('live-frame',{'id':ident,'frame':{k:frame[k] for k in ('seq','geometry','jpeg_base64')}})
                         with self.lock:
                             if self.current==ident:
                                 if not value['active']: raise RuntimeError('连续画面已停止')
                                 self.last_frame=frame['seq'];self.media_at=time.monotonic()
+                        # Include upload time in the send interval. Slow links
+                        # still send only the newest frame, with one in flight.
+                        delay = max(.01, delay - (time.monotonic()-started))
             except PermissionError as error:
                 self.end(ident,error)
             except (OSError, http.client.HTTPException):
@@ -57,7 +63,7 @@ class LiveAgent:
                 pass
             except Exception as error:
                 self.end(ident,error)
-            self.client.stop_event.wait(.06)
+            self.client.stop_event.wait(delay)
 
     def end(self,ident,error,reason=None):
         with self.lock:
@@ -92,7 +98,8 @@ class LiveAgent:
                 ident=sessions[0]['id']
                 with self.lock:
                     if not self.client.incoming or self.client.stop_event.is_set():continue
-                    if self.current!=ident:
+                    starting = self.current!=ident
+                    if starting:
                         self.expire();self.media_at=time.monotonic();self.current=ident
                     frame_timeout = FRAME_GAP_TIMEOUT if self.last_frame else FIRST_FRAME_TIMEOUT
                     timed_out = time.monotonic()-self.media_at>frame_timeout
@@ -104,18 +111,23 @@ class LiveAgent:
                 if ended.get('id')==ident: raise RuntimeError(ended.get('error','连续桌面已停止'))
                 receipt=self.read('live-receipt.json')
                 body={'id':ident,'ack':receipt.get('seq',0) if receipt.get('id')==ident else 0}
+                # The native worker needs its first lease before it can capture.
+                if not starting: body['wait_ms']=LIVE_WAIT_MS
                 if receipt.get('id')==ident and receipt.get('error'): body['error']=receipt['error']
                 # No input is ever submitted again if this exchange loses its response.
                 started=time.monotonic()
                 value=self.hub.call('live-exchange',body)
+                relay_wait = value.get('waited_ms', 0) / 1000
                 with self.lock:
                     if self.current!=ident or not self.client.incoming or self.client.stop_event.is_set():continue
                     if not value['active']: raise RuntimeError('远程输入已停止')
                     self.write(self.root/'live-control.json',{'id':ident,'expires':time.time()+min(2.5,value['lease_ms']/1000)})
                     for batch in value['inputs']:
-                        self.accept(ident, batch, time.monotonic()-started)
+                        transit = max(0, time.monotonic() - started - relay_wait)
+                        self.accept(ident, batch, transit)
                     self.error=''
-                self.client.stop_event.wait(.06)
+                if value['inputs'] or 'waited_ms' not in value:
+                    self.client.stop_event.wait(.06)
             except Exception as error:
                 self.end(self.current,error)
                 self.client.stop_event.wait(.5)

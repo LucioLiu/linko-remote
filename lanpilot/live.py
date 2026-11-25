@@ -5,6 +5,7 @@ never retransmitted. A short worker lease releases held keys on transport loss.
 """
 import base64
 import re
+import threading
 import time
 import uuid
 
@@ -23,6 +24,7 @@ MEDIA_FAILURES = {
     'first_frame_timeout': '被控端未及时传来首帧，可以重连或使用逐步操作',
     'frame_gap': '连续画面传输超时，已释放键鼠，请重新连接',
 }
+LIVE_WAIT_MS = 250
 
 
 def validate_events(events):
@@ -70,9 +72,37 @@ class LiveSessions:
 
     def prune(self,now):
         for k,s in list(self.sessions.items()):
-            if now-s['viewed']>12 or not self.allowed(s,now): self.sessions.pop(k)
+            if now-s['viewed']>12 or not self.allowed(s,now): self.remove(k)
         for k,s in list(self.media_failures.items()):
             if now>=s['expires'] or not self.allowed(s,now): self.media_failures.pop(k)
+
+    def remove(self, identifier):
+        self.sessions.pop(identifier)['changed'].notify_all()
+
+    def wait_for_update(self, op, body, result, wait_ms):
+        """Wait with no open SQLite transaction and release the hub lock."""
+        identifier = body['id']
+        session = self.sessions.get(identifier)
+        if session is None:
+            return None
+        if op == 'live-view':
+            if result['frame'] or result['error'] or result['ack'] != body.get('after_ack', 0):
+                return None
+        elif not result['active'] or result['inputs']:
+            return None
+
+        def ready():
+            if identifier not in self.sessions or session['error']:
+                return True
+            if op == 'live-exchange':
+                return bool(session['queue'])
+            frame = session['frame']
+            fresh_frame = frame and frame['seq'] != body.get('after') and self.hub.clock() - session['frame_at'] < 2
+            return session['ack'] != result['ack'] or bool(fresh_frame)
+
+        started = time.monotonic()
+        session['changed'].wait_for(ready, timeout=wait_ms / 1000)
+        return time.monotonic() - started
 
     def dispatch(self,op,me,body,now):
         self.prune(now)
@@ -88,6 +118,7 @@ class LiveSessions:
             if len(self.sessions)>=32: raise ValueError('连接服务繁忙，请稍候')
             identifier=uuid.uuid4().hex
             s.update(id=identifier,viewed=now,frame=None,frame_at=0,next=1,ack=0,queue=[],inflight=[],error='',agent_seen=now)
+            s['changed'] = threading.Condition(self.hub.lock)
             self.sessions[identifier]=s
             return {'id':identifier}
         if op == 'live-agent-state':
@@ -106,12 +137,14 @@ class LiveSessions:
                     self.media_failures.pop(next(iter(self.media_failures)))
                 self.media_failures[identifier]={'caller':s['caller'],'target':s['target'],'ack':s['ack'],
                                                  'error':MEDIA_FAILURES[reason],'expires':now+12}
-            self.sessions.pop(identifier)
+            self.remove(identifier)
             return {'closed':True}
         if op == 'live-view':
             if me != s['caller']: raise PermissionError('无权查看此桌面')
             s['viewed']=now
-            if s['inflight'] and now-s['inflight'][0]['claimed']>3: s['error']='键鼠回执超时，已暂停输入，请结束连接后重连'
+            if not s['error'] and s['inflight'] and now-s['inflight'][0]['claimed']>3:
+                s['error']='键鼠回执超时，已暂停输入，请结束连接后重连'
+                s['changed'].notify_all()
             age=now-s['frame_at']
             frame=s['frame'] if age<2 else None
             unchanged=frame is not None and frame['seq']==body.get('after')
@@ -128,6 +161,7 @@ class LiveSessions:
             if len(s['queue'])+len(s['inflight'])>=8: raise ValueError('网络拥堵，请暂停操作')
             s['queue'].append({'seq':seq,'events':events,'geometry':f['geometry'],'expires':now+2})
             s['next']+=1
+            s['changed'].notify_all()
             return {'accepted':seq}
         if op == 'live-frame':
             if me != s['target']: raise PermissionError('无权发送此桌面')
@@ -136,13 +170,16 @@ class LiveSessions:
         if op == 'live-exchange':
             if me != s['target']: raise PermissionError('无权发送此桌面')
             s['agent_seen']=now
-            if body.get('error'): s['error']=str(body['error'])[:180]
             ack=body.get('ack',0)
             if type(ack) is not int or ack<s['ack'] or ack>=s['next']: raise ValueError('无效键鼠回执')
             if ack>s['ack']:
                 claimed={q['seq'] for q in s['inflight']}
                 if any(i not in claimed for i in range(s['ack']+1,ack+1)): raise ValueError('回执未对应已交付输入')
                 s['ack']=ack;s['inflight']=[q for q in s['inflight'] if q['seq']>ack]
+                s['changed'].notify_all()
+            if body.get('error'):
+                s['error']=str(body['error'])[:180]
+                s['changed'].notify_all()
             f=body.get('frame')
             if f is not None:
                 self.frame(s, f, now)
@@ -173,3 +210,4 @@ class LiveSessions:
         if not raw.startswith(b'\xff\xd8') or not raw.endswith(b'\xff\xd9'): raise ValueError('无效画面格式')
         if not s['frame'] or f['seq']>s['frame']['seq']:
             s['frame']={'seq':f['seq'],'geometry':f['geometry'],'jpeg_base64':encoded};s['frame_at']=now
+            s['changed'].notify_all()

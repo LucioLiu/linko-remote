@@ -62,9 +62,10 @@ function Invoke-LiveDesktop {
    Remove-Item -LiteralPath $claimed
   }
   if($script:liveTimer.ElapsedMilliseconds -ge 120){
+   # Pace from the start of each capture so encoding and publishing count toward the interval.
+   $script:liveTimer.Restart()
    $jpeg=[RemoteDesktop]::LiveCapture();$script:liveSeq++
    Write-LiveJson 'live-frame.json' @{id=$script:liveId;seq=$script:liveSeq;geometry=$geometry;created=([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()/1000.0);jpeg_base64=[Convert]::ToBase64String($jpeg)}
-   $script:liveTimer.Restart()
   }
  }catch{Stop-LiveSession $_.Exception.Message}
 }

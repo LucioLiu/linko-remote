@@ -2,8 +2,11 @@ import base64
 from pathlib import Path
 import secrets
 import tempfile
+import threading
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 from lanpilot.peer_hub import PeerHub
 from lanpilot.live import validate_events
 
@@ -91,6 +94,44 @@ class LiveTests(unittest.TestCase):
    with self.assertRaises(ValueError):validate_events(e)
   ident=self.open()
   with self.assertRaises(ValueError):self.call('live-exchange',self.b,id=ident,frame={'seq':1,'geometry':'0,0,1,1','jpeg_base64':'x'*1_400_001})
+ def with_waiting_request(self, operation, token, ident, body, change):
+  condition=self.hub.live.sessions[ident]['changed']
+  waiting=threading.Event()
+  wait=condition.wait
+  def signal_wait(timeout):
+   self.assertFalse(self.hub.db.in_transaction)
+   waiting.set()
+   return wait(timeout)
+  with ThreadPoolExecutor(max_workers=1) as worker, patch.object(condition,'wait',signal_wait):
+   request=worker.submit(self.call,operation,token,id=ident,wait_ms=250,**body)
+   self.assertTrue(waiting.wait(1),'Request did not wait for a desktop update')
+   change()
+   return request.result(timeout=1)
+ def test_view_wait_wakes_on_new_frame_and_ack_with_transaction_released(self):
+  ident=self.open();self.frame(ident)
+  view=self.with_waiting_request('live-view',self.a,ident,{'after':1},lambda:self.frame(ident,2))
+  self.assertEqual(2,view['frame']['seq']);self.assertIn('waited_ms',view)
+  self.call('live-input',self.a,id=ident,seq=1,geometry='0,0,1920,1080',events=[{'type':'release'}])
+  self.call('live-exchange',self.b,id=ident,ack=0)
+  view=self.with_waiting_request('live-view',self.a,ident,{'after':2,'after_ack':0},
+                                 lambda:self.call('live-exchange',self.b,id=ident,ack=1))
+  self.assertEqual(1,view['ack']);self.assertTrue(view['unchanged'])
+ def test_exchange_wait_delivers_ordered_pending_input(self):
+  ident=self.open();self.frame(ident)
+  exchange=self.with_waiting_request('live-exchange',self.b,ident,{'ack':0},
+   lambda:self.call('live-input',self.a,id=ident,seq=1,geometry='0,0,1920,1080',events=[{'type':'release'}]))
+  self.assertEqual([1],[batch['seq'] for batch in exchange['inputs']]);self.assertGreater(exchange['lease_ms'],0)
+  self.assertEqual(1,self.call('live-exchange',self.b,id=ident,ack=0)['inputs'][0]['seq'])
+ def test_waiting_view_checks_authorization_again_before_return(self):
+  ident=self.open();self.frame(ident)
+  with self.assertRaises(PermissionError):
+   self.with_waiting_request('live-view',self.a,ident,{'after':1},
+                             lambda:self.call('disconnect',self.b,peer=self.ids[self.a]))
+ def test_waiting_exchange_checks_authorization_again_before_return(self):
+  ident=self.open();self.frame(ident)
+  with self.assertRaises(PermissionError):
+   self.with_waiting_request('live-exchange',self.b,ident,{'ack':0},
+                             lambda:self.call('availability',self.b,enabled=False))
  def test_lost_read_only_poll_can_expire_but_input_cannot_be_falsely_cancelled(self):
   for action in ['observe','click']:
    ident=uuid.uuid4().hex;request={'action':action}
@@ -129,13 +170,16 @@ class DurableLiveAcceptanceTests(unittest.TestCase):
    def call(self,operation,body=None):
     if operation=='live-agent-state':return {'sessions':[{'id':ident}]}
     if operation=='live-exchange':
+     self.first_exchange=body
      client.incoming=False
      client.stop_event.set()
      return {'active':True,'lease_ms':2500,'inputs':[]}
     return {'closed':True}
-  agent=LiveAgent(client,lambda *_:Hub(),lambda _,value:writes.append(value))
+  control=Hub()
+  agent=LiveAgent(client,lambda *_:control,lambda _,value:writes.append(value))
   agent.read=lambda _:{}
   agent.run()
+  self.assertNotIn('wait_ms',control.first_exchange)
   self.assertEqual([{'id':ident,'expires':0}],writes)
 
  def test_first_frame_has_more_time_without_extending_the_active_frame_gap(self):
