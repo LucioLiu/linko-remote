@@ -148,6 +148,10 @@ class LiveSessions:
             age=now-s['frame_at']
             frame=s['frame'] if age<2 else None
             unchanged=frame is not None and frame['seq']==body.get('after')
+            after = body.get('after')
+            if (frame and not unchanged and body.get('accept_repeat') is True and
+                    type(after) is int and s['same_since'] <= after < frame['seq']):
+                frame = {'seq': frame['seq'], 'geometry': frame['geometry'], 'repeat_after': after}
             return {'id':s['id'],'frame':None if unchanged else frame,'unchanged':unchanged,
                     'ack':s['ack'],'error':s['error'],'frame_age_ms':round(age*1000)}
         if op == 'live-input':
@@ -209,5 +213,8 @@ class LiveSessions:
         raw=base64.b64decode(encoded,validate=True)
         if not raw.startswith(b'\xff\xd8') or not raw.endswith(b'\xff\xd9'): raise ValueError('无效画面格式')
         if not s['frame'] or f['seq']>s['frame']['seq']:
+            previous = s['frame']
+            if not previous or previous['geometry'] != f['geometry'] or previous['jpeg_base64'] != encoded:
+                s['same_since'] = f['seq']
             s['frame']={'seq':f['seq'],'geometry':f['geometry'],'jpeg_base64':encoded};s['frame_at']=now
             s['changed'].notify_all()

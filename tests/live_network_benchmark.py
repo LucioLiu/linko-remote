@@ -43,7 +43,7 @@ class DelayedHub(PinnedHub):
 
     def transfer_time(self, data):
         if self.options.mbps and data and data.get('frame'):
-            return len(data['frame']['jpeg_base64']) * 8 / (self.options.mbps * 1_000_000)
+            return len(data['frame'].get('jpeg_base64', '')) * 8 / (self.options.mbps * 1_000_000)
         return 0
 
     def call(self, operation, body=None):
@@ -138,8 +138,10 @@ def benchmark(gateway, endpoint, workspace, options):
             if not quiet.is_set() and now >= next_capture:
                 frame += 1
                 captured[frame] = (now, ack)
+                payload = encoded if options.repeat_image else base64.b64encode(
+                    image[:2] + frame.to_bytes(8, 'big') + image[10:]).decode()
                 atomic_json(workspace / 'live-frame.json', {'id': identifier, 'seq': frame,
-                            'geometry': GEOMETRY, 'created': time.time(), 'jpeg_base64': encoded})
+                            'geometry': GEOMETRY, 'created': time.time(), 'jpeg_base64': payload})
                 next_capture += CAPTURE_PERIOD
                 if next_capture <= now:
                     next_capture = now + CAPTURE_PERIOD
@@ -223,6 +225,7 @@ def benchmark(gateway, endpoint, workspace, options):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--repeat-image', action='store_true', help='Use identical image bytes for each capture')
     parser.add_argument('--rtt-ms', type=float, default=100)
     parser.add_argument('--jitter-ms', type=float, default=0)
     parser.add_argument('--mbps', type=float, default=0, help='Artificial frame bandwidth, or 0 for unlimited')

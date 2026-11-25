@@ -55,3 +55,29 @@ PYTHONPATH="$baseline_dir" python3 tests/live_network_benchmark.py --rtt-ms 100
 1. **Windows 原生视频。** 做 DXGI Desktop Duplication 到低延迟 H.264 的独立试验，与 GDI/JPEG 在同一台机器对照。优先验证办公小字、显卡编解码是否可用、锁屏后恢复和显示器切换。Mac 用 VideoToolbox 比较接收成本。原始帧排队保留最新，发生编码帧依赖中断时请求关键帧。先验证 720p 20 帧/秒和 1080p 30 帧/秒两个档位，再据实确定默认值。 [Windows DXGI](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/desktop-dup-api) · [Media Foundation 低延迟](https://learn.microsoft.com/en-us/windows/win32/medfound/codecapi-avlowlatencymode) · [VideoToolbox](https://developer.apple.com/documentation/videotoolbox/decompression-properties)
 2. **跨网直连。** 固定编码器比较现有 TLS 路线和 WebRTC ICE 直连／TURN。配对和授权提供会话身份，直连失败时仍可走中继。视频拥塞时降低画质或帧率，点击和键鼠边沿保持可靠、有序和可确认。 [WebRTC 统计定义](https://www.w3.org/TR/webrtc-stats/) · [Chrome Remote Desktop 网络指南](https://support.google.com/chrome/a/answer/16364503?hl=en)
 3. **跨网文件。** 先用已配置的 OpenSSH 测 SFTP 收发体验，通用设备传输单独授权和选择接收目录。候选实现提供分块、断点续传、完成校验和限速。在传输暂停、续传和目标同名文件场景验证，并记录并发时的键鼠 P95。逻辑通道共享拥塞窗口时仍需限制传输速率。 [Syncthing 块交换协议](https://docs.syncthing.net/specs/bep-v1.html) · [WebRTC 数据通道标准](https://www.rfc-editor.org/rfc/rfc8831.html)
+
+## 2026-11-25 家庭 Mac 到公司 Windows 公网实测
+
+两端位于不同网络。用户确认 UU 的「联想」与邻控的「华为（宁朋芝交接）」为同一台机器。邻控统一版的这台 Windows 在线，Yoga 在邻控与 UU 的设备列表都显示离线。各次连续桌面会话依次运行，关闭后再开始下一次。采样只记录单调时钟、帧序号、负载大小及计数，不写入屏幕图像。
+
+| Mac 侧接收端 | 采样时长 | 有效新帧 | 从请求连接到第一帧 | 相邻新帧间隔中位数 |
+| --- | ---: | ---: | ---: | ---: |
+| 已安装的 0.8.2-preview.9 | 30 秒 | 22 | 6.48 秒 | 1.013 秒 |
+| 1e82039 接收端，现网中继和公司端 | 30 秒 | 24 | 5.23 秒 | 1.041 秒 |
+| 1e82039 接收端，重复采样 | 30 秒 | 23 | 7.01 秒 | 1.018 秒 |
+
+首帧和间隔统计到 Mac 接收缓存，未计屏幕显示。未安排持续运动场景。第一次额外检查鼠标回执时，12 秒内没有观察到缓存年龄小于 500 ms 的画面。另一次会话在缓存年龄小于 1000 ms 时分别发起五次只移动鼠标的操作。Mac 从提交到看到 Windows 执行回执分别为 3755、1450、1819、3408、2748 ms，五次中位数 2748 ms。未测到按键发出至屏幕像素变化。
+
+重复采样中，有图请求耗时中位数 603 ms，空请求 299 ms；一次图像 Base64 负载中位数 82636 字节。现网中继未返回长轮询等待字段。取消旧中继轮询的额外 60 ms 间隔，单轮帧间隔中位数为 1065 ms，P95 为 1990 ms，未保留该调整。另一次 20 秒采样中，14 次带完整图像的返回有 13 次与上一张字节完全相同，完整图像负载中位数 82576 字节。
+
+新候选中继和接收端在采集序号更新且像素编码与几何信息完全相同时，传递新序号并复用上一帧图像。画面过期仍按实际采集更新状态处理。客户端落后且期间内容有变化时，或旧版未声明支持复用时，返回完整 JPEG。此改动优化中继到 Mac 的一段，下行节省量取决于桌面内容；公司端上传、滚动视频编码和公网往返时间还需分别验证。
+
+可使用以下命令对已配对、在线且允许访问的设备复测。输出的重复整帧计数只统计收到的完整图像。
+
+```sh
+PYTHONPATH=. python3 tests/live_wan_benchmark.py <已配对设备ID> --seconds 30
+```
+
+UU 4.39.1 在同一条路线两次接受连接请求，约 1.8 秒和 1.45 秒后活动连接均为空，未取得首帧或会话统计。不能据此给 UU 与邻控排出速度名次。公开参考中，Nate Randa 用相机同拍主从两屏，测得有线环境下 Parsec、Sunshine/Moonlight、RustDesk 和 AnyDesk 的平均画面时差依次为 13.5、32.6、45.9 和 67.7 ms；60 Hz 两屏约有一帧读数误差。该指标不同于上表的连续更新间隔。[测试原文和原始图表](https://www.nateranda.com/blog/desktop-server/)
+
+固定重复图像、每端到中继 RTT 100 ms、每段限速 5 Mbps、96 KiB 原始帧的本地 TLS 对照中，以 1e82039 为基线，采集至 Mac 缓存 P50 从 645 ms 降到 419 ms，P95 从 758 ms 降到 556 ms。两版各采样 5 秒，均收到 14 帧（2.8 fps）。该项只验证重复画面的接收耗时。新实现还用每帧内容都变的负载完成了相同测试。

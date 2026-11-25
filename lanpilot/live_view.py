@@ -20,6 +20,12 @@ class LiveView:
         now=time.monotonic()
         with self.changed:
             previous=self.value.get('frame');frame=value.get('frame')
+            if frame and 'repeat_after' in frame:
+                if (not previous or previous['seq'] != frame['repeat_after'] or
+                        previous['geometry'] != frame['geometry']):
+                    raise ValueError('重复画面缺少对应的上一帧')
+                frame = dict(previous, seq=frame['seq'])
+                value = dict(value, frame=frame)
             if value.get('unchanged'):
                 value=dict(value,frame=previous)
             if frame and (not previous or previous['seq']!=frame['seq']):
@@ -43,7 +49,7 @@ class LiveView:
                 frame=self.value.get('frame')
                 started=time.monotonic()
                 value=self.hub.call('live-view',{'id':self.id,'after':frame['seq'] if frame else None,
-                                                 'after_ack':self.value['ack'],'wait_ms':LIVE_WAIT_MS})
+                                                 'after_ack':self.value['ack'],'wait_ms':LIVE_WAIT_MS,'accept_repeat':True})
                 # The relay reports age at send time, after its frame wait.
                 transit = max(0, time.monotonic()-started-value.get('waited_ms', 0)/1000)
                 self.publish(value,transit)

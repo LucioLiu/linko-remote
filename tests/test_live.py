@@ -38,6 +38,24 @@ class LiveTests(unittest.TestCase):
   same=self.call('live-view',self.a,id=ident,after=2)
   self.assertTrue(same['unchanged']);self.assertIsNone(same['frame'])
   self.now+=2.1;self.assertIsNone(self.call('live-view',self.a,id=ident)['frame'])
+ def test_repeat_frames_require_matching_history_and_opt_in(self):
+  from lanpilot.live_view import LiveView
+  ident=self.open();self.frame(ident)
+  view=LiveView(None,ident,threading.Event())
+  first=self.call('live-view',self.a,id=ident)
+  view.publish(first); self.frame(ident,2); self.frame(ident,3)
+  delta=self.call('live-view',self.a,id=ident,after=1,accept_repeat=True)
+  self.assertEqual({'geometry':'0,0,1920,1080','seq':3,'repeat_after':1},delta['frame'])
+  view.publish(delta)
+  self.assertEqual(first['frame']['jpeg_base64'],view.value['frame']['jpeg_base64'])
+  self.assertEqual(3,view.snapshot()['frame']['seq'])
+  self.assertIn('jpeg_base64',self.call('live-view',self.a,id=ident,after=1)['frame'])
+  changed=dict(first['frame'],seq=4,jpeg_base64=base64.b64encode(b'\xff\xd8changed\xff\xd9').decode())
+  self.call('live-frame',self.b,id=ident,frame=changed);self.frame(ident,5)
+  full=self.call('live-view',self.a,id=ident,after=3,accept_repeat=True)
+  self.assertIn('jpeg_base64',full['frame'])
+  self.now+=2.1
+  self.assertIsNone(self.call('live-view',self.a,id=ident,after=3,accept_repeat=True)['frame'])
  def test_independent_frame_channel_cannot_deliver_input_or_renew_viewer_lease(self):
   ident=self.open()
   frame={'seq':1,'geometry':'0,0,1920,1080','jpeg_base64':base64.b64encode(b'\xff\xd8frame\xff\xd9').decode()}
