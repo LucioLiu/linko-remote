@@ -143,6 +143,27 @@ class Desktop {
     HGDIOBJ previous_ = nullptr;
     void* pixels_ = nullptr;
 
+    void draw_cursor() {
+        CURSORINFO cursor{};
+        cursor.cbSize = sizeof(cursor);
+        if (!GetCursorInfo(&cursor) || cursor.flags != CURSOR_SHOWING) return;
+        ICONINFO icon{};
+        if (!GetIconInfo(cursor.hCursor, &icon)) return;
+        BITMAP bitmap{};
+        const bool measured = GetObjectW(icon.hbmColor ? icon.hbmColor : icon.hbmMask,
+                                          sizeof(bitmap), &bitmap) == sizeof(bitmap);
+        if (measured) {
+            const int cursor_height = icon.hbmColor ? bitmap.bmHeight : bitmap.bmHeight / 2;
+            const int x = cursor.ptScreenPos.x - bounds.x - static_cast<int>(icon.xHotspot);
+            const int y = cursor.ptScreenPos.y - bounds.y - static_cast<int>(icon.yHotspot);
+            DrawIconEx(memory_, MulDiv(x, width, bounds.width), MulDiv(y, height, bounds.height),
+                       cursor.hCursor, std::max(1, MulDiv(bitmap.bmWidth, width, bounds.width)),
+                       std::max(1, MulDiv(cursor_height, height, bounds.height)), 0, nullptr, DI_NORMAL);
+        }
+        if (icon.hbmColor) DeleteObject(icon.hbmColor);
+        if (icon.hbmMask) DeleteObject(icon.hbmMask);
+    }
+
 public:
     Bounds bounds{};
     unsigned width = 0, height = 0;
@@ -186,7 +207,9 @@ public:
         check(bounds == desktop_bounds(), "virtual desktop changed");
         session.check_lease();
         check(StretchBlt(memory_, 0, 0, int(width), int(height), screen_, bounds.x, bounds.y,
-                         bounds.width, bounds.height, SRCCOPY | CAPTUREBLT) && GdiFlush(), "desktop capture");
+                         bounds.width, bounds.height, SRCCOPY | CAPTUREBLT), "desktop capture");
+        draw_cursor();
+        check(GdiFlush(), "flush capture");
         check_desktop();
         check(bounds == desktop_bounds(), "virtual desktop changed");
         session.check_lease();
