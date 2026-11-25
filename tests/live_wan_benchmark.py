@@ -115,7 +115,10 @@ def measure(peer, seconds, stream=False):
             view.thread.join(timeout=2)
     calls = list(media.calls)
     sizes = [size for _, size, _ in calls if size]
-    return {'seconds': round(end-opened, 2), 'open_ms': round((opened-start)*1000),
+    elapsed = end - opened
+    return {'seconds': round(elapsed, 2), 'completed_window': elapsed >= seconds and not error,
+            'distinct_updates_per_second': round(view.content_changes / elapsed, 2),
+            'open_ms': round((opened-start)*1000),
             'first_frame_ms': round((arrivals[0]-start)*1000) if arrivals else None,
             'visible_frames': len(arrivals), 'error': error,
             'stream_requested': stream, 'stream_advertised': session.get('view_stream') == 1,
