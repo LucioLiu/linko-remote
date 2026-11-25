@@ -144,7 +144,8 @@ class PeerHub:
                     if operation == 'live-exchange':
                         # The initial call already committed the prior receipt and frame.
                         body = {'id': body['id'], 'ack': body.get('ack', 0),
-                                'accept_avc_batch': body.get('accept_avc_batch')}
+                                'accept_avc_batch': body.get('accept_avc_batch'),
+                                'accept_avc_upload': body.get('accept_avc_upload')}
                     result = self._dispatch_committed(operation, credential, body, source)
                 result['waited_ms'] = round((waited or 0) * 1000)
             work = self.live.prepare_view(body, result) if operation == 'live-view' else None

@@ -64,3 +64,37 @@ python3 -m unittest discover -s tests -p 'test_live_stream.py'
 ```
 
 新对照使用同一份 720p、20fps AVC 片段和正常的 LiveAgent 上传及 TLS 中继。合成采集按固定时钟写入邮箱，两组分别使用旧的单文件和协商后的 8 槽邮箱。发送端到中继的 RTT 为 0、100 或 200ms，观看端直连本地中继。每轮在相同位置跳过两个采集序号，恢复时间从首个跳过的序号计到下一次有效到帧。片段每秒有一个 IDR。回归测试另验证提交未获 ACK、邮箱覆盖、输入回执及按需请求 IDR。到帧延迟测到观看端解析记录，Windows 实机采集和屏幕显示耗时需要另测。
+
+## 有界 AVC 上传与点击场景
+
+新 Windows 发送端和中继通过原控制交换协商上传流。TLS 握手与首轮控制交换并行，取得租约后才发送 HTTP 上传请求。已获得该会话发送权限的设备通过固定证书指纹 TLS 上传，每个 HTTP 块只含一个 AVC 帧。中继逐帧发布并重新核对授权、观看期限和发送端控制租约。原控制连接继续处理键鼠、回执和进度，上传本身不续租。
+
+发送窗口最多 24 帧或 4 MiB 编码载荷，取帧时丢弃已等待 250 ms 的帧。丢帧后等待 IDR。进度卡住 1.25 秒、连接中断、协商不可用时，发送端关闭流、请求新 IDR 并回到原批传。中继在批传接手或控制端停止协商后封住旧流，旧中继照常协商批传或逐帧 AVC。现有 JPEG 回退仍适用。
+
+Windows 原生队列仍为 8 帧或 4 MiB，编码器沿用单个采集位图和现有 Media Foundation 缓冲。磁盘及 Python 读取缓存最多各 8 个 mailbox，单槽最多一个约 2.67 MiB 的 Base64 记录。上传窗口只保留序号、计时和字节数，不另存帧。中继每会话 AVC 历史上限 64 帧或 4 MiB，每条连接按有界单帧大小读取，最多 12 条上传流并存。接收端沿用一个画布，WebCodecs 最多保留 8 个待解码帧的元数据，每个输出 VideoFrame 绘制后立即关闭。Mac 硬解互操作可用以下命令验证。实机显存峰值和长时内存曲线需在 Windows、Mac 实机采样。
+
+复跑时用同一 Python 环境安装本目录的 `requirements.txt`，从候选工作树执行。
+
+```sh
+baseline_dir=$(mktemp -d)
+git archive 0703f5e | tar -x -C "$baseline_dir"
+cp tests/video_stream/batch_avc_tls.py tests/video_stream/input_avc_tls.py "$baseline_dir/tests/video_stream/"
+python "$baseline_dir/tests/video_stream/batch_avc_tls.py" --rtts 100 200 --modes batch
+python tests/video_stream/batch_avc_tls.py --rtts 100 200 --modes stream
+
+python "$baseline_dir/tests/video_stream/batch_avc_tls.py" --input --repeats 1 --rtts 100 200 --modes batch
+python tests/video_stream/batch_avc_tls.py --input --repeats 1 --rtts 100 200 --modes stream
+python tests/video_stream/native_interop.py
+```
+
+- 传输对照使用原来的 720p 20 fps 滚动源、300 个预编码访问单元和 1 秒 IDR 间隔，两组都故意漏掉第 145、146 帧。每个 RTT 和模式各三轮，每轮 15 秒。延迟只加在 Windows 发送端与中继之间，查看端走本机回环 TLS。帧年龄从生成对应源帧到查看端收到该帧的回调，使用共用单调时钟。帧率分母为固定 15 秒窗口，另在排空后统计丢帧。
+- 点击对照单独运行。测试用实际 `live-input`、`live-exchange` 和 Windows worker 文件信箱协议，把点击送到独立运行的合成桌面逻辑。合成桌面应用点击并写执行回执，随后把更新后的状态绘制进编码源帧的一组像素。以查看端发出点击前为起点，分别记录提交响应、桌面应用、查看端收到执行回执，以及收到 AVC 并解码出对应像素标记的时刻。最后一个边界止于解码结果，显示器绘制、刷新和物理键鼠需另行采样。丢帧恢复期间的点击也在样本内，逐条保留回执和像素结果。
+
+| 发送端 RTT | 收帧率中位数 | 帧年龄 P95 的三轮中位数 | 点击到执行回执 P95 | 点击到解码对应像素 P95 |
+| --- | ---: | ---: | ---: | ---: |
+| 100 ms | 18.87 → 18.87 fps | 172 → 73 ms | 281 → 189 ms | 374 → 206 ms |
+| 200 ms | 18.80 → 18.80 fps | 307 → 124 ms | 467 → 280 ms | 657 → 282 ms |
+
+箭头从 `0703f5e` 实际代码重跑的批传指向候选上传流。原始滚动源与此前批传实验有相同的 AVC 载荷 SHA-256。收帧对照的十二轮均从第 161 帧恢复，每轮经排空确认缺失 16 帧，包含故意省略的两帧。点击对照在 100 ms RTT 匹配了批传 29 次、上传流 35 次，在 200 ms RTT 匹配了批传 20 次、上传流 28 次。每次均收到回执且解码得到对应像素。Mac 原生互操作使用 VideoToolbox 硬解，通过完整序列 65 帧及注入丢帧后的 44 帧像素哈希核对。
+
+[逐轮结果与每次点击的计时](bounded_avc_tls_results.json) · [此前逐帧和批传的原始对照](batch_avc_tls_results.json)

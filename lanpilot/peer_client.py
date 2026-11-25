@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import secrets
 import shlex
 import shutil
@@ -220,6 +221,56 @@ class LiveStream:
             self.connection.close()
 
 
+class AvcUpload:
+    """One pinned HTTPS request; progress travels on the input exchange."""
+
+    def __init__(self, host, port, pin, credential, identifier):
+        self.connection = PinnedConnection(host, port, pin)
+        self.connection.timeout = 1.25
+        self.credential = credential
+        self.identifier = identifier
+
+    def connect(self):
+        if self.connection.sock is None:
+            self.connection.connect()
+
+    def open(self):
+        self.connect()
+        connection = self.connection
+        connection.sock.settimeout(.25)
+        connection.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        connection.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 128 * 1024)
+        connection.putrequest('POST', '/v2/live-avc-upload', skip_accept_encoding=True)
+        connection.putheader('Authorization', 'Bearer ' + self.credential)
+        connection.putheader('X-Live-Session', self.identifier)
+        connection.putheader('Content-Type', 'application/json')
+        connection.putheader('Transfer-Encoding', 'chunked')
+        connection.putheader('Connection', 'close')
+        connection.endheaders()
+
+    def send(self, record):
+        sock = self.connection.sock
+        # A response before we finish the request means rejection or closure.
+        if sock.pending() or select.select([sock], [], [], 0)[0]:
+            # TLS 1.3 post-handshake messages also make the socket readable.
+            # Consume them without waiting or treating them as HTTP responses.
+            with_timeout = sock.gettimeout()
+            sock.setblocking(False)
+            try:
+                sock.recv(1)
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                pass
+            else:
+                raise OSError('AVC upload closed')
+            finally:
+                sock.settimeout(with_timeout)
+        raw = json.dumps(record, separators=(',', ':')).encode('ascii')
+        self.connection.send(f'{len(raw):x}\r\n'.encode('ascii') + raw + b'\r\n')
+
+    def close(self):
+        self.connection.close()
+
+
 class PinnedHub:
     def __init__(self, endpoint, credential):
         parsed = urlsplit(endpoint['url'])
@@ -236,6 +287,9 @@ class PinnedHub:
     def live_stream(self, identifier, *, accept_avc=False):
         return LiveStream(self.host, self.port, self.pin, self.credential, identifier,
                           accept_avc=accept_avc)
+
+    def avc_upload(self, identifier):
+        return AvcUpload(self.host, self.port, self.pin, self.credential, identifier)
 
     def call(self, operation, body=None):
         # Read-only recovery may use a fresh connection after a relay closes an

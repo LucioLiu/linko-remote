@@ -45,6 +45,9 @@ AVC_MAX_HISTORY_FRAMES = 64
 AVC_BATCH_FRAMES = 8
 AVC_BATCH_BYTES = 4 * 1024 * 1024  # Encoded access units
 AVC_BATCH_BODY_MAX = AVC_BATCH_BYTES + 2048
+AVC_UPLOAD_WINDOW_FRAMES = 24
+AVC_UPLOAD_PROGRESS_TIMEOUT = 1.25
+AVC_UPLOAD_MAX_QUEUE_AGE_MS = 250
 AVC_MAX_CAPTURE_AGE_MS = 1500
 AVC_FRAME_TTL = 2
 AVC_START_CODE = re.compile(rb'\x00\x00\x01')
@@ -129,6 +132,10 @@ class LiveSessions:
         requested = body.get('accept_avc_batch')
         if options.get('live_avc') == 1 and type(requested) is int and requested == 1:
             options['avc_batch'] = 1
+            stream = body.get('accept_avc_upload')
+            if type(stream) is int and stream == 1 and not session.get('upload_retired'):
+                options.update(avc_upload=1, upload_seen=session.get('upload_seen', 0),
+                               upload_seq=session.get('upload_seq', 0))
         return options
 
     def wait_for_update(self, op, body, result, wait_ms):
@@ -226,7 +233,10 @@ class LiveSessions:
             if isinstance(frame, dict) and 'avc_base64' in frame:
                 if 'avc' not in s:
                     raise ValueError('未协商 AVC 连续画面')
-                accepted = self.avc_frame(s, frame, now) if active and s['avc'] is not None else None
+                accepted = None
+                if active and s['avc'] is not None:
+                    accepted = self.avc_frame(s, frame, now)
+                    s['upload_retired'] = True
             else:
                 accepted = (self.frame(s, frame, now, allow_repeat=True)
                             if active or s.get('avc') is None else None)
@@ -249,6 +259,7 @@ class LiveSessions:
                 sequences = [entry[0]['seq'] for entry in decoded]
                 if any(right <= left for left, right in zip(sequences, sequences[1:])):
                     raise ValueError('AVC 批次序号无效')
+                s['upload_retired'] = True
                 for entry in decoded:
                     accepted = s['avc'].add_decoded(entry, now)
                 s['changed'].notify_all()
@@ -284,7 +295,12 @@ class LiveSessions:
             s['queue']=[]
             if s['error']: inputs=[]
             remaining=max(0,int((s['viewed']+8-now)*1000))
-            return {'inputs':inputs if remaining else [],'active':not bool(s['error']) and remaining>0,'lease_ms':min(2500,remaining), **self.sender_media_options(s, body)}
+            options = self.sender_media_options(s, body)
+            if options.get('avc_upload') and not s['error'] and remaining:
+                s['upload_until'] = now + min(2500, remaining) / 1000
+            elif 'upload_until' in s:
+                s['upload_retired'] = True
+            return {'inputs':inputs if remaining else [],'active':not bool(s['error']) and remaining>0,'lease_ms':min(2500,remaining), **options}
         raise ValueError('无效连续桌面请求')
 
     def view(self, session, now, after, accept_repeat):
@@ -300,6 +316,41 @@ class LiveSessions:
             frame = {'seq': frame['seq'], 'geometry': frame['geometry'], 'repeat_after': after}
         return {'id': session['id'], 'frame': None if unchanged else frame, 'unchanged': unchanged,
                 'ack': session['ack'], 'error': session['error'], 'frame_age_ms': round(age * 1000)}
+
+    def check_upload(self, session, now):
+        if (self.sessions.get(session['id']) is not session or session.get('avc') is None
+                or session.get('upload_retired') or session['error']
+                or now >= session.get('upload_until', 0) or now - session['viewed'] >= 8
+                or not self.allowed(session, now)):
+            raise PermissionError('AVC 上传租约已失效')
+
+    def begin_upload(self, credential, identifier):
+        with self.hub.lock:
+            sender = self.hub._device(credential)['id']
+            session = self.sessions.get(identifier)
+            if not session or session['target'] != sender or session.get('upload_open'):
+                raise PermissionError('无法开启 AVC 上传')
+            self.check_upload(session, self.hub.clock())
+            session['upload_open'] = True
+            return session
+
+    def upload_record(self, session, record):
+        decoded = decode_avc_record(record)
+        with self.hub.lock:
+            now = self.hub.clock()
+            self.check_upload(session, now)
+            seq = decoded[0]['seq']
+            if seq <= session.get('upload_seen', 0):
+                raise ValueError('AVC 上传序号无效')
+            session['upload_seen'] = seq
+            if session['avc'].add_decoded(decoded, now) is not None:
+                session['upload_seq'] = seq
+                session['changed'].notify_all()
+
+    def end_upload(self, session):
+        with self.hub.lock:
+            # A reconnect must use the legacy path and start with a fresh IDR.
+            session['upload_retired'] = True
 
     def begin_stream(self, credential, identifier, accept_avc):
         if not isinstance(identifier, str) or not re.fullmatch('[a-f0-9]{32}', identifier):

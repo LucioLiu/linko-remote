@@ -91,7 +91,7 @@ function Invoke-LiveAvc($Control,[string]$Geometry){
      return $true
     }
     try{
-     # The negotiated uploader can collect across its previous batch's ACK.
+     # Preserve ordered captures while the uploader sends or waits for progress.
      # Keep a bounded ring. An overwritten slot becomes a detectable sequence gap.
      $mailbox='live-frame.json'
      if($Control.avc_batch -eq 1){$mailbox='live-avc-'+($frame.Sequence % $script:liveAvcSlots)+'.json'}

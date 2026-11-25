@@ -48,7 +48,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         operations = {'register', 'name', 'availability', 'code', 'connect', 'access',
                       'approve', 'disconnect', 'state', 'poll', 'submit', 'result', 'recover',
                       'live-open', 'live-close', 'live-view', 'live-input', 'live-exchange', 'live-agent-state', 'live-frame',
-                      'live-stream', 'live-avc-batch'}
+                      'live-stream', 'live-avc-batch', 'live-avc-upload'}
         operation = self.path[4:] if self.path.startswith('/v2/') else ''
         if operation not in operations:
             self.close_connection = True
@@ -57,6 +57,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if len(authorization) != 1 or not re.fullmatch('Bearer [A-Za-z0-9_-]{40,90}', authorization[0]):
             self.close_connection = True
             return self.answer(401, {'ok': False, 'error': '身份验证失败'})
+        if operation == 'live-avc-upload':
+            return self.upload_avc(authorization[0][7:])
         maximum = {'result': 24_000_000, 'live-exchange': 1_500_000,
                    'live-frame': LIVE_AVC_STREAM_RECORD_MAX, 'live-avc-batch': AVC_BATCH_BODY_MAX}.get(operation, 16000)
         lengths = self.headers.get_all('Content-Length', [])
@@ -99,6 +101,68 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if operation == 'submit':
                 print('Submit rejected:', type(error).__name__, str(error)[:150], file=sys.stderr, flush=True)
             return self.answer(400, {'ok': False, 'error': '请求无效或上一操作尚未确认'})
+
+    def upload_avc(self, credential):
+        self.close_connection = True
+        ids = self.headers.get_all('X-Live-Session', [])
+        if (len(ids) != 1 or not re.fullmatch('[a-f0-9]{32}', ids[0])
+                or self.headers.get_all('Transfer-Encoding') != ['chunked']
+                or self.headers.get_all('Content-Length') is not None):
+            return self.answer(400, {'ok': False, 'error': '请求无效'})
+        if not self.server.upload_capacity.acquire(blocking=False):
+            return self.answer(503, {'ok': False, 'error': '连续画面上传繁忙'})
+        live = self.server.hub.live
+        session = None
+        try:
+            session = live.begin_upload(credential, ids[0])
+            while True:
+                started = time.monotonic()
+                # Read bounded HTTP chunks, one AVC record per chunk. Apply
+                # an absolute deadline even when a peer keeps trickling bytes.
+                header = bytearray()
+                while len(header) < 10 and not header.endswith(b'\n'):
+                    remaining = started + 1.0 - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('AVC upload header timed out')
+                    self.connection.settimeout(remaining)
+                    part = self.rfile.read1(1)
+                    if not part:
+                        break
+                    header.extend(part)
+                if not header:
+                    return
+                if not re.fullmatch(rb'[0-9a-f]{1,6}\r\n', header):
+                    raise ValueError('Invalid AVC chunk header')
+                size = int(header, 16)
+                if size > LIVE_AVC_STREAM_RECORD_MAX:
+                    raise ValueError('Invalid AVC chunk size')
+                received_at = time.monotonic()
+                deadline = started + 1.25
+                raw = bytearray()
+                while len(raw) < size + 2:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('AVC upload record timed out')
+                    self.connection.settimeout(remaining)
+                    part = self.rfile.read1(min(64 * 1024, size + 2 - len(raw)))
+                    if not part:
+                        return
+                    raw.extend(part)
+                if not raw.endswith(b'\r\n'):
+                    raise ValueError('Invalid AVC chunk ending')
+                if not size:
+                    return self.answer(200, {'ok': True, 'value': {}})
+                record = json.loads(raw[:-2])
+                self.age_avc(record, received_at)
+                live.upload_record(session, record)
+        except PermissionError as error:
+            return self.answer(403, {'ok': False, 'error': str(error)})
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return self.answer(400, {'ok': False, 'error': '无效 AVC 上传'})
+        finally:
+            if session is not None:
+                live.end_upload(session)
+            self.server.upload_capacity.release()
 
     @staticmethod
     def age_avc(frame, received_at):
@@ -180,6 +244,7 @@ class PeerGateway(http.server.ThreadingHTTPServer):
         self.context.load_cert_chain(str(cert), str(key))
         self.capacity = threading.BoundedSemaphore(64)
         self.stream_capacity = threading.BoundedSemaphore(24)
+        self.upload_capacity = threading.BoundedSemaphore(12)
         super().__init__((bind, port), Handler)
 
     def process_request(self, request, address):

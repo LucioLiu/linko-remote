@@ -46,6 +46,9 @@ def avc_upload(seq, unit, *, age=0, flags=None, limit=None, tick=None):
 class RecordingHandler(Handler):
     def do_POST(self):
         self.server.paths.append(self.path)
+        if self.path == '/v2/live-avc-upload' and self.server.reject_upload:
+            self.close_connection = True
+            return self.answer(503, {'ok': False, 'error': 'Upload unavailable'})
         if self.path == '/v2/live-stream' and self.server.reject_stream:
             self.close_connection = True
             return self.answer(404, {'ok': False, 'error': 'Not found'})
@@ -54,10 +57,18 @@ class RecordingHandler(Handler):
     def answer(self, status, value):
         if self.path == '/v2/live-open' and self.server.legacy and value.get('ok'):
             value['value'].pop('view_stream')
+        if not self.server.stream_upload and value.get('ok'):
+            value['value'].pop('avc_upload', None)
+            for session in value['value'].get('sessions', []):
+                session.pop('avc_upload', None)
         if self.server.legacy_upload and value.get('ok'):
             value['value'].pop('avc_batch', None)
             for session in value['value'].get('sessions', []):
                 session.pop('avc_batch', None)
+        if (self.path == '/v2/live-exchange' and self.server.hold_progress
+                and value.get('value', {}).get('upload_seen')):
+            self.server.progress_blocked.set()
+            self.server.release_progress.wait(3)
         if self.path == '/v2/live-avc-batch' and self.server.hold_upload:
             self.server.upload_committed.set()
             self.server.release_upload.wait(3)
@@ -96,6 +107,11 @@ class LiveStreamTLSTests(unittest.TestCase):
         self.home = home
         self.relay.legacy = False
         self.relay.legacy_upload = False
+        self.relay.stream_upload = False
+        self.relay.reject_upload = False
+        self.relay.hold_progress = False
+        self.relay.progress_blocked = threading.Event()
+        self.relay.release_progress = threading.Event()
         self.relay.hold_upload = False
         self.relay.lose_upload_ack = False
         self.relay.upload_committed = threading.Event()
@@ -362,6 +378,7 @@ class LiveStreamTLSTests(unittest.TestCase):
             self.addCleanup(worker.join, 4)
         self.addCleanup(client.stop_event.set)
         self.addCleanup(self.relay.release_upload.set)
+        self.addCleanup(self.relay.release_progress.set)
         self.wait_for(lambda: agent.read('live-control.json').get('live_avc') == 1)
 
         def capture(seq, unit, *, batch=True):
@@ -375,6 +392,145 @@ class LiveStreamTLSTests(unittest.TestCase):
             return record
 
         return agent, capture
+
+    def test_stream_sender_continues_in_order_without_progress_reply(self):
+        self.relay.stream_upload = self.relay.hold_progress = True
+        identifier = self.open_avc()
+        _, response = self.avc_stream(identifier)
+        agent, capture = self.start_windows_upload(identifier)
+        self.assertTrue(agent.avc_stream)
+        capture(1, 0)
+        self.assertEqual(1, self.read_update(response)['frame']['seq'])
+        self.assertTrue(self.relay.progress_blocked.wait(1))
+        for seq in range(2, 5):
+            capture(seq, 1)
+        self.assertEqual([2, 3, 4], [self.read_update(response)['frame']['seq'] for _ in range(3)])
+        self.assertEqual(0, agent.avc_seq)
+        self.assertEqual(1, self.relay.paths.count('/v2/live-avc-upload'))
+        self.assertNotIn('/v2/live-avc-batch', self.relay.paths)
+        self.relay.release_progress.set()
+        self.wait_for(lambda: agent.avc_seq == 4)
+        self.assertFalse(agent.avc_pending)
+        self.sender.call('availability', {'enabled': False})
+        self.assertTrue(self.read_update(response)['error'])
+        self.wait_for(lambda: agent.read('live-control.json').get('expires') == 0)
+
+    def test_stream_rejection_falls_back_to_batch_with_fresh_idr(self):
+        self.relay.stream_upload = self.relay.reject_upload = True
+        identifier = self.open_avc()
+        _, response = self.avc_stream(identifier)
+        agent, capture = self.start_windows_upload(identifier)
+        capture(1, 0)
+        self.wait_for(lambda: agent.read('live-control.json').get('avc_key', 0) >= 1)
+        self.assertFalse(agent.avc_stream)
+        capture(3, 1)
+        self.wait_for(lambda: agent.avc_seen == 3)
+        capture(4, 2)
+        frame = self.read_update(response)['frame']
+        self.assertEqual((4, True), (frame['seq'], frame['idr']))
+        self.assertIn('/v2/live-avc-batch', self.relay.paths)
+
+    def test_upload_endpoint_checks_sender_and_control_lease(self):
+        now = 1000
+        self.relay.hub.clock = lambda: now
+        self.relay.stream_upload = True
+        identifier = self.open_avc()
+        lease = {'id': identifier, 'accept_avc_batch': 1, 'accept_avc_upload': 1}
+        premature = self.sender.avc_upload(identifier)
+        self.addCleanup(premature.close)
+        premature.open()
+        self.assertEqual(403, premature.connection.getresponse().status)
+
+        self.sender.call('live-exchange', lease)
+        foreign = self.controller.avc_upload(identifier)
+        self.addCleanup(foreign.close)
+        foreign.open()
+        self.assertEqual(403, foreign.connection.getresponse().status)
+
+        sender = self.sender.avc_upload(identifier)
+        self.addCleanup(sender.close)
+        sender.open()
+        sender.send(avc_upload(1, 0))
+        session = self.relay.hub.live.sessions[identifier]
+        self.wait_for(lambda: session.get('upload_seq') == 1)
+        duplicate = self.sender.avc_upload(identifier)
+        self.addCleanup(duplicate.close)
+        duplicate.open()
+        self.assertEqual(403, duplicate.connection.getresponse().status)
+
+        now += 2.5
+        sender.send(avc_upload(2, 1))
+        self.assertEqual(403, sender.connection.getresponse().status)
+        self.assertEqual(1, session['upload_seq'])
+        self.assertEqual(1, session['upload_seen'])
+
+    def test_legacy_batch_fences_an_open_upload_stream(self):
+        self.relay.stream_upload = True
+        identifier = self.open_avc()
+        self.sender.call('live-exchange', {'id': identifier, 'accept_avc_batch': 1, 'accept_avc_upload': 1})
+        sender = self.sender.avc_upload(identifier)
+        self.addCleanup(sender.close)
+        sender.open()
+        sender.send(avc_upload(1, 0))
+        session = self.relay.hub.live.sessions[identifier]
+        self.wait_for(lambda: session.get('upload_seq') == 1)
+        self.assertEqual(3, self.sender.call(
+            'live-avc-batch', {'id': identifier, 'frames': [avc_upload(3, 2)]})['frame_seq'])
+        sender.send(avc_upload(4, 3))
+        with sender.connection.getresponse() as response:
+            self.assertEqual(403, response.status)
+        self.assertEqual(3, session['avc'].last_seq)
+
+    def test_upload_stream_rejects_non_avc_records(self):
+        self.relay.stream_upload = True
+        identifier = self.open_avc()
+        self.sender.call('live-exchange', {'id': identifier, 'accept_avc_batch': 1, 'accept_avc_upload': 1})
+        sender = self.sender.avc_upload(identifier)
+        self.addCleanup(sender.close)
+        sender.open()
+        sender.send({'geometry': AVC_GEOMETRY, 'seq': 1, 'jpeg_base64': '/9j/2Q=='})
+        with sender.connection.getresponse() as response:
+            self.assertEqual(400, response.status)
+        session = self.relay.hub.live.sessions[identifier]
+        self.assertEqual(0, session['avc'].last_seq)
+        self.wait_for(lambda: session.get('upload_retired'))
+
+    def test_stream_limits_pending_frames_bytes_and_age(self):
+        agent = LiveAgent(SimpleNamespace(config={'endpoint': self.endpoint, 'credential': self.sender.credential},
+                                         incoming=True, stop_event=threading.Event(),
+                                         agent=SimpleNamespace(workspace=self.home)), PinnedHub, atomic_json)
+        agent.current = 'session'
+        agent.avc_active = agent.avc_stream = True
+        agent.avc_lease = time.monotonic() + 3
+        sent = []
+        upload = SimpleNamespace(send=sent.append)
+        def frame(seq, size=1, age=0, idr=False):
+            return {'seq': seq, 'avc_base64': 'a' * size, 'capture_tick': 1000 - age, 'idr': idr}
+
+        with patch('lanpilot.live_agent.windows_tick_ms', return_value=1000):
+            agent.read_avc_mailbox = lambda _: [frame(1, AVC_MAX_PAYLOAD * 4 // 3, idr=True),
+                                                 frame(2, AVC_MAX_PAYLOAD)]
+            agent.send_avc_stream('session', upload)
+            self.assertEqual(1, len(sent))
+            self.assertEqual(1, agent.avc_seen)
+
+            agent.update_avc_stream('session', {'avc_upload': 1, 'upload_seen': 1, 'upload_seq': 1})
+            agent.read_avc_mailbox = lambda _: [frame(seq) for seq in range(2, 32)]
+            agent.send_avc_stream('session', upload)
+            self.assertEqual(24, len(agent.avc_pending))
+            self.assertEqual(25, len(sent))
+            agent.update_avc_stream('session', {'avc_upload': 1, 'upload_seen': 25, 'upload_seq': 25})
+            agent.read_avc_mailbox = lambda _: [frame(26, age=300), frame(27), frame(28, idr=True)]
+            agent.send_avc_stream('session', upload)
+            self.assertEqual(28, agent.avc_sent)
+            self.assertEqual(26, len(sent))
+            self.assertEqual(1, agent.avc_key)
+            agent.read_avc_mailbox = lambda _: []
+            elapsed = agent.avc_pending[0][1] + 2
+            with patch('lanpilot.live_agent.time.monotonic', return_value=elapsed):
+                agent.send_avc_stream('session', upload)
+            self.assertFalse(agent.avc_stream)
+            self.assertFalse(agent.avc_pending)
 
     def test_windows_batch_mailbox_pressure_lost_ack_and_receipts_over_tls(self):
         identifier = self.open_avc()

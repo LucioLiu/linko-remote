@@ -1,4 +1,4 @@
-"""Compare product serial and batch upload with a fixed-cadence Windows mailbox fixture."""
+"""Compare product AVC upload modes using a fixed-cadence synthetic Windows mailbox."""
 
 import argparse
 from collections import Counter
@@ -38,7 +38,7 @@ def close_hub(hub):
         hub.connection.close()
 
 
-def trial(home, cert, key, pin, records, rtt, mode, seconds):
+def trial(home, cert, key, pin, records, rtt, mode, seconds, input_desktop=False):
     uploads = []
     captures, arrivals = {}, {}
     condition = threading.Condition()
@@ -58,6 +58,11 @@ def trial(home, cert, key, pin, records, rtt, mode, seconds):
 
     class RelayHandler(Handler):
         def answer(self, status, response):
+            if mode != 'stream' and response.get('ok'):
+                value = response['value']
+                value.pop('avc_upload', None)
+                for session in value.get('sessions', []):
+                    session.pop('avc_upload', None)
             if mode == 'serial' and response.get('ok'):
                 value = response['value']
                 value.pop('avc_batch', None)
@@ -96,6 +101,11 @@ def trial(home, cert, key, pin, records, rtt, mode, seconds):
         identifier = viewer.call('live-open', {'peer': target, 'accept_avc': 1})['id']
         stream = viewer.live_stream(identifier, accept_avc=True)
 
+        desktop = None
+        if input_desktop:
+            from input_avc_tls import InputDesktop
+            desktop = InputDesktop(viewer, agent, identifier, AVC_HEADER, atomic_json)
+
         after = None
 
         def publish(value, _):
@@ -104,12 +114,14 @@ def trial(home, cert, key, pin, records, rtt, mode, seconds):
             if value['error']:
                 raise RuntimeError(value['error'])
             frame = value['frame']
+            if desktop:
+                desktop.publish(frame, value['ack'])
             if not frame:
                 if not value.get('unchanged'):
                     after = None
                 return
             seq = frame['seq']
-            if (frame['avc_base64'] != records[seq - 1] or frame['geometry'] != '0,0,1280,720'
+            if ((not desktop and frame['avc_base64'] != records[seq - 1]) or frame['geometry'] != '0,0,1280,720'
                     or (not frame['idr'] and (after is None or seq != after + 1))):
                 raise ValueError(f'Invalid arrival at frame {seq}')
             with condition:
@@ -147,25 +159,35 @@ def trial(home, cert, key, pin, records, rtt, mode, seconds):
                 raise RuntimeError(f'AVC lease did not start: {agent.error}')
             time.sleep(.01)
         batch = control.get('avc_batch') == 1
-        if batch != (mode == 'batch'):
+        if batch != (mode != 'serial') or getattr(agent, 'avc_stream', False) != (mode == 'stream'):
             raise RuntimeError('Unexpected upload negotiation')
 
         start = time.monotonic()
+        end = start + seconds
+        if desktop:
+            clicks = threading.Thread(target=desktop.clicks, args=(end, errors), daemon=True)
+            clicks.start()
+            workers.append(clicks)
         fault = (seconds // 2) * FPS + 5
         for seq, record in enumerate(records, 1):
             due = start + (seq - 1) / FPS
             time.sleep(max(0, due - time.monotonic()))
             captured = time.monotonic()
             captures[seq] = captured
+            if desktop:
+                record = desktop.capture(seq, captured)
             if seq in (fault, fault + 1):
                 continue
             mailbox = f'live-avc-{seq % AVC_BATCH_FRAMES}.json' if batch else 'live-frame.json'
             atomic_json(home / mailbox, {'id': identifier, 'seq': seq, 'avc_base64': record,
                                         'capture_tick': int(captured * 1000), 'idr': (seq - 1) % GOP == 0})
-        end = start + seconds
+        if desktop:
+            clicks.join(2)
         with condition:
             condition.wait_for(lambda: len(records) in arrivals or errors, timeout=.8)
             observed = dict(arrivals)
+        if mode == 'stream' and (not agent.avc_stream or uploads):
+            raise RuntimeError('Candidate fell back during the measured window')
         if errors or agent.error:
             raise RuntimeError(f'Viewer {errors}, sender {agent.error}')
         if not observed:
@@ -175,6 +197,7 @@ def trial(home, cert, key, pin, records, rtt, mode, seconds):
         recovered = min((seq for seq in observed if seq > fault + 1), default=None)
         missing = len(captures.keys() - observed.keys())
         return {
+            **(desktop.results() if desktop else {}),
             'mode': mode, 'sender_rtt_ms': rtt, 'received_in_window': in_window,
             'arrival_fps': round(in_window / seconds, 3), 'received_unique': len(observed),
             'arrival_latency_p95_ms': p95_ms([arrived - captures[seq] for seq, arrived in observed.items()]),
@@ -191,10 +214,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seconds', type=int, default=15)
     parser.add_argument('--repeats', type=int, default=3)
+    parser.add_argument('--rtts', nargs='+', type=int, default=RTTS)
+    parser.add_argument('--modes', nargs='+', choices=('serial', 'batch', 'stream'), default=('serial', 'batch'))
+    parser.add_argument('--input', action='store_true', help='Encode a synthetic desktop that responds to real protocol clicks')
     args = parser.parse_args()
     if args.seconds < 4 or args.repeats < 1:
         parser.error('Use at least 4 seconds and 1 repeat')
-    records, fixture = preencode(FPS * args.seconds, AVC_HEADER)
+    if args.input:
+        records = [None] * (FPS * args.seconds)
+        fixture = {'frames': len(records), 'source': 'Scrolling text with a click-driven pixel marker'}
+    else:
+        records, fixture = preencode(FPS * args.seconds, AVC_HEADER)
     with tempfile.TemporaryDirectory(prefix='lanpilot-batch-avc-') as temp:
         home = Path(temp)
         cert, key = home / 'cert.pem', home / 'key.pem'
@@ -204,21 +234,27 @@ def main():
         pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text('ascii'))).hexdigest()
         trials = []
         for repeat in range(args.repeats):
-            order = RTTS[repeat % len(RTTS):] + RTTS[:repeat % len(RTTS)]
+            order = args.rtts[repeat % len(args.rtts):] + args.rtts[:repeat % len(args.rtts)]
             for index, rtt in enumerate(order):
-                modes = ('serial', 'batch') if (repeat + index) % 2 == 0 else ('batch', 'serial')
+                modes = args.modes if (repeat + index) % 2 == 0 else reversed(args.modes)
                 for mode in modes:
                     print(f'Trial {repeat + 1}/{args.repeats}, {rtt} ms, {mode}', file=sys.stderr, flush=True)
-                    result = trial(home / f'{repeat}-{rtt}-{mode}', cert, key, pin, records, rtt, mode, args.seconds)
+                    result = trial(home / f'{repeat}-{rtt}-{mode}', cert, key, pin, records, rtt, mode, args.seconds, args.input)
                     trials.append({'repeat': repeat + 1, **result})
         print(json.dumps({
             'platform': platform.platform(), 'python': platform.python_version(),
             'seconds_per_trial': args.seconds, 'fixture': fixture, 'fps': FPS, 'gop_frames': GOP,
             'measurement': {
                 'transport': 'Pinned TLS with sender-only symmetric byte delay from serial_avc_tls; viewer direct loopback',
-                'source': 'Same preencoded moving frames, 20 fps independent of ACK, through product LiveAgent file mailbox',
+                **({'input': 'Monotonic before live-input POST to queued response, synthetic target applying the '
+                             'mailbox click, execution receipt at viewer, and first decoded frame with matching pixel '
+                             'marker. Receipt and pixels are independently timed. No display presentation.'}
+                   if args.input else {}),
+                'source': ('Click-responsive synthetic desktop encoded at run time' if args.input
+                           else 'Same preencoded moving frames, 20 fps independent of ACK, through product LiveAgent file mailbox'),
                 'serial': 'Legacy sender negotiation, with one latest-frame mailbox',
                 'batch': 'Negotiated bounded mailbox ring and AVC batch uploads',
+                'stream': 'Same mailbox ring and one pinned request with independently reported progress',
                 'loss': 'Absent source sequences after drain. Exactly two source slots omitted midway in each trial',
                 'recovery': 'First arrival after the injected gap, measured from first omitted capture slot. '
                             'Fixture uses scheduled IDRs rather than synthesizing one when the sender requests it',

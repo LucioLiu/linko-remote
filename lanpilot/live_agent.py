@@ -1,4 +1,5 @@
 """Continuous desktop pump. A stalled network expires the native input lease."""
+from collections import deque
 import json
 import os
 import http.client
@@ -6,7 +7,9 @@ import sys
 import threading
 import time
 
-from .live import AVC_BATCH_BYTES, AVC_BATCH_FRAMES, AVC_MAX_ENCODED, LIVE_WAIT_MS
+from .live import (AVC_BATCH_BYTES, AVC_BATCH_FRAMES, AVC_MAX_ENCODED,
+                   AVC_UPLOAD_MAX_QUEUE_AGE_MS, AVC_UPLOAD_PROGRESS_TIMEOUT,
+                   AVC_UPLOAD_WINDOW_FRAMES, LIVE_WAIT_MS)
 
 FIRST_FRAME_TIMEOUT = 15
 FRAME_GAP_TIMEOUT = 8
@@ -38,6 +41,10 @@ class LiveAgent:
     def reset_avc(self):
         self.avc_active = False
         self.avc_batch = False
+        self.avc_stream = False
+        self.avc_sent = 0
+        self.avc_idr_sent = 0
+        self.avc_pending = deque()
         self.avc_mailbox = {}
         self.avc_seen = 0
         self.avc_seq = 0
@@ -67,32 +74,128 @@ class LiveAgent:
         threading.Thread(target=self.frames,daemon=True).start()
 
     def frames(self):
-        # The input lease and receipts run on their own connection. The
-        # Windows mailbox collects new captures while this thread sends media.
-        while not self.client.stop_event.is_set():
-            ident = self.current
-            delay = .06
-            started = time.monotonic()
-            try:
-                if ident:
-                    if self.avc_batch:
+        # Control and media use separate connections. Only this thread owns
+        # the socket, including during fallback and session replacement.
+        upload = None
+        opened = False
+        try:
+            while not self.client.stop_event.is_set():
+                delay = .06
+                started = time.monotonic()
+                with self.lock:
+                    ident = self.current
+                    wants_upload = ident and self.avc_stream
+                    leased = self.avc_active and started < self.avc_lease
+                    if wants_upload and (not self.client.incoming or (self.avc_active and not leased)):
+                        self.fallback_avc_stream(ident)
+                        wants_upload = False
+                try:
+                    if upload and (not wants_upload or upload.identifier != ident):
+                        upload.close()
+                        upload = None
+                        opened = False
+                    if wants_upload:
+                        delay = .01
+                        try:
+                            if upload is None:
+                                upload = self.frame_hub.avc_upload(ident)
+                                # Overlap TLS with the first control exchange.
+                                # HTTP authorization and media wait for its lease.
+                                upload.connect()
+                            if leased:
+                                if not opened:
+                                    upload.open()
+                                    opened = True
+                                self.send_avc_stream(ident, upload)
+                        except PermissionError:
+                            raise
+                        except (OSError, http.client.HTTPException):
+                            self.fallback_avc_stream(ident)
+                    elif ident and self.avc_batch:
                         delay = .01
                         self.upload_avc(ident, self.read_avc_mailbox(ident))
-                    frame = self.read('live-frame.json')
-                    if frame.get('id') == ident:
-                        if 'avc_base64' in frame and not self.avc_batch:
-                            delay = .02
-                            self.upload_avc(ident, [frame])
-                        elif ('jpeg_base64' in frame and frame['seq'] > self.last_frame and
-                              time.time() - frame.get('created', 0) < 1):
-                            self.upload_frame(ident, frame)
-            except PermissionError as error:
-                self.end(ident, error)
-            except (OSError, http.client.HTTPException):
-                pass
-            except Exception as error:
-                self.end(ident, error)
-            self.client.stop_event.wait(max(.005, delay - (time.monotonic() - started)))
+                    if ident:
+                        frame = self.read('live-frame.json')
+                        if frame.get('id') == ident:
+                            if 'avc_base64' in frame and not self.avc_batch:
+                                delay = .02
+                                self.upload_avc(ident, [frame])
+                            elif ('jpeg_base64' in frame and frame['seq'] > self.last_frame and
+                                  time.time() - frame.get('created', 0) < 1):
+                                self.upload_frame(ident, frame)
+                except PermissionError as error:
+                    self.end(ident, error)
+                except (OSError, http.client.HTTPException):
+                    pass
+                except Exception as error:
+                    self.end(ident, error)
+                self.client.stop_event.wait(max(.005, delay - (time.monotonic() - started)))
+        finally:
+            if upload:
+                upload.close()
+
+    def fallback_avc_stream(self, ident):
+        with self.lock:
+            if self.current == ident and self.avc_stream:
+                self.avc_stream = False
+                self.avc_pending.clear()
+                self.request_avc_key()
+
+    def send_avc_stream(self, ident, upload):
+        with self.lock:
+            if (self.avc_pending and
+                    time.monotonic() - self.avc_pending[0][1] >= AVC_UPLOAD_PROGRESS_TIMEOUT):
+                self.fallback_avc_stream(ident)
+                return
+        frames = self.read_avc_mailbox(ident)
+        for frame in frames:
+            with self.lock:
+                now = time.monotonic()
+                if (self.current != ident or not self.avc_active or not self.avc_stream
+                        or not self.client.incoming or self.client.stop_event.is_set()
+                        or now >= self.avc_lease):
+                    return
+                pending = self.avc_pending
+                if pending and now - pending[0][1] >= AVC_UPLOAD_PROGRESS_TIMEOUT:
+                    self.fallback_avc_stream(ident)
+                    return
+                seq = frame['seq']
+                size = len(frame['avc_base64'])
+                if (len(pending) >= AVC_UPLOAD_WINDOW_FRAMES or
+                        sum(item[2] for item in pending) + size > AVC_BATCH_BYTES):
+                    return
+                self.avc_seen = seq
+                age = windows_tick_ms() - frame['capture_tick']
+                if not 0 <= age < AVC_UPLOAD_MAX_QUEUE_AGE_MS:
+                    self.request_avc_key()
+                    continue
+                if frame['idr']:
+                    self.avc_waiting_key = False
+                    self.avc_idr_sent = seq
+                elif self.avc_waiting_key or not self.avc_sent or seq != self.avc_sent + 1:
+                    self.request_avc_key()
+                    continue
+                self.avc_sent = seq
+                # Reserve before sending because progress may arrive on the
+                # control channel before this thread next acquires the lock.
+                pending.append((seq, now, size))
+            upload.send({'avc_base64': frame['avc_base64'], 'capture_age_ms': age})
+
+    def update_avc_stream(self, ident, value):
+        if not self.avc_stream:
+            return
+        if value.get('avc_upload') != 1:
+            self.fallback_avc_stream(ident)
+            return
+        seen = value.get('upload_seen', 0)
+        accepted = value.get('upload_seq', 0)
+        if self.avc_seq < accepted <= self.avc_sent:
+            self.avc_seq = accepted
+            self.media_at = time.monotonic()
+        while self.avc_pending and self.avc_pending[0][0] <= seen:
+            self.avc_pending.popleft()
+        if seen and seen >= self.avc_idr_sent and value.get('need_idr'):
+            self.request_avc_key()
 
     def read_avc_mailbox(self, ident):
         slots = self.avc_mailbox
@@ -190,7 +293,8 @@ class LiveAgent:
             if self.current != ident:
                 return
             # The worker has switched codecs for the rest of this session.
-            self.avc_active = self.avc_batch = False
+            self.avc_active = self.avc_batch = self.avc_stream = False
+            self.avc_pending.clear()
             base = self.upload_base
             # A lost response leaves the relay's current base uncertain.
             self.upload_base = None
@@ -249,6 +353,8 @@ class LiveAgent:
                     sessions = [{'id': self.current}]
                 else:
                     options = {'accept_avc_batch': 1} if self.avc_enabled else {}
+                    if self.avc_enabled and hasattr(self.frame_hub, 'avc_upload'):
+                        options['accept_avc_upload'] = 1
                     sessions = self.hub.call('live-agent-state', options)['sessions']
                 if not sessions:
                     self.client.stop_event.wait(.3);continue
@@ -258,8 +364,10 @@ class LiveAgent:
                     starting = self.current!=ident
                     if starting:
                         self.expire();self.media_at=time.monotonic();self.current=ident
+                        self.avc_stream = sessions[0].get('avc_upload') == 1
                     if self.avc_active and time.monotonic() - self.media_at > AVC_FALLBACK_TIMEOUT:
-                        self.avc_active = self.avc_batch = False
+                        self.avc_active = self.avc_batch = self.avc_stream = False
+                        self.avc_pending.clear()
                     has_frame = self.last_frame or self.avc_seq
                     frame_timeout = FRAME_GAP_TIMEOUT if has_frame else FIRST_FRAME_TIMEOUT
                     timed_out = time.monotonic() - self.media_at > frame_timeout
@@ -273,6 +381,8 @@ class LiveAgent:
                 body={'id':ident,'ack':receipt.get('seq',0) if receipt.get('id')==ident else 0}
                 if (starting and sessions[0].get('avc_batch') == 1) or self.avc_batch:
                     body['accept_avc_batch'] = 1
+                if (starting and sessions[0].get('avc_upload') == 1) or self.avc_stream:
+                    body['accept_avc_upload'] = 1
                 # The native worker needs its first lease before it can capture.
                 if not starting: body['wait_ms']=LIVE_WAIT_MS
                 if receipt.get('id')==ident and receipt.get('error'): body['error']=receipt['error']
@@ -289,6 +399,7 @@ class LiveAgent:
                         self.avc_batch = sessions[0].get('avc_batch') == 1
                     self.avc_active = self.avc_active and value.get('live_avc') == 1
                     self.avc_batch = self.avc_active and self.avc_batch and value.get('avc_batch') == 1
+                    self.update_avc_stream(ident, value)
                     control = {'id': ident, 'expires': time.time() + lease}
                     if self.avc_active:
                         self.avc_lease = time.monotonic() + lease
