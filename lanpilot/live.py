@@ -32,6 +32,10 @@ MEDIA_FAILURES = {
 }
 LIVE_WAIT_MS = 250
 LIVE_STREAM_SECONDS = 3
+AVC_VIEW_BATCH_SECONDS = .25
+AVC_VIEW_BATCH_BYTES = 64 * 1024
+AVC_VIEW_RESPONSE_TIMEOUT = 2.5
+AVC_VIEW_MAX_RELAY_AGE = .35
 LIVE_STREAM_RECORD_MAX = 1_510_000
 LIVE_STREAM_TYPE = 'application/x-ndjson'
 
@@ -55,6 +59,11 @@ AVC_START_CODE = re.compile(rb'\x00\x00\x01')
 
 def accepts_avc(body):
     version = body.get('accept_avc')
+    return type(version) is int and version == 1
+
+
+def accepts_bounded_view(body):
+    version = body.get('avc_view_batch')
     return type(version) is int and version == 1
 
 
@@ -183,7 +192,10 @@ class LiveSessions:
                     'SELECT 1 FROM live_avc_capabilities WHERE id=?', (target,))):
                 s['avc'] = AvcHistory()
             self.sessions[identifier]=s
-            return {'id':identifier, **self.media_options(s)}
+            result = {'id':identifier, **self.media_options(s)}
+            if s.get('avc') is not None and accepts_bounded_view(body):
+                result['avc_view_batch'] = 1
+            return result
         if op == 'live-agent-state':
             return {'sessions': [{'id': s['id'], **self.sender_media_options(s, body)}
                                  for s in self.sessions.values() if s['target'] == me]}
@@ -376,7 +388,7 @@ class LiveSessions:
             session['viewed'] = now
             return session
 
-    def stream_update(self, session, after, ack, wait):
+    def stream_update(self, session, after, ack, wait, *, bounded=False):
         with self.hub.lock:
             now = self.hub.clock()
             if self.sessions.get(session['id']) is not session or not self.allowed(session, now):
@@ -388,7 +400,7 @@ class LiveSessions:
             result = self.view(session, now, seq if not using_avc else None, True)
             if using_avc and not result['error']:
                 avc = session['avc']
-                frame, captured_at = avc.next_frame(seq, now)
+                frame, captured_at = (avc.fresh_frame(seq, now) if bounded else avc.next_frame(seq, now))
                 result.update(frame=frame, frame_age_ms=round((now - captured_at) * 1000) if frame else 0,
                               unchanged=frame is None and bool(avc.frames) and avc.frames[-1][0]['seq'] == seq)
             if result['frame'] or result['ack'] != ack or result['error']:
@@ -571,6 +583,24 @@ class AvcHistory:
         while self.size > AVC_MAX_HISTORY_BYTES or len(self.frames) > AVC_MAX_HISTORY_FRAMES:
             self.discard_first()
         return seq
+
+    def fresh_frame(self, after, now):
+        self.expire(now)
+        key = None
+        for frame, captured_at in reversed(self.frames):
+            if after is not None and frame['seq'] <= after:
+                break
+            if now - captured_at >= AVC_VIEW_MAX_RELAY_AGE:
+                continue
+            if after is not None and frame['seq'] == after + 1:
+                return frame, captured_at
+            if key is None and frame['idr']:
+                key = frame, captured_at
+        if key is not None:
+            return key
+        if not self.frames or self.frames[-1][0]['seq'] != after:
+            self.need_idr = True
+        return None, 0
 
     def next_frame(self, after, now):
         self.expire(now)

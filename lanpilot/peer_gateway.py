@@ -15,8 +15,9 @@ import threading
 import time
 from pathlib import Path
 
-from .live import (AVC_BATCH_BODY_MAX, AVC_BATCH_FRAMES, LIVE_AVC_STREAM_RECORD_MAX,
-                   LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE, accepts_avc)
+from .live import (AVC_BATCH_BODY_MAX, AVC_BATCH_FRAMES, AVC_VIEW_BATCH_BYTES,
+                   AVC_VIEW_BATCH_SECONDS, LIVE_AVC_STREAM_RECORD_MAX,
+                   LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE, accepts_avc, accepts_bounded_view)
 from .peer_hub import PeerHub
 
 
@@ -74,7 +75,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if operation == 'live-stream':
                 if not isinstance(body, dict):
                     raise ValueError('Invalid stream request')
-                return self.stream_live(authorization[0][7:], body.get('id'), body.get('after'), accepts_avc(body))
+                return self.stream_live(authorization[0][7:], body.get('id'), body.get('after'),
+                                        accepts_avc(body), bounded=accepts_bounded_view(body))
             if operation == 'live-frame' and isinstance(body, dict):
                 frame = body.get('frame')
                 if isinstance(frame, dict) and 'avc_base64' in frame:
@@ -171,13 +173,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Include wall time spent receiving and parsing the request body.
             frame['capture_age_ms'] += round((time.monotonic() - received_at) * 1000)
 
-    def stream_live(self, credential, identifier, confirmed, accept_avc):
+    def stream_live(self, credential, identifier, confirmed, accept_avc, *, bounded=False):
         if not self.server.stream_capacity.acquire(blocking=False):
             return self.answer(503, {'ok': False, 'error': '连续画面连接繁忙'})
         try:
             live = self.server.hub.live
             session = live.begin_stream(credential, identifier, accept_avc)
             timeout = self.connection.gettimeout()
+            bounded = bounded and accept_avc
             try:
                 # Bound a stalled write. The connection holds only a cursor.
                 self.connection.settimeout(.5)
@@ -195,7 +198,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                       and type(confirmed) is int and cursor[1][1] == confirmed) else None
                 self.stream_cursor = None
                 ack = None
-                deadline = started + LIVE_STREAM_SECONDS
+                deadline = started + (AVC_VIEW_BATCH_SECONDS if bounded else LIVE_STREAM_SECONDS)
+                sent_bytes = 0
                 heartbeat = time.monotonic() + .25
                 while (now := time.monotonic()) < deadline:
                     # The client sends no bytes until the batch ends. Readability
@@ -203,14 +207,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if self.connection.pending() or select.select([self.connection], [], [], 0)[0]:
                         self.close_connection = True
                         return
-                    value = live.stream_update(session, after, ack, min(.1, deadline - now))
+                    value = live.stream_update(session, after, ack, min(.1, deadline - now), bounded=bounded)
                     if value is None:
                         if now >= heartbeat:
                             self.stream_chunk(b'\n')
                             heartbeat = time.monotonic() + .25
                         continue
                     value['sent_ms'] = int((now - started) * 1000)
-                    self.stream_chunk(json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode() + b'\n')
+                    record = json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode() + b'\n'
+                    # An access unit is indivisible. A large first record gets its own batch.
+                    if bounded and sent_bytes and sent_bytes + len(record) > AVC_VIEW_BATCH_BYTES:
+                        break
+                    self.stream_chunk(record)
+                    if value['frame']:
+                        sent_bytes += len(record)
                     heartbeat = time.monotonic() + .25
                     if value['error']:
                         break
@@ -219,6 +229,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     elif not value.get('unchanged'):
                         after = None
                     ack = value['ack']
+                    if bounded and sent_bytes >= AVC_VIEW_BATCH_BYTES:
+                        break
                 self.wfile.write(b'0\r\n\r\n')
                 self.stream_cursor = (identifier, after)
             finally:

@@ -57,6 +57,8 @@ class RecordingHandler(Handler):
     def answer(self, status, value):
         if self.path == '/v2/live-open' and self.server.legacy and value.get('ok'):
             value['value'].pop('view_stream')
+        if self.path == '/v2/live-open' and self.server.legacy_view_batch and value.get('ok'):
+            value['value'].pop('avc_view_batch', None)
         if not self.server.stream_upload and value.get('ok'):
             value['value'].pop('avc_upload', None)
             for session in value['value'].get('sessions', []):
@@ -106,6 +108,7 @@ class LiveStreamTLSTests(unittest.TestCase):
         self.relay.records = []
         self.home = home
         self.relay.legacy = False
+        self.relay.legacy_view_batch = False
         self.relay.legacy_upload = False
         self.relay.stream_upload = False
         self.relay.reject_upload = False
@@ -289,13 +292,16 @@ class LiveStreamTLSTests(unittest.TestCase):
                          self.sender.call('live-agent-state')['sessions'][0])
         return session['id']
 
-    def avc_stream(self, identifier, *, connection=None, after=None, hub=None, accept_avc=1):
+    def avc_stream(self, identifier, *, connection=None, after=None, hub=None, accept_avc=1, bounded=False):
         hub = hub or self.controller
         if connection is None:
             connection = PinnedConnection(hub.host, hub.port, hub.pin)
             self.addCleanup(connection.close)
         headers = {'Authorization': 'Bearer ' + hub.credential, 'Content-Type': 'application/json'}
-        body = json.dumps({'id': identifier, 'after': after, 'accept_avc': accept_avc})
+        request = {'id': identifier, 'after': after, 'accept_avc': accept_avc}
+        if bounded:
+            request['avc_view_batch'] = 1
+        body = json.dumps(request)
         connection.request('POST', '/v2/live-stream', body, headers)
         response = connection.getresponse()
         self.addCleanup(response.close)
@@ -325,6 +331,46 @@ class LiveStreamTLSTests(unittest.TestCase):
         self.assertNotIn('live_avc', legacy)
         self.send(legacy['id'], 1)
         self.assertIn('jpeg_base64', self.controller.call('live-view', {'id': legacy['id']})['frame'])
+
+    def test_new_avc_viewer_uses_legacy_stream_without_bounded_capability(self):
+        self.relay.legacy_view_batch = True
+        self.sender.call('register', {'name': 'Windows', 'platform': 'windows',
+                                      'live_version': 1, 'live_avc': 1})
+        session = self.client.api('live-open', {'peer': self.target, 'viewer_transport': 'stream', 'accept_avc': 1})
+        self.assertNotIn('avc_view_batch', session)
+        self.upload_avc(session['id'], avc_upload(1, 0, age=500))
+        # The old stream still delivers an IDR older than the new relay-side selection limit.
+        self.wait_for(lambda: (self.client.live_view.snapshot()['frame'] or {}).get('seq') == 1)
+        self.assertIn('/v2/live-stream', self.relay.paths)
+        self.assertNotIn('/v2/live-view', self.relay.paths)
+
+    def test_bounded_view_renews_with_confirmed_cursor_and_requests_fresh_idr(self):
+        self.sender.call('register', {'name': 'Windows', 'platform': 'windows',
+                                      'live_version': 1, 'live_avc': 1})
+        session = self.controller.call('live-open', {'peer': self.target, 'accept_avc': 1, 'avc_view_batch': 1})
+        self.assertEqual(1, session['avc_view_batch'])
+        identifier = session['id']
+        self.upload_avc(identifier, avc_upload(1, 0, age=500))
+        _, forbidden = self.avc_stream(identifier, hub=self.sender, bounded=True)
+        self.assertEqual(403, forbidden.status)
+
+        connection, response = self.avc_stream(identifier, bounded=True)
+        with response:
+            updates = [json.loads(line) for line in response if line != b'\n']
+        self.assertTrue(updates)
+        self.assertTrue(all(value['frame'] is None for value in updates))
+        self.assertTrue(self.sender.call('live-exchange', {'id': identifier})['need_idr'])
+        self.upload_avc(identifier, avc_upload(2, 0))
+        self.upload_avc(identifier, avc_upload(3, 1))
+        with patch('lanpilot.peer_gateway.AVC_VIEW_BATCH_BYTES', 1):
+            for after, expected in ((None, 2), (2, 3)):
+                _, response = self.avc_stream(identifier, connection=connection, after=after, bounded=True)
+                with response:
+                    updates = [json.loads(line) for line in response if line != b'\n']
+                self.assertEqual([expected], [value['frame']['seq'] for value in updates if value['frame']])
+        self.sender.call('availability', {'enabled': False})
+        _, revoked = self.avc_stream(identifier, connection=connection, after=3, bounded=True)
+        self.assertEqual(403, revoked.status)
 
     def test_avc_preserves_native_bytes_and_resumes_only_on_idr_after_uplink_gap(self):
         identifier = self.open_avc()

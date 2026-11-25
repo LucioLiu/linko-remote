@@ -8,7 +8,7 @@ from .live_delta import DeltaError, decode_delta
 
 
 class LiveView:
-    def __init__(self, hub, identifier, stop_event, *, stream_version=None, avc=False):
+    def __init__(self, hub, identifier, stop_event, *, stream_version=None, avc=False, bounded=False):
         self.hub=hub;self.id=identifier;self.client_stop=stop_event
         self.stop=threading.Event();self.changed=threading.Condition()
         self.value={'id':identifier,'frame':None,'ack':0,'error':''}
@@ -17,6 +17,7 @@ class LiveView:
         self.stream_version = stream_version
         self.stream = None
         self.media_feed = avc
+        self.bounded = bounded
         self.jpeg_requested = threading.Event()
         self.media = deque()
         self.media_serial = 0
@@ -113,8 +114,13 @@ class LiveView:
         with self.changed:
             if not self.active():
                 return True
-            stream = self.stream = (factory(self.id, accept_avc=True)
-                                    if self.media_feed else factory(self.id))
+            if self.bounded:
+                stream = factory(self.id, accept_avc=True, bounded=True)
+            elif self.media_feed:
+                stream = factory(self.id, accept_avc=True)
+            else:
+                stream = factory(self.id)
+            self.stream = stream
         try:
             if self.media_feed:
                 return stream.run(lambda: self.active() and not self.jpeg_requested.is_set(),
@@ -129,6 +135,10 @@ class LiveView:
         try:
             if self.run_stream():
                 return
+            if self.bounded and self.active() and not self.jpeg_requested.is_set():
+                # A failed media response has no confirmed decoder cursor.
+                if self.run_stream():
+                    return
             while self.active():
                 frame = None if resync else self.value.get('frame')
                 started=time.monotonic()

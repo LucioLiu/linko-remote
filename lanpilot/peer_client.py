@@ -1,5 +1,6 @@
 """One cross-platform desktop client: both session initiator and desktop agent."""
 import base64
+from contextlib import ExitStack
 import hashlib
 import hmac
 import http.client
@@ -25,7 +26,8 @@ import uuid
 import webbrowser
 
 from desktop import make_request
-from .live import LIVE_AVC_STREAM_RECORD_MAX, LIVE_STREAM_RECORD_MAX, LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE
+from .live import (AVC_MAX_CAPTURE_AGE_MS, AVC_VIEW_RESPONSE_TIMEOUT, LIVE_AVC_STREAM_RECORD_MAX,
+                   LIVE_STREAM_RECORD_MAX, LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE, accepts_avc)
 from .peer_hub import DESKTOP_PLATFORMS, DESKTOP_UNAVAILABLE, READ_ONLY_TIMEOUTS, display_name
 from .version import VERSION
 from .updater import UpdateManager
@@ -134,11 +136,14 @@ class RelayIdentityError(PermissionError):
 
 
 class LiveStream:
-    def __init__(self, host, port, pin, credential, identifier, *, accept_avc=False):
+    def __init__(self, host, port, pin, credential, identifier, *, accept_avc=False, bounded=False):
         self.connection = PinnedConnection(host, port, pin)
         self.credential = credential
         self.identifier = identifier
         self.accept_avc = accept_avc
+        self.bounded = bounded
+        if bounded:
+            self.connection.timeout = AVC_VIEW_RESPONSE_TIMEOUT
 
     def abort(self):
         sock = self.connection.sock
@@ -155,16 +160,26 @@ class LiveStream:
         limit = LIVE_AVC_STREAM_RECORD_MAX if self.accept_avc else LIVE_STREAM_RECORD_MAX
         try:
             self.connection.connect()
-            self.connection.sock.settimeout(LIVE_STREAM_SECONDS + 2)
+            self.connection.sock.settimeout(AVC_VIEW_RESPONSE_TIMEOUT if self.bounded else LIVE_STREAM_SECONDS + 2)
             self.connection.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             while active():
                 request = {'id': self.identifier, 'after': after}
                 if self.accept_avc:
                     request['accept_avc'] = 1
+                if self.bounded:
+                    request['avc_view_batch'] = 1
                 payload = json.dumps(request, separators=(',', ':')).encode()
                 started = time.monotonic()
-                self.connection.request('POST', '/v2/live-stream', payload, headers)
-                with self.connection.getresponse() as response:
+                with ExitStack() as batch:
+                    if self.bounded:
+                        # Bound a slow trickle as well as a socket that stops making progress.
+                        deadline = threading.Timer(AVC_VIEW_RESPONSE_TIMEOUT, self.abort)
+                        deadline.daemon = True
+                        deadline.start()
+                        batch.callback(deadline.join)
+                        batch.callback(deadline.cancel)
+                    self.connection.request('POST', '/v2/live-stream', payload, headers)
+                    response = batch.enter_context(self.connection.getresponse())
                     if response.status in (404, 405, 501, 503):
                         return False
                     if response.status != 200:
@@ -200,6 +215,13 @@ class LiveStream:
                         # Include the request flight time and any downstream
                         # queueing when applying the existing frame age limit.
                         transit = max(0, time.monotonic() - started - sent / 1000)
+                        if self.bounded and frame and 'avc_base64' in frame and (
+                                value.get('frame_age_ms', 0) + transit * 1000 >= AVC_MAX_CAPTURE_AGE_MS or
+                                (not frame['idr'] and (after is None or frame['seq'] != after + 1))):
+                            # Keep acknowledgements, but only confirm media still usable by the decoder.
+                            after = None
+                            value.update(frame=None, unchanged=True)
+                            frame = None
                         if active():
                             publish(value, transit)
                             if frame:
@@ -284,9 +306,9 @@ class PinnedHub:
         self.connection = None
         self.last_response = 0
 
-    def live_stream(self, identifier, *, accept_avc=False):
+    def live_stream(self, identifier, *, accept_avc=False, bounded=False):
         return LiveStream(self.host, self.port, self.pin, self.credential, identifier,
-                          accept_avc=accept_avc)
+                          accept_avc=accept_avc, bounded=bounded)
 
     def avc_upload(self, identifier):
         return AvcUpload(self.host, self.port, self.pin, self.credential, identifier)
@@ -712,14 +734,17 @@ class DesktopClient:
                 except PermissionError: return {'closed': True}
             if operation == 'live-open' and self.live_view and not self.live_view.stop.is_set():
                 raise ValueError('请先关闭当前远程桌面')
+            if operation == 'live-open' and accepts_avc(body):
+                body = dict(body, avc_view_batch=1)
             value = self.live_input_hub.call(operation, body)
             if operation == 'live-open':
                 self.live_session = value['id']
-                avc = type(body.get('accept_avc')) is int and body['accept_avc'] == 1 and value.get('live_avc') == 1
+                avc = accepts_avc(body) and value.get('live_avc') == 1
                 stream_version = 1 if avc else (
                     value.get('view_stream') if body.get('viewer_transport') == 'stream' else None)
                 self.live_view = LiveView(self.live_hub, value['id'], self.stop_event,
-                                          stream_version=stream_version, avc=avc)
+                                          stream_version=stream_version, avc=avc,
+                                          bounded=avc and value.get('avc_view_batch') == 1)
                 self.live_view.start()
             return value
         if not self.supports_updates and operation.startswith('update-'):
