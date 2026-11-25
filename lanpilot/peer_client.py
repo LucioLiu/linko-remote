@@ -63,6 +63,14 @@ def default_home():
     return config_root / 'linko-remote'
 
 
+def portable_home(package):
+    # The ZIP can live in a shared or read-only directory. Keep the identity
+    # and desktop mailbox under the current Windows account instead.
+    package_key = os.path.normcase(str(Path(package).resolve()))
+    identifier = hashlib.sha256(package_key.encode('utf-8')).hexdigest()[:24]
+    return Path(os.environ['LOCALAPPDATA']) / 'LinkoRemotePortable' / identifier
+
+
 class InstanceLock:
     def __init__(self, home):
         self.path = Path(home) / 'app.lock'
@@ -398,12 +406,14 @@ class PinnedHub:
 
 
 class MailboxAgent:
-    def __init__(self, home):
+    def __init__(self, home, *, portable=False):
         self.home = Path(home)
         self.workspace = self.home / 'worker'
         self.workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.process = None
         self.stop_path = self.workspace / 'stop'
+        self.portable = portable
+        self.ready_path = self.workspace / 'worker.ready'
 
     def permissions(self):
         platform = desktop_platform()
@@ -435,7 +445,37 @@ class MailboxAgent:
                        str(ROOT / 'windows/Start-Desktop.ps1'), '-AllowInput', '-TargetGuard',
                        '-Workspace', str(self.workspace), '-StopFile', str(self.stop_path)]
             options = {'creationflags': subprocess.CREATE_NO_WINDOW}
+            if self.portable:
+                command[0] = str(Path(os.environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe')
+                command.extend(['-OwnerProcessId', str(os.getpid())])
+                options['cwd'] = self.workspace
+                self.ready_path.unlink(missing_ok=True)
         self.process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options)
+        if self.portable:
+            self.wait_until_ready()
+
+    def wait_until_ready(self):
+        deadline = time.monotonic() + 30
+        while self.process.poll() is None and time.monotonic() < deadline:
+            try:
+                if self.ready_path.read_text(encoding='ascii') == str(self.process.pid):
+                    return
+            except FileNotFoundError:
+                pass
+            time.sleep(.05)
+        self.close()
+        raise OSError('试用版桌面服务未能启动，请确认当前 Windows 桌面已解锁后重试')
+
+    def close(self):
+        self.stop()
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Only the process started by this agent owns this handle.
+                self.process.terminate()
+                self.process.wait(timeout=5)
+        self.ready_path.unlink(missing_ok=True)
 
     def running(self):
         return self.process is not None and self.process.poll() is None and not self.stop_path.exists()
@@ -473,12 +513,13 @@ class MailboxAgent:
 
 
 class DesktopClient:
-    def __init__(self, home, endpoint, hub_factory=PinnedHub, agent_factory=MailboxAgent):
+    def __init__(self, home, endpoint, hub_factory=PinnedHub, agent_factory=MailboxAgent, *, portable=False):
         self.home = Path(home)
         self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.platform = desktop_platform()
         self.supports_incoming = self.platform in DESKTOP_PLATFORMS
-        self.supports_updates = self.platform in DESKTOP_PLATFORMS
+        self.portable = portable
+        self.supports_updates = not portable and self.platform in DESKTOP_PLATFORMS
         self.path = self.home / 'client.json'
         if self.path.exists():
             self.config = json.loads(self.path.read_text())
@@ -491,7 +532,8 @@ class DesktopClient:
         else:
             credential = secrets.token_urlsafe(32)
             # Never import the developer's or the current user's OS hostname.
-            label = {'macos': 'Mac 电脑', 'windows': 'Windows 电脑', 'linux': 'Linux 电脑'}[self.platform]
+            label = 'Windows 试用' if portable else {
+                'macos': 'Mac 电脑', 'windows': 'Windows 电脑', 'linux': 'Linux 电脑'}[self.platform]
             self.config = {'credential': credential,
                            'name': label + ' ' + hashlib.sha256(credential.encode()).hexdigest()[:4],
                            'endpoint': endpoint, 'ssh': []}
@@ -501,7 +543,7 @@ class DesktopClient:
         self.command_hub = hub_factory(self.config['endpoint'], self.config['credential'])
         self.live_hub = hub_factory(self.config['endpoint'], self.config['credential'])
         self.live_input_hub = hub_factory(self.config['endpoint'], self.config['credential'])
-        self.agent = agent_factory(self.home)
+        self.agent = agent_factory(self.home, portable=True) if portable else agent_factory(self.home)
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
         self.operation_lock = threading.RLock()
@@ -701,6 +743,7 @@ class DesktopClient:
             connected = self._state_is_current(STATE_STALE_AFTER)
             value.update(version=VERSION, connected=connected, error=self.error,
                          supports_incoming=self.supports_incoming, supports_updates=self.supports_updates,
+                         portable=self.portable,
                          incoming=self.incoming, pause_pending=self.pause_pending, agent_error=self.agent_error,
                          permissions=self.permissions, ssh=self.config['ssh'], pending=dict(self.pending))
         value['updates'] = self.updater.snapshot()
@@ -738,6 +781,11 @@ class DesktopClient:
             return self._api(operation, body)
 
     def _api(self, operation, body):
+        if self.portable:
+            if self.stop_event.is_set():
+                raise ValueError('邻控试用版正在退出')
+            if operation.startswith(('ssh-', 'update-')):
+                raise ValueError('邻控试用版仅支持远程桌面')
         if operation in ('live-open', 'live-input', 'live-close'):
             if self.updating:
                 raise ValueError('正在更新，暂不能连接')
@@ -963,11 +1011,15 @@ class DesktopClient:
         if self.live_view: self.live_view.close()
         self.updater.stop.set()
         with self.operation_lock:
-            self._stop_incoming()
             try:
-                self.ui_hub.call('availability', {'enabled': False})
-            except Exception:
-                pass
+                self._stop_incoming()
+                if self.portable:
+                    self.agent.close()
+            finally:
+                try:
+                    self.ui_hub.call('availability', {'enabled': False})
+                except Exception:
+                    pass
 
 
 class LocalHandler(http.server.BaseHTTPRequestHandler):
@@ -1093,9 +1145,13 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
             if not isinstance(body, dict) or not re.fullmatch('/api/[a-z-]+', self.path):
                 raise ValueError('无效请求')
             if self.path == '/api/shutdown':
-                self.respond(200, b'{"ok":true,"value":{"stopped":true}}')
-                self.server.client.agent.stop()
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                client = self.server.client
+                try:
+                    client.stop_event.set()
+                    client.agent.stop()
+                    self.respond(200, b'{"ok":true,"value":{"stopped":true}}')
+                finally:
+                    threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
             value = self.server.client.api(self.path[5:], body)
             data = json.dumps({'ok': True, 'value': value}, ensure_ascii=False, separators=(',', ':')).encode()
@@ -1108,74 +1164,115 @@ class LocalHandler(http.server.BaseHTTPRequestHandler):
             self.respond(400, json.dumps({'ok': False, 'error': str(error)[:250]}, ensure_ascii=False).encode())
 
 
-def run(home, endpoint, open_browser=False):
-    client = DesktopClient(home, endpoint)
+def run(home, endpoint, open_browser=False, *, portable=False):
+    client = DesktopClient(home, endpoint, portable=True) if portable else DesktopClient(home, endpoint)
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), LocalHandler)
     server.daemon_threads = True
     server.client = client
     server.authority = '127.0.0.1:' + str(server.server_port)
     server.nonce = secrets.token_urlsafe(32)
     url = 'http://' + server.authority + '/#' + server.nonce
-    atomic_json(Path(home) / 'shell-session.json', {'url': url, 'pid': os.getpid(),
-                'app_pid': int(os.environ.get('LINKO_APP_PID', '0'))})
+    session_path = Path(home) / 'shell-session.json'
+    atomic_json(session_path, {'url': url, 'pid': os.getpid(),
+                'app_pid': 0 if portable else int(os.environ.get('LINKO_APP_PID', '0'))})
     if sys.stdout is not None:
         print(json.dumps({'url': url}), flush=True)
-    client.start()
     def terminate(*_):
+        client.stop_event.set()
         client.agent.stop()
         threading.Thread(target=server.shutdown, daemon=True).start()
-    for event in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(event, terminate)
-    if open_browser:
-        if sys.platform == 'win32':
-            edge = Path(os.environ.get('PROGRAMFILES(X86)', 'C:/Program Files (x86)')) / 'Microsoft/Edge/Application/msedge.exe'
-            if edge.exists():
-                subprocess.Popen([str(edge), '--app=' + url, '--user-data-dir=' + str(Path(home) / 'webview-profile')])
+    try:
+        client.start()
+        for event in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(event, terminate)
+        if portable:
+            os.startfile(url)
+        elif open_browser:
+            if sys.platform == 'win32':
+                edge = Path(os.environ.get('PROGRAMFILES(X86)', 'C:/Program Files (x86)')) / 'Microsoft/Edge/Application/msedge.exe'
+                if edge.exists():
+                    subprocess.Popen([str(edge), '--app=' + url, '--user-data-dir=' + str(Path(home) / 'webview-profile')])
+                else:
+                    webbrowser.open(url)
             else:
                 webbrowser.open(url)
-        else:
-            webbrowser.open(url)
-    try:
         server.serve_forever(poll_interval=0.3)
     finally:
-        client.close()
-        server.server_close()
+        try:
+            client.close()
+        finally:
+            server.server_close()
+            if portable:
+                session_path.unlink(missing_ok=True)
+
+
+def running_session(home, *, portable=False):
+    session = json.loads((home / 'shell-session.json').read_text(encoding='utf-8'))
+    url = session['url']
+    parsed = urlsplit(url)
+    if (parsed.scheme != 'http' or parsed.netloc != '127.0.0.1:' + str(parsed.port)
+            or not parsed.port or parsed.path != '/' or parsed.query
+            or not re.fullmatch('[A-Za-z0-9_-]{40,90}', parsed.fragment)):
+        raise ValueError('本机邻控会话无效')
+    check = http.client.HTTPConnection('127.0.0.1', parsed.port, timeout=1 if portable else 3)
+    try:
+        check.request('POST', '/api/state', '{}', {'X-Linko-Session': parsed.fragment})
+        response = check.getresponse()
+        if response.status != 200 or (portable and not json.load(response)['value']['portable']):
+            raise ValueError('本机邻控服务尚未就绪')
+        response.read()
+    finally:
+        check.close()
+    return url
+
+
+def launch(home, endpoint, open_browser=False, *, portable=False):
+    lock = InstanceLock(home)
+    deadline = time.monotonic() + 8
+    while not lock.acquire():
+        try:
+            url = running_session(home, portable=portable)
+        except (OSError, ValueError, KeyError, http.client.HTTPException):
+            if not portable or time.monotonic() >= deadline:
+                raise
+            time.sleep(.1)
+            continue
+        if sys.stdout is not None:
+            print(json.dumps({'url': url}), flush=True)
+        if portable:
+            os.startfile(url)
+        elif open_browser:
+            webbrowser.open(url)
+        return
+    try:
+        run(home, endpoint, open_browser, portable=portable)
+    finally:
+        lock.close()
 
 
 def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--home', type=Path)
-    parser.add_argument('--endpoint', type=Path, default=ROOT / 'peer-endpoint.json')
+    parser.add_argument('--endpoint', type=Path)
     parser.add_argument('--open-browser', action='store_true')
+    parser.add_argument('--portable', action='store_true')
     args = parser.parse_args()
-    home = args.home or default_home()
-    endpoint = json.loads(args.endpoint.read_text())
-    lock = InstanceLock(home)
-    if not lock.acquire():
-        session = json.loads((home / 'shell-session.json').read_text())
-        url = session['url']
-        parsed = urlsplit(url)
-        if parsed.scheme != 'http' or parsed.hostname != '127.0.0.1' or not parsed.port or not re.fullmatch('[A-Za-z0-9_-]{40,90}', parsed.fragment):
-            raise ValueError('本机邻控会话无效')
-        check = http.client.HTTPConnection('127.0.0.1', parsed.port, timeout=3)
+    packaged_endpoint = ROOT / 'peer-endpoint.json'
+    if args.portable:
+        if sys.platform != 'win32' or args.home is not None or args.endpoint is not None or args.open_browser:
+            parser.error('--portable is reserved for the Windows ZIP launcher')
         try:
-            check.request('POST', '/api/state', '{}', {'X-Linko-Session': parsed.fragment})
-            response = check.getresponse()
-            if response.status != 200:
-                raise ValueError('本机邻控服务尚未就绪')
-            response.read()
-        finally:
-            check.close()
-        if sys.stdout is not None:
-            print(json.dumps({'url': url}), flush=True)
-        if args.open_browser:
-            webbrowser.open(url)
-        return
-    try:
-        run(home, endpoint, args.open_browser)
-    finally:
-        lock.close()
+            home = portable_home(ROOT.parent)
+            launch(home, json.loads(packaged_endpoint.read_text(encoding='utf-8')), portable=True)
+        except Exception as error:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, str(error), '邻控便携试用版启动失败', 0x10)
+            raise SystemExit(1) from error
+    else:
+        home = args.home or default_home()
+        endpoint = json.loads((args.endpoint or packaged_endpoint).read_text(encoding='utf-8'))
+        launch(home, endpoint, args.open_browser)
 
 
 if __name__ == '__main__':

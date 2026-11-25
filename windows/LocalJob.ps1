@@ -214,7 +214,7 @@ function Start-BackgroundJob([string]$Root,[string]$Id,$Manifest) {
  try{
   $space.ApartmentState='MTA';$space.ThreadOptions='ReuseThread';$space.Open()
   $pipeline.Runspace=$space
-  [void]$pipeline.AddCommand($hostFile).AddParameter('RequestId',$Id)
+  [void]$pipeline.AddCommand($hostFile).AddParameter('RequestId',$Id).AddParameter('Workspace',$Root)
   $invocation=$pipeline.BeginInvoke()
   $script:localJobHandle=@{Space=$space;Pipeline=$pipeline;Invocation=$invocation}
  }catch{

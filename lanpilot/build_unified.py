@@ -77,10 +77,12 @@ def mac(output, endpoint, engine):
     subprocess.run(['codesign','--force','--deep','--sign','-',str(output)],check=True)
 
 
-def windows(output, endpoint, runtime, expected, avc_helper=None):
+def windows(output, endpoint, runtime, expected, avc_helper=None, *, portable=False):
     if hashlib.sha256(runtime.read_bytes()).hexdigest()!=expected:
         raise ValueError('Embedded Python archive checksum mismatch')
-    output.mkdir(parents=True,exist_ok=True)
+    output.mkdir(parents=True, exist_ok=not portable)
+    if (output / '打开邻控试用版.exe').exists():
+        raise ValueError('An installable package cannot reuse a portable output directory')
     files = CLIENT_FILES + ('windows/video/LiveAvc.cs',)
     extra = {WINDOWS_AVC: avc_helper} if avc_helper is not None else None
     # An existing build may be repackaged as JPEG-only.
@@ -95,9 +97,28 @@ def windows(output, endpoint, runtime, expected, avc_helper=None):
     pth=next((output/'runtime').glob('python*._pth'))
     version=pth.stem
     pth.write_text(version+'.zip\n.\n../code\n',encoding='ascii')
-    shutil.copy2(ROOT/'windows/Install-Unified.ps1',output/'Install-Unified.ps1')
-    (output/'打开邻控.cmd').write_bytes(b'@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-Unified.ps1"\r\n')
-    (output/'使用说明.txt').write_text('邻控统一客户端预览\n\n双击「打开邻控.cmd」。每台电脑都有相同界面，既可连接别人，也可允许别人连接本机。\n0.7 旧配对保留在原客户端中，本预览版不覆盖原配置。\n首次连接：在对方开启允许连接并生成连接码，粘贴到本机，对方确认后即可连接。\n',encoding='utf-8-sig')
+    if portable:
+        subprocess.run([
+            os.environ.get('LANPILOT_WINDOWS_CC', 'x86_64-w64-mingw32-clang'), '-municode', '-mwindows',
+            '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+            str(ROOT / 'windows/PortableLauncher.c'),
+            '-o', str(output / '打开邻控试用版.exe'), '-luser32',
+        ], check=True)
+        instructions = (
+            '邻控便携试用版\n\n完整解压 ZIP，再双击「打开邻控试用版.exe」。'
+            '使用当前 Windows 账户，浏览器会打开试用版。\n'
+            '首次试用需要重新配对。请开启「允许其他电脑连接本机」，生成连接码，'
+            '在对方输入后回到本机确认。\n'
+            '试用数据保存在当前账户的 LinkoRemotePortable 目录中，与正式安装分开。'
+            '请从原解压位置重新打开，以继续使用同一试用身份。\n'
+            '结束试用时，在「设置与帮助」中选择「退出邻控并停止接受连接」。'
+            '仅关闭浏览器标签页会保留试用服务。\n'
+        )
+    else:
+        shutil.copy2(ROOT/'windows/Install-Unified.ps1',output/'Install-Unified.ps1')
+        (output/'打开邻控.cmd').write_bytes(b'@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-Unified.ps1"\r\n')
+        instructions = '邻控统一客户端预览\n\n双击「打开邻控.cmd」。每台电脑都有相同界面，既可连接别人，也可允许别人连接本机。\n0.7 旧配对保留在原客户端中，本预览版不覆盖原配置。\n首次连接：在对方开启允许连接并生成连接码，粘贴到本机，对方确认后即可连接。\n'
+    (output/'使用说明.txt').write_text(instructions, encoding='utf-8-sig')
     checks={str(path.relative_to(output)).replace('\\','/'):hashlib.sha256(path.read_bytes()).hexdigest() for path in output.rglob('*') if path.is_file() and path.name != 'checksums.json'}
     (output/'checksums.json').write_text(json.dumps(checks))
 
@@ -143,11 +164,14 @@ def main():
     parser.add_argument('--endpoint',type=Path,required=True);parser.add_argument('--runtime',type=Path);parser.add_argument('--runtime-sha256')
     parser.add_argument('--engine',type=Path)
     parser.add_argument('--avc-helper', type=Path, help='Prebuilt Windows AVC helper matching the embedded Python architecture')
+    parser.add_argument('--portable', action='store_true', help='Build a Windows ZIP payload with a direct GUI launcher')
     args=parser.parse_args();endpoint=json.loads(args.endpoint.read_text())
+    if args.portable and args.platform != 'windows':
+        parser.error('--portable requires the windows target')
     if set(endpoint)!={'url','pin'}:raise ValueError('Endpoint metadata must contain only public URL and certificate pin')
     if args.platform=='macos':mac(args.output.resolve(),endpoint,args.engine)
     elif args.platform=='linux':linux(args.output.resolve(),endpoint)
-    else:windows(args.output.resolve(),endpoint,args.runtime,args.runtime_sha256,args.avc_helper)
+    else:windows(args.output.resolve(),endpoint,args.runtime,args.runtime_sha256,args.avc_helper,portable=args.portable)
     print(args.output.resolve())
 
 

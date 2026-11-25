@@ -1,7 +1,13 @@
-param([switch]$AllowInput, [string]$RelayConfig, [switch]$TargetGuard, [switch]$Persistent, [switch]$LanDiscovery, [switch]$WanOnly, [Threading.ManualResetEvent]$StopEvent, [ValidatePattern('^[a-f0-9]{32}$')][string]$Generation, [string]$Workspace, [string]$StopFile)
+param([switch]$AllowInput, [string]$RelayConfig, [switch]$TargetGuard, [switch]$Persistent, [switch]$LanDiscovery, [switch]$WanOnly, [Threading.ManualResetEvent]$StopEvent, [ValidatePattern('^[a-f0-9]{32}$')][string]$Generation, [string]$Workspace, [string]$StopFile, [int]$OwnerProcessId)
 $ErrorActionPreference = 'Stop'
 if($env:LANPILOT_ISOLATED -match '^[0-9a-f]{32}$' -and $env:LOCALAPPDATA -eq (Join-Path ([IO.Path]::GetTempPath()) ('LanPilot-Invite-QA-'+$env:LANPILOT_ISOLATED))){$AllowInput=$false}
 $root = if($Workspace){[IO.Path]::GetFullPath($Workspace)}else{Join-Path $env:LOCALAPPDATA 'CodexRemoteDesktop'}
+$owner=$null
+if($OwnerProcessId){
+ if(-not $Workspace -or -not $StopFile){throw 'WORKER_OWNER_REQUIRES_PRIVATE_MAILBOX'}
+ $owner=[Diagnostics.Process]::GetProcessById($OwnerProcessId)
+ [void]$owner.Handle
+}
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 # Protect mailbox contents (typed text and screenshots) from other local users.
 $acl = [IO.Directory]::GetAccessControl($root,[Security.AccessControl.AccessControlSections]::Access)
@@ -53,7 +59,7 @@ try {
  if($Persistent){[void][RemoteDesktop]::KeepAwake($true)}
  [RemoteDesktop]::Check()
  $session = if($Generation){$Generation}else{[guid]::NewGuid().ToString('N')}
- function Test-WorkerStop {return ($StopEvent -and $StopEvent.WaitOne(0)) -or ($StopFile -and (Test-Path -LiteralPath $StopFile))}
+ function Test-WorkerStop {return ($StopEvent -and $StopEvent.WaitOne(0)) -or ($StopFile -and (Test-Path -LiteralPath $StopFile)) -or ($owner -and $owner.HasExited)}
  function Wait-Reconnect([int]$Seconds) {
   if($StopEvent){[void]$StopEvent.WaitOne($Seconds*1000)}else{Start-Sleep -Seconds $Seconds}
  }
@@ -158,6 +164,9 @@ try {
  Write-Host "Input enabled: $([bool]$AllowInput). This controls THIS Windows desktop; do not use it concurrently."
  Write-Host 'No listening TCP port, no AI login, no automatic startup. Close this window to stop.'
  if(-not $RelayConfig){. (Join-Path $PSScriptRoot 'Live-Desktop.ps1')}
+ if($owner -and -not (Test-WorkerStop)){
+  [IO.File]::WriteAllText((Join-Path $root 'worker.ready'),[string]$PID)
+ }
  while (-not (Test-WorkerStop)) {
   if(-not $RelayConfig){Invoke-LiveDesktop}
   if($RelayConfig){
@@ -307,6 +316,6 @@ try {
   elseif('RemoteDesktop' -as [type]){[RemoteDesktop]::LiveRelease()}
  }finally{
   try{if(Get-Command Close-LocalJobHandle -CommandType Function -ErrorAction SilentlyContinue){Close-LocalJobHandle -Wait}}
-  finally{if($Persistent -and ('RemoteDesktop' -as [type])){[void][RemoteDesktop]::KeepAwake($false)};$lock.Dispose()}
+  finally{if($Persistent -and ('RemoteDesktop' -as [type])){[void][RemoteDesktop]::KeepAwake($false)};$lock.Dispose();if($owner){$owner.Dispose()}}
  }
 }

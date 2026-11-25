@@ -10,6 +10,8 @@
 4. 运行 `python3 -m lanpilot.build_unified macos OUTPUT_APP --endpoint ENDPOINT --engine FROZEN_ENGINE`。构建脚本生成原生外壳、签名应用，并只复制 `CLIENT_FILES` 白名单中的源码。
 5. 用 Python `zipfile` 归档，保证文件名按 UTF-8 编码；为下载包生成 `SHA256SUMS.txt`。
 
+Windows x64 同机试用包沿用第 2 步的命令，增加 `--portable` 并使用全新的输出目录。构建需要 `x86_64-w64-mingw32-clang`，可用 `LANPILOT_WINDOWS_CC` 指定该编译器的路径。归档后完整解压，双击「打开邻控试用版.exe」。当前 Windows 账户的 `%LOCALAPPDATA%\LinkoRemotePortable` 下按解压位置保存独立身份、单例和工作目录。试用包的远程桌面配对和授权走原界面，软件更新和 SSH 功能停用。退出从试用页面的「设置与帮助」发起，关闭浏览器标签页后也可双击入口重新打开试用页面。
+
 Linux 单文件候选使用 `python3 -m lanpilot.build_unified linux LinkoRemote-Linux.pyz --endpoint ENDPOINT`。安装时执行 `python3 LinkoRemote-Linux.pyz`，所需环境为 Python 3.9 或更新版本。输出文件名也可以使用 `.zip`。ZIP 解压后可用 `sh LinkoRemote-Linux/run.sh` 直接启动，或用 `python3 LinkoRemote-Linux/install.py` 添加应用菜单入口。Linux 的软件更新使用新安装包。
 
 不要从已安装应用或用户数据目录直接打包。重用输出目录时，代码目录出现白名单以外的文件会中止构建。

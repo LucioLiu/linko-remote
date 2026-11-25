@@ -87,6 +87,34 @@ class UnifiedBuildTests(unittest.TestCase):
                                     for name, digest in manifest.items()))
                 self.assertEqual(b'\xef\xbb\xbf', (output / 'Install-Unified.ps1').read_bytes()[:3])
 
+    def test_portable_build_uses_a_gui_launcher_without_the_installer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / 'python.zip'
+            with zipfile.ZipFile(runtime, 'w') as archive:
+                archive.writestr('python315._pth', 'python315.zip')
+            output = root / '邻控 试用'
+            endpoint = {'url': 'https://example.test', 'pin': 'a' * 64}
+            pin = hashlib.sha256(runtime.read_bytes()).hexdigest()
+
+            def compile_launcher(command, **options):
+                self.assertTrue(options['check'])
+                self.assertIn('-mwindows', command)
+                self.assertIn(str(ROOT / 'windows/PortableLauncher.c'), command)
+                Path(command[command.index('-o') + 1]).write_bytes(b'fixture launcher')
+
+            with patch('lanpilot.build_unified.subprocess.run', side_effect=compile_launcher):
+                windows(output, endpoint, runtime, pin, portable=True)
+            manifest = json.loads((output / 'checksums.json').read_text())
+            self.assertIn('打开邻控试用版.exe', manifest)
+            self.assertIn('code/windows/Start-Desktop.ps1', manifest)
+            self.assertNotIn('Install-Unified.ps1', manifest)
+            self.assertNotIn('打开邻控.cmd', manifest)
+            with self.assertRaises(FileExistsError):
+                windows(output, endpoint, runtime, pin, portable=True)
+            with self.assertRaisesRegex(ValueError, 'portable output'):
+                windows(output, endpoint, runtime, pin)
+
 
 if __name__ == '__main__':
     unittest.main()

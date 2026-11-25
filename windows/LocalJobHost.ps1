@@ -1,7 +1,7 @@
-param([Parameter(Mandatory=$true)][ValidatePattern('^[a-f0-9]{32}$')][string]$RequestId)
+param([Parameter(Mandatory=$true)][ValidatePattern('^[a-f0-9]{32}$')][string]$RequestId,[string]$Workspace)
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'LocalJob.ps1')
-$root=Join-Path $env:LOCALAPPDATA 'CodexRemoteDesktop'
+$root=if($Workspace){[IO.Path]::GetFullPath($Workspace)}else{Join-Path $env:LOCALAPPDATA 'CodexRemoteDesktop'}
 $folder=Join-Path (Join-Path $root 'job-queue') $RequestId
 $done=Join-Path $folder 'finished.json'
 $slot=$null;$running=$null

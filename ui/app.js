@@ -55,6 +55,11 @@ async function refresh() {
  if(lastStatePoll || closing) return; lastStatePoll=true;
  try {
   state=await api('state'); $('local-name').textContent=state.self.name; $('local-id').textContent=state.self.id || '正在注册'; $('local-platform').textContent=platform(state.self.platform);
+  if(state.portable){
+   document.title=$('app-name').textContent='邻控试用版';
+   $('ssh-nav').classList.add('hidden');
+   $('quit').textContent='退出试用版并停止接受连接';
+  }
   if(!changingAvailability)$('incoming').checked=state.incoming;
   $('service-dot').className='status-dot'+(state.connected?' online':'');
   $('service-state').textContent=state.connected?'连接服务在线':state.error?'连接服务暂不可用':state.self.id?'正在恢复连接服务':'正在连接服务';
