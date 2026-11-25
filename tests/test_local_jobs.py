@@ -2,10 +2,11 @@ import base64
 import hashlib
 import tempfile
 import unittest
+from unittest.mock import Mock
 from pathlib import Path
 
 from desktop import make_request, save_result
-from lanpilot.jobs import stage_manifest, validate_job
+from lanpilot.jobs import stage_manifest, validate_job, start_ledger_pair
 
 
 class JobTests(unittest.TestCase):
@@ -22,6 +23,22 @@ class JobTests(unittest.TestCase):
             with self.assertRaises(ValueError): stage_manifest('november',[path,path])
             for scope in ['../root','NUL','c:/tmp','a.b','']:
                 with self.assertRaises(ValueError): stage_manifest(scope,[path])
+
+    def test_pair_does_not_start_after_uncertain_or_mismatched_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'ledger.csv'
+            path.write_text('id,amount\nA,1.00\n')
+            bridge = Mock()
+            bridge.request.return_value = {'ok': False, 'state': 'unconfirmed', 'request_id': 'a'*32}
+            response = start_ledger_pair(bridge, 'test', path, path)
+            self.assertEqual('stage-inputs', response['step'])
+            self.assertEqual('a'*32, response['request_id'])
+            bridge.request.assert_called_once()
+            bridge.reset_mock()
+            bridge.request.return_value = {'ok': True, 'result': {'files': []}}
+            with self.assertRaisesRegex(ValueError, '暂存回执'):
+                start_ledger_pair(bridge, 'test', path, path)
+            bridge.request.assert_called_once()
 
     def test_unscoped_or_duplicate_jobs_rejected(self):
         base={'version':1,'operation':'reconcile-ledgers','input_scope':'november'}

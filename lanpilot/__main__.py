@@ -16,6 +16,7 @@ x=s.add_parser('invite');x.add_argument('name');x.add_argument('installer',type=
 x=s.add_parser('invite-route');x.add_argument('--server');x.add_argument('--port',type=int);x.add_argument('--lan-only',action='store_true')
 x=s.add_parser('adopt');x.add_argument('name');x.add_argument('runtime')
 x=s.add_parser('job');x.add_argument('device');x.add_argument('manifest',type=Path)
+x=s.add_parser('reconcile',help='暂存两份 CSV 并启动后台对账');x.add_argument('device');x.add_argument('expected',type=Path);x.add_argument('actual',type=Path)
 for command in ('job-status','job-result'):
  x=s.add_parser(command,help='按原作业编号查询后台对账');x.add_argument('device');x.add_argument('job_id')
 x=s.add_parser('stage');x.add_argument('device');x.add_argument('scope');x.add_argument('files',nargs='*',type=Path);x.add_argument('--input',nargs=2,action='append',default=[],metavar=('REMOTE_NAME','MAC_PATH'))
@@ -71,6 +72,10 @@ elif a.command in ('job-status','job-result'):
  try:validate_job(manifest)
  except ValueError as e:p.exit(1,str(e)+'\n')
  r=b.request(a.device,{'action':'job','manifest':manifest})
+elif a.command=='reconcile':
+ from .jobs import start_ledger_pair
+ try:r=start_ledger_pair(b,a.device,a.expected,a.actual)
+ except (OSError,ValueError) as e:p.exit(1,str(e)+'\n')
 elif a.command=='stage':
  from .jobs import stage_manifest
  r=b.request(a.device,{'action':'job','manifest':stage_manifest(a.scope,a.files+[{'name':n,'path':p} for n,p in a.input])})

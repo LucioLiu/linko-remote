@@ -3,6 +3,7 @@ import base64
 import hashlib
 from pathlib import Path
 import re
+import uuid
 
 FILE_LIMIT = 524288
 TOTAL_LIMIT = 2097152
@@ -111,3 +112,24 @@ def stage_manifest(scope, paths):
     manifest=dict(version=1,operation='stage-inputs',input_scope=scope,files=files)
     validate_job(manifest)
     return manifest
+
+def start_ledger_pair(bridge, device, expected, actual):
+    """Stage a snapshot of the two selected files before starting one background job."""
+    scope = 'ledger-' + uuid.uuid4().hex
+    stage = stage_manifest(scope, [
+        {'path': expected, 'name': 'expected-01.csv'},
+        {'path': actual, 'name': 'actual-01.csv'},
+    ])
+    receipt = bridge.request(device, {'action': 'job', 'manifest': stage})
+    if receipt.get('ok') is not True:
+        return dict(receipt, step='stage-inputs')
+    result = receipt.get('result', {})
+    checks = [(item['name'], item['sha256']) for item in stage['files']]
+    if (result.get('operation') != 'stage-inputs' or result.get('input_scope') != scope or
+            [(item.get('name'), item.get('sha256')) for item in result.get('files', [])]
+            != checks):
+        raise ValueError('暂存回执与所选文件不符，对账尚未启动')
+    batch = {'batch': '01', 'expected_sha256': checks[0][1], 'actual_sha256': checks[1][1]}
+    job = dict(version=1, operation='reconcile-ledgers', execution='background',
+               input_scope=scope, batches=[batch])
+    return dict(bridge.request(device, {'action': 'job', 'manifest': job}), step='reconcile-ledgers')
