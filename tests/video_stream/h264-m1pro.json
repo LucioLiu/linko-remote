@@ -1,0 +1,233 @@
+{
+  "platform": "macOS-26.7-arm64-arm-64bit",
+  "cpu": "arm",
+  "python": "3.12.14",
+  "pyav": "16.1.0",
+  "ffmpeg_libraries": {
+    "libavutil": [
+      60,
+      8,
+      100
+    ],
+    "libavcodec": [
+      62,
+      11,
+      100
+    ],
+    "libavformat": [
+      62,
+      3,
+      100
+    ],
+    "libavdevice": [
+      62,
+      1,
+      100
+    ],
+    "libavfilter": [
+      11,
+      4,
+      100
+    ],
+    "libswscale": [
+      9,
+      1,
+      100
+    ],
+    "libswresample": [
+      6,
+      1,
+      100
+    ]
+  },
+  "parameters": {
+    "frames": 120,
+    "repeats": 3
+  },
+  "jpeg_encoder": "mjpeg",
+  "jpeg_quantizer": 5,
+  "h264_encoder": "libx264",
+  "h264_preset": "veryfast",
+  "h264_tune": "zerolatency",
+  "h264_params": "bframes=0:rc-lookahead=0:sync-lookahead=0:scenecut=0:repeat-headers=1:annexb=1:open-gop=0",
+  "encoder_threads": 1,
+  "decoder_threads": 1,
+  "pixel_format": "yuvj444p",
+  "measurement": {
+    "scene": "Existing full-screen fixture, scrolling 7 pixels per frame",
+    "payload": "Raw JPEG or Annex B H.264, including in-band SPS/PPS on IDRs",
+    "latency": "RGB to bytes to RGB, including color conversion and byte copies",
+    "excluded": "RGB generation, capture, network, framing, queueing and rendering",
+    "quality": "RGB PSNR from pooled pixel errors on every measured source frame",
+    "text_edges": "RGB PSNR on pixels adjacent to horizontal green-channel jumps of at least 24, plus green-gradient RMSE at those jumps",
+    "calibration": "Full measured sequence at each resolution, minimizing the absolute RGB PSNR gap"
+  },
+  "resolutions": [
+    {
+      "width": 1280,
+      "height": 720,
+      "fps": 20,
+      "h264_crf": 31.25,
+      "h264_gop_frames": 40,
+      "h264_crf_trials": {
+        "20.0": {
+          "rgb_psnr_db": 41.403
+        },
+        "36.0": {
+          "rgb_psnr_db": 31.866
+        },
+        "28.0": {
+          "rgb_psnr_db": 36.518
+        },
+        "32.0": {
+          "rgb_psnr_db": 34.349
+        },
+        "30.0": {
+          "rgb_psnr_db": 35.453
+        },
+        "31.0": {
+          "rgb_psnr_db": 34.876
+        },
+        "31.5": {
+          "rgb_psnr_db": 34.58
+        },
+        "31.25": {
+          "rgb_psnr_db": 34.764
+        }
+      },
+      "payload_savings_pct": 97.66,
+      "h264_minus_jpeg_psnr_db": 0.013,
+      "full_jpeg": {
+        "payload_bytes": 94937157,
+        "mean_kib_per_frame": 257.534,
+        "estimated_mbps": 42.194,
+        "immediately_decoded_frames": 360,
+        "intra_frames": 360,
+        "encode_ms": {
+          "p50": 10.367,
+          "p95": 11.727
+        },
+        "decode_ms": {
+          "p50": 5.798,
+          "p95": 6.686
+        },
+        "encode_decode_ms": {
+          "p50": 16.165,
+          "p95": 18.044
+        },
+        "quality": {
+          "rgb_psnr_db": 34.751,
+          "edge_rgb_psnr_db": 29.664,
+          "edge_green_gradient_rmse": 11.734
+        }
+      },
+      "h264": {
+        "payload_bytes": 2219859,
+        "mean_kib_per_frame": 6.022,
+        "estimated_mbps": 0.987,
+        "immediately_decoded_frames": 360,
+        "intra_frames": 9,
+        "encode_ms": {
+          "p50": 7.244,
+          "p95": 9.649
+        },
+        "decode_ms": {
+          "p50": 2.536,
+          "p95": 3.438
+        },
+        "encode_decode_ms": {
+          "p50": 9.824,
+          "p95": 13.039
+        },
+        "quality": {
+          "rgb_psnr_db": 34.764,
+          "edge_rgb_psnr_db": 28.641,
+          "edge_green_gradient_rmse": 8.846
+        }
+      }
+    },
+    {
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "h264_crf": 30.25,
+      "h264_gop_frames": 60,
+      "h264_crf_trials": {
+        "20.0": {
+          "rgb_psnr_db": 40.701
+        },
+        "36.0": {
+          "rgb_psnr_db": 31.241
+        },
+        "28.0": {
+          "rgb_psnr_db": 36.002
+        },
+        "32.0": {
+          "rgb_psnr_db": 33.833
+        },
+        "30.0": {
+          "rgb_psnr_db": 34.898
+        },
+        "31.0": {
+          "rgb_psnr_db": 34.374
+        },
+        "30.5": {
+          "rgb_psnr_db": 34.628
+        },
+        "30.25": {
+          "rgb_psnr_db": 34.779
+        }
+      },
+      "payload_savings_pct": 98.56,
+      "h264_minus_jpeg_psnr_db": 0.014,
+      "full_jpeg": {
+        "payload_bytes": 213607539,
+        "mean_kib_per_frame": 579.448,
+        "estimated_mbps": 142.405,
+        "immediately_decoded_frames": 360,
+        "intra_frames": 360,
+        "encode_ms": {
+          "p50": 22.703,
+          "p95": 24.33
+        },
+        "decode_ms": {
+          "p50": 12.77,
+          "p95": 13.658
+        },
+        "encode_decode_ms": {
+          "p50": 35.506,
+          "p95": 37.793
+        },
+        "quality": {
+          "rgb_psnr_db": 34.765,
+          "edge_rgb_psnr_db": 29.679,
+          "edge_green_gradient_rmse": 11.717
+        }
+      },
+      "h264": {
+        "payload_bytes": 3074706,
+        "mean_kib_per_frame": 8.341,
+        "estimated_mbps": 2.05,
+        "immediately_decoded_frames": 360,
+        "intra_frames": 6,
+        "encode_ms": {
+          "p50": 15.883,
+          "p95": 18.9
+        },
+        "decode_ms": {
+          "p50": 5.159,
+          "p95": 6.308
+        },
+        "encode_decode_ms": {
+          "p50": 21.041,
+          "p95": 25.294
+        },
+        "quality": {
+          "rgb_psnr_db": 34.779,
+          "edge_rgb_psnr_db": 28.626,
+          "edge_green_gradient_rmse": 8.793
+        }
+      }
+    }
+  ]
+}

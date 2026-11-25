@@ -1,0 +1,102 @@
+{
+  "platform": "macOS-26.7-arm64-arm-64bit",
+  "python": "3.12.14",
+  "pyav": "16.1.0",
+  "libavcodec": "62.11.100",
+  "tile_px": 128,
+  "parameters": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 30,
+    "frames": 120,
+    "repeats": 3,
+    "quantizer": 5,
+    "scene": "both"
+  },
+  "scenes": {
+    "region": {
+      "equal_rgb_frames": 360,
+      "wire_byte_savings_pct": 15.37,
+      "full_jpeg": {
+        "packet_bytes": 114240630,
+        "mean_kib_per_frame": 309.898,
+        "estimated_mbps_at_fixture_fps": 76.16,
+        "full_frames": 360,
+        "delta_frames": 0,
+        "encode_ms": {
+          "p50": 17.363,
+          "p95": 18.562
+        },
+        "decode_ms": {
+          "p50": 9.235,
+          "p95": 10.007
+        },
+        "encode_decode_ms": {
+          "p50": 26.625,
+          "p95": 28.383
+        }
+      },
+      "jpeg_delta": {
+        "packet_bytes": 96676578,
+        "mean_kib_per_frame": 262.252,
+        "estimated_mbps_at_fixture_fps": 64.451,
+        "full_frames": 6,
+        "delta_frames": 354,
+        "encode_ms": {
+          "p50": 13.538,
+          "p95": 14.855
+        },
+        "decode_ms": {
+          "p50": 7.173,
+          "p95": 8.112
+        },
+        "encode_decode_ms": {
+          "p50": 20.712,
+          "p95": 22.636
+        }
+      }
+    },
+    "full": {
+      "equal_rgb_frames": 360,
+      "wire_byte_savings_pct": 0.0,
+      "full_jpeg": {
+        "packet_bytes": 213612219,
+        "mean_kib_per_frame": 579.46,
+        "estimated_mbps_at_fixture_fps": 142.408,
+        "full_frames": 360,
+        "delta_frames": 0,
+        "encode_ms": {
+          "p50": 22.933,
+          "p95": 24.229
+        },
+        "decode_ms": {
+          "p50": 12.856,
+          "p95": 13.768
+        },
+        "encode_decode_ms": {
+          "p50": 35.832,
+          "p95": 37.818
+        }
+      },
+      "jpeg_delta": {
+        "packet_bytes": 213612219,
+        "mean_kib_per_frame": 579.46,
+        "estimated_mbps_at_fixture_fps": 142.408,
+        "full_frames": 360,
+        "delta_frames": 0,
+        "encode_ms": {
+          "p50": 23.947,
+          "p95": 25.303
+        },
+        "decode_ms": {
+          "p50": 12.89,
+          "p95": 13.907
+        },
+        "encode_decode_ms": {
+          "p50": 36.821,
+          "p95": 38.815
+        }
+      }
+    }
+  }
+}
