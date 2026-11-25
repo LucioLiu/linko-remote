@@ -169,8 +169,8 @@ class LiveSessions:
             return {'accepted':seq}
         if op == 'live-frame':
             if me != s['target']: raise PermissionError('无权发送此桌面')
-            self.frame(s, body.get('frame'), now)
-            return {'active':not bool(s['error']) and now-s['viewed']<8}
+            accepted = self.frame(s, body.get('frame'), now, allow_repeat=True)
+            return {'active':not bool(s['error']) and now-s['viewed']<8, 'frame_seq':accepted}
         if op == 'live-exchange':
             if me != s['target']: raise PermissionError('无权发送此桌面')
             s['agent_seen']=now
@@ -205,16 +205,33 @@ class LiveSessions:
             return {'inputs':inputs if remaining else [],'active':not bool(s['error']) and remaining>0,'lease_ms':min(2500,remaining)}
         raise ValueError('无效连续桌面请求')
 
-    def frame(self,s,f,now):
+    def frame(self,s,f,now,*,allow_repeat=False):
         if not isinstance(f,dict) or not re.fullmatch(r'-?\d+,-?\d+,\d+,\d+',str(f.get('geometry',''))) or type(f.get('seq')) is not int:
             raise ValueError('无效连续画面')
-        encoded=f.get('jpeg_base64','')
-        if not isinstance(encoded,str) or len(encoded)>1_400_000: raise ValueError('画面过大')
-        raw=base64.b64decode(encoded,validate=True)
-        if not raw.startswith(b'\xff\xd8') or not raw.endswith(b'\xff\xd9'): raise ValueError('无效画面格式')
-        if not s['frame'] or f['seq']>s['frame']['seq']:
-            previous = s['frame']
-            if not previous or previous['geometry'] != f['geometry'] or previous['jpeg_base64'] != encoded:
-                s['same_since'] = f['seq']
-            s['frame']={'seq':f['seq'],'geometry':f['geometry'],'jpeg_base64':encoded};s['frame_at']=now
-            s['changed'].notify_all()
+        previous = s['frame']
+        seq, geometry = f['seq'], f['geometry']
+        if 'repeat_after' in f:
+            base = f['repeat_after']
+            if not allow_repeat or type(base) is not int or 'jpeg_base64' in f or seq <= base:
+                raise ValueError('无效重复画面')
+            if not previous or previous['seq'] != base or previous['geometry'] != geometry:
+                return None
+            encoded = previous['jpeg_base64']
+        else:
+            encoded = f.get('jpeg_base64', '')
+            if not isinstance(encoded,str) or len(encoded)>1_400_000: raise ValueError('画面过大')
+            raw = base64.b64decode(encoded, validate=True)
+            if not raw.startswith(b'\xff\xd8') or not raw.endswith(b'\xff\xd9'): raise ValueError('无效画面格式')
+            if previous and seq <= previous['seq']:
+                # A transport retry can acknowledge a stored frame without
+                # giving that capture a new timestamp.
+                if seq == previous['seq'] and geometry == previous['geometry'] and encoded == previous['jpeg_base64']:
+                    return seq
+                return None
+
+        if not previous or previous['geometry'] != geometry or previous['jpeg_base64'] != encoded:
+            s['same_since'] = seq
+        s['frame'] = {'seq':seq, 'geometry':geometry, 'jpeg_base64':encoded}
+        s['frame_at'] = now
+        s['changed'].notify_all()
+        return seq

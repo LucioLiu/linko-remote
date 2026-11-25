@@ -2,6 +2,7 @@
 import json
 import os
 import http.client
+import sys
 import threading
 import time
 
@@ -18,6 +19,8 @@ class LiveAgent:
         self.frame_hub=factory(client.config['endpoint'],client.config['credential'])
         self.root=client.agent.workspace
         self.current=None;self.known=set();self.last_frame=0
+        self.upload_base = None
+        self.repeat_uploads = sys.platform == 'win32'
         self.error=''
         self.media_at=0
         self.lock=threading.RLock()
@@ -27,6 +30,7 @@ class LiveAgent:
             if self.current:
                 self.write(self.root/'live-control.json',{'id':self.current,'expires':0})
             self.current=None;self.known.clear();self.last_frame=0
+            self.upload_base = None
 
     def read(self,name):
         try: return json.loads((self.root/name).read_text(encoding='utf-8-sig'))
@@ -47,11 +51,7 @@ class LiveAgent:
                     frame=self.read('live-frame.json')
                     if frame.get('id')==ident and frame.get('seq',0)>self.last_frame and time.time()-frame.get('created',0)<1:
                         started = time.monotonic()
-                        value=self.frame_hub.call('live-frame',{'id':ident,'frame':{k:frame[k] for k in ('seq','geometry','jpeg_base64')}})
-                        with self.lock:
-                            if self.current==ident:
-                                if not value['active']: raise RuntimeError('连续画面已停止')
-                                self.last_frame=frame['seq'];self.media_at=time.monotonic()
+                        self.upload_frame(ident, frame)
                         # Include upload time in the send interval. Slow links
                         # still send only the newest frame, with one in flight.
                         delay = max(.01, delay - (time.monotonic()-started))
@@ -64,6 +64,37 @@ class LiveAgent:
             except Exception as error:
                 self.end(ident,error)
             self.client.stop_event.wait(delay)
+
+    def upload_frame(self, ident, frame):
+        with self.lock:
+            if self.current != ident:
+                return
+            base = self.upload_base
+            # A lost response leaves the relay's current base uncertain.
+            self.upload_base = None
+
+        payload = {k: frame[k] for k in ('seq', 'geometry', 'jpeg_base64')}
+        if (base and base['geometry'] == payload['geometry'] and
+                base['jpeg_base64'] == payload['jpeg_base64']):
+            del payload['jpeg_base64']
+            payload['repeat_after'] = base['seq']
+
+        value = self.frame_hub.call('live-frame', {'id': ident, 'frame': payload})
+        with self.lock:
+            if self.current != ident:
+                return
+            if not value['active']:
+                raise RuntimeError('连续画面已停止')
+            # Older relays omit frame_seq and always receive complete JPEGs.
+            if 'frame_seq' in value:
+                if value['frame_seq'] != frame['seq']:
+                    return
+                if self.repeat_uploads:
+                    self.upload_base = frame
+            elif 'repeat_after' in payload:
+                return
+            self.last_frame = frame['seq']
+            self.media_at = time.monotonic()
 
     def end(self,ident,error,reason=None):
         with self.lock:
