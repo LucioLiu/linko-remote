@@ -144,7 +144,7 @@ class LiveAgent:
     def send_avc_stream(self, ident, upload):
         with self.lock:
             if (self.avc_pending and
-                    time.monotonic() - self.avc_pending[0][1] >= AVC_UPLOAD_PROGRESS_TIMEOUT):
+                    time.monotonic() - max(self.avc_pending[0][1], self.media_at) >= AVC_UPLOAD_PROGRESS_TIMEOUT):
                 self.fallback_avc_stream(ident)
                 return
         frames = self.read_avc_mailbox(ident)
@@ -156,7 +156,7 @@ class LiveAgent:
                         or now >= self.avc_lease):
                     return
                 pending = self.avc_pending
-                if pending and now - pending[0][1] >= AVC_UPLOAD_PROGRESS_TIMEOUT:
+                if pending and now - max(pending[0][1], self.media_at) >= AVC_UPLOAD_PROGRESS_TIMEOUT:
                     self.fallback_avc_stream(ident)
                     return
                 seq = frame['seq']
