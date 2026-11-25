@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>邻控动态桌面测试</title>
+<style>
+body { margin: 0; font: 19px system-ui,sans-serif; color: #203247; background: #fafafa; }
+header { padding: 14px 22px; background: #163652; color: white; }
+output { padding: 0 10px; font: 20px monospace; }
+canvas { display: block; width: 100vw; height: calc(100vh - 56px); }
+</style>
+<header>滚动文字　<output></output>　点击或按空格切换标记</header>
+<canvas width="1280" height="720" aria-label="连续滚动的测试文字"></canvas>
+<script>
+const canvas = document.querySelector('canvas');
+const graphics = canvas.getContext('2d');
+const output = document.querySelector('output');
+let marked = false, shown = -1;
+function toggle() { marked = !marked; }
+canvas.addEventListener('click', toggle);
+window.addEventListener('keydown', event => {
+  if (event.code === 'Space' && !event.repeat) { event.preventDefault(); toggle(); }
+});
+function paint(time) {
+  const tick = Math.floor(time / 50);
+  if (tick !== shown) {
+    shown = tick;
+    graphics.fillStyle = '#fafafa';
+    graphics.fillRect(0, 0, canvas.width, canvas.height);
+    graphics.font = '19px monospace';
+    const scroll = tick * 7;
+    for (let row = 0; row <= 26; row++) {
+      const index = Math.floor(scroll / 30) + row;
+      const y = row * 30 - scroll % 30;
+      graphics.fillStyle = index % 2 ? '#eff5f7' : '#fafafa';
+      graphics.fillRect(0,y,canvas.width,30);
+      graphics.fillStyle = '#203247';
+      graphics.fillText(String(index).padStart(7,'0') + '      Quality      ABCDEFG      延迟      0123456789',24,y+22);
+    }
+    graphics.fillStyle = marked ? '#137a3b' : '#e95127';
+    graphics.fillRect(canvas.width-90,0,90,90);
+    output.value = String(tick);
+    document.title = '邻控动态桌面测试 ' + tick;
+  }
+  requestAnimationFrame(paint);
+}
+requestAnimationFrame(paint);
+</script>
+</html>
