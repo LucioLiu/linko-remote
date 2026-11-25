@@ -13,7 +13,7 @@ async function api(operation, body = {}) {
  return value.value;
 }
 function note(message, good = false) { $('notice').textContent = message; $('notice').className = 'notice' + (good ? ' good' : ''); }
-function platform(value) { return value === 'macos' ? 'macOS' : value === 'windows' ? 'Windows' : '电脑'; }
+function platform(value) { return {macos:'macOS',windows:'Windows',linux:'Linux'}[value] || '电脑'; }
 function textNode(tag, value, className = '') { const el = document.createElement(tag); el.textContent = value; el.className = className; return el; }
 function action(label, handler, primary = false) { const el = textNode('button', label, 'button ' + (primary ? 'primary' : 'secondary')); el.onclick = () => Promise.resolve(handler()).catch(e => note(e.message)); return el; }
 function renderDevices() {
@@ -28,18 +28,19 @@ function renderDevices() {
   meta.append(textNode('strong',peer.name),textNode('small',platform(peer.platform) + ' · ' + peer.id + (peer.trusted_incoming ? ' · 已长期授权' : peer.incoming ? ' · 已授权连接本机' : '')));
   const online = state.connected && peer.online;
   const paused = peer.accepting_connections === false;
-  const statusLabel = paused ? '● 在线 · 暂停接收' : '● 应用在线';
+  const initiatorOnly = peer.accepts_desktop === false;
+  const statusLabel = initiatorOnly ? '● 在线 · 可发起连接' : paused ? '● 在线 · 暂停接收' : '● 应用在线';
   const status = textNode('div',online ? statusLabel : state.connected ? '○ 离线' : '○ 状态待更新','device-status' + (online ? ' online' : ''));
   const buttons = textNode('div','','row-actions');
   const pending = !peer.can_control && waiting.has(peer.id);
   const awaitingReceipt = Boolean(state.pending[peer.id]);
-  const connect = action(awaitingReceipt ? '查询原结果' : peer.can_control ? '打开桌面' : pending ? '等待对方同意' : '请求连接',async () => {
+  const connect = action(awaitingReceipt ? '查询原结果' : initiatorOnly ? '可发起连接' : peer.can_control ? '打开桌面' : pending ? '等待对方同意' : '请求连接',async () => {
    if(awaitingReceipt || peer.can_control){openRemote(peer);return;}
    connect.disabled=true;
    try{await api('access',{peer:peer.id});note('请对方打开邻控，在两分钟内同意。',true);await refresh();}
    finally{connect.disabled=false;}
   },true);
-  connect.disabled=!state.connected || (!awaitingReceipt && (!online || paused || pending));
+  connect.disabled=!state.connected || (!awaitingReceipt && (!online || paused || pending || initiatorOnly));
   buttons.append(connect);
   if(peer.can_control || peer.incoming || peer.trusted_incoming) buttons.append(action(peer.trusted_incoming ? '撤销信任并断开' : '断开', async()=>{await api('disconnect',{peer:peer.id}); if(selectedPeer?.id===peer.id) closeRemote(); await refresh();}));
   row.append(icon,meta,status,buttons); list.append(row);
@@ -60,14 +61,18 @@ async function refresh() {
   $('version').textContent=state.version;
   $('generate').disabled=!state.incoming || !state.connected; $('settings-version').textContent=state.version; $('settings-network').textContent=state.connected?'已连接':state.error || '正在连接';
   const ready=state.permissions.screen && state.permissions.input;
-  $('permission-text').textContent=state.pause_pending?'本机已暂停接收，等待与连接服务同步':state.agent_error || (ready?'本机屏幕与键鼠权限已就绪':'连接本机需要录屏与辅助功能权限'); $('settings-permissions').textContent=state.agent_error || (ready?'已就绪':'等待系统权限');
+  const controllerOnly=state.supports_incoming===false;
+  $('receive-row').classList.toggle('hidden',controllerOnly); $('code-area').classList.toggle('hidden',controllerOnly);
+  $('permission-text').textContent=controllerOnly?'Linux 候选版支持发起远程桌面和 SSH 连接':state.pause_pending?'本机已暂停接收，等待与连接服务同步':state.agent_error || (ready?'本机屏幕与键鼠权限已就绪':'连接本机需要录屏与辅助功能权限');
+  $('settings-permissions').textContent=controllerOnly?'可发起连接':state.agent_error || (ready?'已就绪':'等待系统权限');
+  $('screen-permission').classList.toggle('hidden',controllerOnly); $('input-permission').classList.toggle('hidden',controllerOnly);
   $('screen-permission').disabled=state.permissions.screen; $('input-permission').disabled=state.permissions.input;
-  renderDevices(); renderSSH(); renderUpdates();
+  syncInviteActions(); renderDevices(); renderSSH(); renderUpdates();
   const approvals=state.connected && state.incoming ? state.approvals : [];
   if(!activeApproval && approvals.length){activeApproval=approvals[0];$('approval-name').textContent=activeApproval.peer.name;$('approval-detail').textContent=platform(activeApproval.peer.platform)+' · '+activeApproval.peer.id;$('approval-permission').textContent=state.supports_long_term_trust
-   ? '允许后，这台电脑可直接查看屏幕并操作键鼠。邻控下次启动后仍可连接。你可以暂停接收连接，或在设备列表撤销授权。'
+   ? '允许本次连接后，对方可在一小时内操作本机。长期授权可在设备列表撤销。'
    : '允许后，对方可在一小时内查看本机屏幕并操作键鼠。';
-  $('approve').textContent=state.supports_long_term_trust?'允许长期连接':'允许本次连接';
+  $('approve-persistent').classList.toggle('hidden',!state.supports_long_term_trust);
   $('approval-dialog').showModal();}
   if(activeApproval && !approvals.some(x=>x.id===activeApproval.id)){ $('approval-dialog').close(); activeApproval=null; }
   if(selectedPeer && state.pending[selectedPeer.id] && !remotePending){remotePending=state.pending[selectedPeer.id];remotePendingRestored=true;$('remote-state').textContent='上一操作结果未确认，请查询原结果';}
@@ -81,21 +86,83 @@ $('incoming').onchange=async()=>{
  changingAvailability=true;$('incoming').disabled=true;
  try{
   const result=await api('availability',{enabled});
-  if(!result.incoming){ownCode=null;$('own-code').textContent='•••• •••• ••••';$('copy-code').disabled=true;}
+  if(!result.incoming){ownCode=null;syncInviteActions();}
   if(result.sync_pending)note('本机已暂停接收，联网后会同步。',true);
  }catch(e){note(e.message);}
  finally{changingAvailability=false;$('incoming').disabled=false;await refresh();}
 };
-$('generate').onclick=async()=>{try{ownCode=await api('code');$('own-code').textContent=ownCode.code.match(/.{1,4}/g).join(' ');$('copy-code').disabled=false;$('generate').textContent='刷新连接码';}catch(e){note(e.message);}};
-async function copy(value){try{await navigator.clipboard.writeText(value);}catch{const field=document.createElement('textarea');field.value=value;document.body.append(field);field.select();document.execCommand('copy');field.remove();}note('连接码已复制，通过可信渠道发给对方。',true);}
-$('copy-code').onclick=()=>ownCode && copy(ownCode.connection);
-$('connect-form').onsubmit=async event=>{event.preventDefault();const code=$('connect-code').value.trim();if(!code.startsWith('linko2:') && !/^\d{12}$/.test(code.replace(/[\s-]/g,''))){note('请输入对方的 12 位连接码。');return;}$('connect-button').disabled=true;try{await api('connect',{code});note('连接申请已发出，请等待对方在邻控中确认。',true);$('connect-code').value='';}catch(e){note(e.message);}finally{$('connect-button').disabled=false;}};
+function connectionCode(value){
+ if(typeof value!=='string')return '';
+ const code=value.trim();
+ if(/^linko2:[a-zA-Z0-9_-]{1,2000}$/.test(code))return code;
+ const digits=code.replace(/[\s-]/g,'');
+ return /^\d{12}$/.test(digits)?digits:'';
+}
+function readInvitation(text, now=Date.now()/1000){
+ let value;
+ try{value=JSON.parse(text);}catch{throw new Error('邀请文件内容无效。');}
+ if(!value || value.kind!=='linko-invitation' || value.version!==1 || !connectionCode(value.code) || !Number.isFinite(value.expires)){
+  throw new Error('邀请文件内容无效。');
+ }
+ if(value.expires<=now)throw new Error('邀请已过期，请对方重新生成。');
+ return connectionCode(value.code);
+}
+function syncInviteActions(){
+ const seconds=ownCode?Math.max(0,Math.ceil(ownCode.expires-Date.now()/1000)):0;
+ const canShare=Boolean(seconds && state?.connected && state.incoming);
+ $('copy-code').disabled=!canShare; $('save-invite').disabled=!canShare;
+ $('generate').textContent=canShare?'刷新连接码':'生成连接码';
+ $('own-code').textContent=canShare?ownCode.code.match(/.{1,4}/g).join(' '):'•••• •••• ••••';
+ $('code-hint').textContent=canShare?Math.floor(seconds/60)+':'+String(seconds%60).padStart(2,'0')+' 后失效 · 对方发起后需你确认':ownCode && !seconds?'连接码已过期，请重新生成':'允许连接后，生成 10 分钟有效的连接码';
+}
+$('generate').onclick=async()=>{try{ownCode=await api('code');syncInviteActions();}catch(e){note(e.message);}};
+async function copy(value){
+ try{await navigator.clipboard.writeText(value);}
+ catch{
+  const field=document.createElement('textarea');field.value=value;document.body.append(field);field.select();
+  try{if(!document.execCommand('copy'))throw new Error('复制失败，请手动选中连接码。');}
+  finally{field.remove();}
+ }
+ note('连接码已复制。',true);
+}
+$('copy-code').onclick=()=>{if(ownCode && ownCode.expires>Date.now()/1000)copy(ownCode.connection || ownCode.code).catch(e=>note(e.message));};
+$('save-invite').onclick=async()=>{
+ if(!ownCode || ownCode.expires<=Date.now()/1000)return;
+ const contents=JSON.stringify({kind:'linko-invitation',version:1,code:ownCode.connection || ownCode.code,expires:ownCode.expires});
+ const nativeSave=window.webkit?.messageHandlers?.linkoInvite;
+ if(nativeSave){
+  try{if(await nativeSave.postMessage(contents))note('邀请文件已保存。',true);}
+  catch(e){note(e.message || '邀请文件保存失败。');}
+  return;
+ }
+ const url=URL.createObjectURL(new Blob([contents],{type:'application/json'}));
+ const link=document.createElement('a');link.href=url;link.download='邻控邀请.linko';
+ document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);
+};
+$('open-invite').onclick=()=>$('invite-file').click();
+$('invite-file').onchange=async()=>{
+ const input=$('invite-file'), file=input.files[0];input.value='';
+ if(!file)return;
+ try{
+  if(file.size>4096)throw new Error('邀请文件内容无效。');
+  $('connect-code').value=readInvitation(await file.text());
+  $('connect-button').focus();note('邀请已读取。点击「发起连接」后，等待对方确认。',true);
+ }catch(e){note(e.message);}
+};
+$('connect-form').onsubmit=async event=>{
+ event.preventDefault();const code=connectionCode($('connect-code').value);
+ if(!code){note('请输入有效的邻控连接码，或打开邀请文件。');return;}
+ $('connect-button').disabled=true;
+ try{await api('connect',{code});note('连接申请已发出，请等待对方在邻控中确认。',true);$('connect-code').value='';}
+ catch(e){note(e.message);}finally{$('connect-button').disabled=false;}
+};
 $('rename').onclick=()=>{$('new-name').value=state.self.name;$('rename-dialog').showModal();};
 $('rename-dialog').addEventListener('close',async()=>{if($('rename-dialog').returnValue==='save'){try{await api('name',{name:$('new-name').value});await refresh();}catch(e){note(e.message);}}});
 for(const [id,kind] of [['screen-permission','screen'],['input-permission','input']])$(id).onclick=()=>api('permissions',{kind}).catch(e=>note(e.message));
 $('add-ssh').onclick=()=>$('ssh-dialog').showModal();$('ssh-dialog').addEventListener('close',async()=>{if($('ssh-dialog').returnValue==='save'){try{const value=Object.fromEntries(new FormData($('ssh-dialog').querySelector('form')));await api('ssh-save',value);await refresh();}catch(e){note(e.message);}}});
 async function approve(allow,persistent=false){if(!activeApproval)return;const id=activeApproval.id;try{await api('approve',{approval:id,allow,...(persistent?{persistent:true}:{})});$('approval-dialog').close();activeApproval=null;await refresh();}catch(e){note(e.message);}}
-$('approve').onclick=()=>approve(true,state.supports_long_term_trust===true);
+$('approve').onclick=()=>approve(true);
+$('approve-persistent').onclick=()=>approve(true,true);
 $('deny').onclick=()=>approve(false);
 function openRemote(peer){
  selectedPeer=peer;remoteFrame=null;remotePending=state.pending[peer.id] || null;
@@ -148,10 +215,13 @@ async function perform(request){
 $('remote-refresh').onclick=()=>live?restartLive():perform({action:'observe'});$('remote-recover').onclick=recoverPending;
 $('remote-image').onclick=event=>{if(live || !remoteFrame)return;const rect=event.target.getBoundingClientRect();perform({action:'click',x:Math.min(remoteFrame.bounds[2]-1,Math.floor((event.clientX-rect.left)*remoteFrame.bounds[2]/rect.width)),y:Math.min(remoteFrame.bounds[3]-1,Math.floor((event.clientY-rect.top)*remoteFrame.bounds[3]/rect.height)),button:'left'});};
 $('send-text').onclick=()=>{const value=$('remote-text').value;if(value){if(live){if(value.length>500){$('remote-state').textContent='连续桌面每次最多发送 500 字，请分段发送';return;}queueLive({type:'text',text:value});}else perform({action:'text',text:value});}};document.querySelectorAll('.key').forEach(button=>button.onclick=()=>{if(live){const code={ENTER:'Enter',TAB:'Tab',ESC:'Escape',BACKSPACE:'Backspace'}[button.dataset.key];queueLive({type:'keydown',code});queueLive({type:'keyup',code});}else perform({action:'key',keys:[button.dataset.key]});});
-setInterval(()=>{if(ownCode){const seconds=Math.max(0,Math.ceil(ownCode.expires-Date.now()/1000));$('code-hint').textContent=seconds?Math.floor(seconds/60)+':'+String(seconds%60).padStart(2,'0')+' 后失效 · 对方输入后仍需你确认':'连接码已过期，请重新生成';if(!seconds)$('copy-code').disabled=true;}},1000);
+setInterval(syncInviteActions,1000);
 setInterval(refresh,2500);setInterval(()=>{if(remotePending && $('remote-dialog').open)recoverPending();},2000);refresh();
 
 function renderUpdates(){
+ const supported=state.supports_updates!==false;
+ document.querySelector('.update-card').classList.toggle('hidden',!supported);
+ if(!supported){$('update-banner').classList.add('hidden');return;}
  const update=state.updates;if(!update)return;
  $('auto-update-check').checked=update.auto_check;
  $('update-state').textContent=update.message;

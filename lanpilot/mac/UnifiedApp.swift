@@ -1,7 +1,8 @@
 import Cocoa
+import UniformTypeIdentifiers
 import WebKit
 
-final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, WKScriptMessageHandlerWithReply {
  var window: NSWindow!
  var view: WKWebView!
  var process: Process?
@@ -12,7 +13,8 @@ final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, W
   window.title="邻控";window.minSize=NSSize(width:860,height:680);window.center();window.isReleasedWhenClosed=false
   let configuration=WKWebViewConfiguration()
   configuration.userContentController.add(self,name:"linkoUpdate")
-  view=WKWebView(frame:window.contentView!.bounds,configuration:configuration);view.navigationDelegate=self;view.autoresizingMask=[.width,.height];window.contentView=view
+  configuration.userContentController.addScriptMessageHandler(self,contentWorld:.page,name:"linkoInvite")
+  view=WKWebView(frame:window.contentView!.bounds,configuration:configuration);view.navigationDelegate=self;view.uiDelegate=self;view.autoresizingMask=[.width,.height];window.contentView=view
   window.makeKeyAndOrderFront(nil)
   let menu=NSMenu(), item=NSMenuItem(), appMenu=NSMenu()
   appMenu.addItem(withTitle:"关于邻控",action:#selector(about),keyEquivalent:"").target=self
@@ -39,11 +41,38 @@ final class UnifiedApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, W
    }catch {DispatchQueue.main.async{let alert=NSAlert();alert.messageText="邻控暂时无法启动";alert.informativeText="本地连接服务没有正常启动。原版配对和安装不受影响。";alert.runModal()}}
   }
  }
+ func isLocalMainFrame(_ frame: WKFrameInfo) -> Bool {
+  guard frame.isMainFrame, let url=frame.request.url, url.host=="127.0.0.1", url.scheme=="http", let port=url.port else {return false}
+  return "127.0.0.1:\(port)" == authority
+ }
  func userContentController(_ userContentController:WKUserContentController,didReceive message:WKScriptMessage){
-  guard message.name=="linkoUpdate",message.body as? String=="installing",message.frameInfo.isMainFrame,
-   let url=message.frameInfo.request.url,url.host=="127.0.0.1",url.scheme=="http",
-   url.host!+":"+String(url.port ?? 80)==authority else{return}
+  guard message.name=="linkoUpdate",message.body as? String=="installing",isLocalMainFrame(message.frameInfo) else{return}
   NSApp.terminate(nil)
+ }
+ func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage, replyHandler: @escaping (Any?, String?) -> Void) {
+  guard message.name=="linkoInvite", isLocalMainFrame(message.frameInfo), let content=message.body as? String,
+        let data=content.data(using:.utf8), data.count<=4096 else {
+   replyHandler(nil,"邀请文件内容无效。");return
+  }
+  let panel=NSSavePanel()
+  panel.nameFieldStringValue="邻控邀请.linko"
+  if let type=UTType(filenameExtension:"linko"){panel.allowedContentTypes=[type]}
+  panel.beginSheetModal(for:window){result in
+   guard result == .OK, let url=panel.url else {replyHandler(false,nil);return}
+   do {
+    try data.write(to:url,options:.atomic)
+    try? FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:url.path)
+    replyHandler(true,nil)
+   }
+   catch {replyHandler(nil,"邀请文件保存失败。")}
+  }
+ }
+ func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
+  guard isLocalMainFrame(frame) else {completionHandler(nil);return}
+  let panel=NSOpenPanel()
+  panel.canChooseDirectories=false
+  if let type=UTType(filenameExtension:"linko"){panel.allowedContentTypes=[type]}
+  panel.beginSheetModal(for:window){result in completionHandler(result == .OK ? panel.urls : nil)}
  }
  func webView(_ webView:WKWebView,decidePolicyFor navigationAction:WKNavigationAction,decisionHandler:@escaping(WKNavigationActionPolicy)->Void){
   guard let url=navigationAction.request.url,url.scheme=="http",url.host=="127.0.0.1",url.host!+":"+String(url.port ?? 80)==authority else{decisionHandler(.cancel);return};decisionHandler(.allow)

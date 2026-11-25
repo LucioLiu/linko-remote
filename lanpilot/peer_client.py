@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import ssl
@@ -23,7 +24,7 @@ import uuid
 import webbrowser
 
 from desktop import make_request
-from .peer_hub import READ_ONLY_TIMEOUTS, display_name
+from .peer_hub import DESKTOP_PLATFORMS, DESKTOP_UNAVAILABLE, READ_ONLY_TIMEOUTS, display_name
 from .version import VERSION
 from .updater import UpdateManager
 from .live_agent import LiveAgent
@@ -35,6 +36,27 @@ MAX_BODY = 24_000_000
 STATE_STALE_AFTER = 8
 LEGACY_PREVIEW_ENDPOINT = {'url': 'https://bore.pub:49006',
                            'pin': 'd660698b3705ed323698955c0e36fe0e2be71d11777eee3d2e2bc1ff2dde73af'}
+
+
+def desktop_platform():
+    if sys.platform.startswith('linux'):
+        return 'linux'
+    try:
+        return {'darwin': 'macos', 'win32': 'windows'}[sys.platform]
+    except KeyError:
+        raise ValueError('当前操作系统尚不受支持') from None
+
+
+def default_home():
+    platform = desktop_platform()
+    if platform == 'windows':
+        return Path(os.environ['LOCALAPPDATA']) / 'LinkoRemote'
+    if platform == 'macos':
+        return Path.home() / 'Library/Application Support/LinkoRemote'
+    config_root = Path(os.environ.get('XDG_CONFIG_HOME', ''))
+    if not config_root.is_absolute():
+        config_root = Path.home() / '.config'
+    return config_root / 'linko-remote'
 
 
 class InstanceLock:
@@ -191,19 +213,24 @@ class MailboxAgent:
         self.stop_path = self.workspace / 'stop'
 
     def permissions(self):
-        if sys.platform == 'darwin':
+        platform = desktop_platform()
+        if platform == 'macos':
             helper = ROOT / 'native/LinkoDesktop'
             result = subprocess.run([str(helper), '--permissions'], capture_output=True, timeout=8)
             return json.loads(result.stdout)
-        return {'screen': True, 'input': True, 'platform': 'windows'}
+        supported = platform in DESKTOP_PLATFORMS
+        return {'screen': supported, 'input': supported, 'platform': platform}
 
     def start(self):
+        platform = desktop_platform()
+        if platform not in DESKTOP_PLATFORMS:
+            raise PermissionError(DESKTOP_UNAVAILABLE)
         if self.process and self.process.poll() is None:
             if not self.stop_path.exists():
                 return
             self.process.wait(timeout=5)
         self.stop_path.unlink(missing_ok=True)
-        if sys.platform == 'darwin':
+        if platform == 'macos':
             permissions = self.permissions()
             if not permissions.get('screen') or not permissions.get('input'):
                 raise PermissionError('请先在 macOS 系统设置中允许邻控录屏和辅助功能')
@@ -256,7 +283,9 @@ class DesktopClient:
     def __init__(self, home, endpoint, hub_factory=PinnedHub, agent_factory=MailboxAgent):
         self.home = Path(home)
         self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.platform = 'macos' if sys.platform == 'darwin' else 'windows'
+        self.platform = desktop_platform()
+        self.supports_incoming = self.platform in DESKTOP_PLATFORMS
+        self.supports_updates = self.platform in DESKTOP_PLATFORMS
         self.path = self.home / 'client.json'
         if self.path.exists():
             self.config = json.loads(self.path.read_text())
@@ -269,7 +298,7 @@ class DesktopClient:
         else:
             credential = secrets.token_urlsafe(32)
             # Never import the developer's or the current user's OS hostname.
-            label = 'Mac 电脑' if self.platform == 'macos' else 'Windows 电脑'
+            label = {'macos': 'Mac 电脑', 'windows': 'Windows 电脑', 'linux': 'Linux 电脑'}[self.platform]
             self.config = {'credential': credential,
                            'name': label + ' ' + hashlib.sha256(credential.encode()).hexdigest()[:4],
                            'endpoint': endpoint, 'ssh': []}
@@ -298,15 +327,18 @@ class DesktopClient:
         self.pending_path = self.home / 'pending.json'
         self.pending = json.loads(self.pending_path.read_text()) if self.pending_path.exists() else {}
         self.updating = False
-        self.updater = UpdateManager(self.home, lambda: self.config.get('auto_update_check', True))
+        self.updater = UpdateManager(self.home, lambda: self.supports_updates and self.config.get('auto_update_check', True),
+                                     system=self.platform)
         self.live_agent = LiveAgent(self, hub_factory, atomic_json)
         self.live_session = None
         self.live_view = None
 
     def start(self):
         threading.Thread(target=self._pump, daemon=True).start()
-        self.updater.start()
-        self.live_agent.start()
+        if self.supports_updates:
+            self.updater.start()
+        if self.supports_incoming:
+            self.live_agent.start()
 
     def _pump(self):
         registered = False
@@ -317,10 +349,16 @@ class DesktopClient:
                     with self.operation_lock:
                         if self.stop_event.is_set():
                             return
-                        self.agent_hub.call('register', {'name': self.config['name'], 'platform': self.platform, 'live_version': 1})
+                        try:
+                            self.agent_hub.call('register', {'name': self.config['name'], 'platform': self.platform,
+                                                             'live_version': int(self.supports_incoming)})
+                        except HubRejection as error:
+                            if self.platform == 'linux':
+                                raise ValueError('Linux 电脑注册失败，请检查连接服务是否支持 Linux：' + str(error)) from error
+                            raise
                         # Clear temporary grants before restoring explicitly trusted peers.
                         self.agent_hub.call('availability', {'enabled': False})
-                        if self.config.get('resume_trusted_access', True):
+                        if self.supports_incoming and self.config.get('resume_trusted_access', True):
                             peers = self.agent_hub.call('state').get('peers', [])
                             if any(peer.get('trusted_incoming') for peer in peers):
                                 try:
@@ -332,7 +370,8 @@ class DesktopClient:
                                     self._enable_relay_availability(self.agent_hub)
                     registered = True
                 self._reconcile_incoming()
-                waiting_for_worker = self._sync_commands()
+                if self.supports_incoming:
+                    waiting_for_worker = self._sync_commands()
                 if not self._state_is_current(2):
                     started_wall = time.time()
                     started = time.monotonic()
@@ -461,6 +500,7 @@ class DesktopClient:
             value = dict(self.state)
             connected = self._state_is_current(STATE_STALE_AFTER)
             value.update(version=VERSION, connected=connected, error=self.error,
+                         supports_incoming=self.supports_incoming, supports_updates=self.supports_updates,
                          incoming=self.incoming, pause_pending=self.pause_pending, agent_error=self.agent_error,
                          permissions=self.permissions, ssh=self.config['ssh'], pending=dict(self.pending))
         value['updates'] = self.updater.snapshot()
@@ -510,6 +550,8 @@ class DesktopClient:
                 self.live_view = LiveView(self.live_hub, value['id'], self.stop_event)
                 self.live_view.start()
             return value
+        if not self.supports_updates and operation.startswith('update-'):
+            raise ValueError('Linux 预览版请通过安装包更新邻控')
         if operation == 'update-check':
             return self.updater.begin('check')
         if operation == 'update-download':
@@ -537,6 +579,8 @@ class DesktopClient:
             if type(enabled) is not bool:
                 raise ValueError('请明确选择是否允许连接')
             if enabled:
+                if not self.supports_incoming:
+                    raise PermissionError(DESKTOP_UNAVAILABLE)
                 self._start_agent()
                 value = self._enable_relay_availability(self.ui_hub)
                 try:
@@ -669,14 +713,36 @@ class DesktopClient:
         if item['user']:
             args += ['-l', item['user']]
         args += ['--', item['host']]
-        if sys.platform == 'darwin':
+        if self.platform == 'macos':
             path = self.home / ('ssh-' + identifier + '.command')
             path.write_text('#!/bin/sh\nexec ' + shlex.join(args) + '\n')
             path.chmod(0o700)
             subprocess.Popen(['/usr/bin/open', '-a', 'Terminal', str(path)])
-        else:
+        elif self.platform == 'windows':
             subprocess.Popen(['cmd.exe', '/d', '/c', 'start', '', 'ssh.exe', *args[1:]])
+        else:
+            self.open_linux_ssh(args)
         return {'opened': True}
+
+    @staticmethod
+    def open_linux_ssh(args):
+        ssh = shutil.which('ssh')
+        if ssh is None:
+            raise ValueError('请先安装 OpenSSH 客户端，再打开 SSH 连接')
+        if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+            raise ValueError('未检测到图形桌面，请在终端运行：' + shlex.join(args))
+        terminals = (('xdg-terminal-exec', '--'), ('gnome-terminal', '--'), ('konsole', '-e'),
+                     ('xfce4-terminal', '-x'), ('xterm', '-e'))
+        for name, flag in terminals:
+            terminal = shutil.which(name)
+            if terminal:
+                try:
+                    subprocess.Popen([terminal, flag, ssh, *args[1:]], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                except OSError:
+                    continue
+                return
+        raise ValueError('找不到可用的桌面终端，请在终端运行：' + shlex.join(args))
 
     def close(self):
         self.stop_event.set()
@@ -826,7 +892,7 @@ def main():
     parser.add_argument('--endpoint', type=Path, default=ROOT / 'peer-endpoint.json')
     parser.add_argument('--open-browser', action='store_true')
     args = parser.parse_args()
-    home = args.home or ((Path(os.environ['LOCALAPPDATA']) / 'LinkoRemote') if sys.platform == 'win32' else Path.home() / 'Library/Application Support/LinkoRemote')
+    home = args.home or default_home()
     endpoint = json.loads(args.endpoint.read_text())
     lock = InstanceLock(home)
     if not lock.acquire():

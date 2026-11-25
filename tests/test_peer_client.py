@@ -1,5 +1,6 @@
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import http.client
 import http.server
 import json
@@ -17,6 +18,7 @@ import uuid
 
 from lanpilot.peer_client import (
     DesktopClient, HubRejection, InstanceLock, LocalHandler, MailboxAgent, PinnedHub, RelayIdentityError, atomic_json,
+    default_home,
 )
 from lanpilot.peer_gateway import Handler, PeerGateway
 from lanpilot.peer_hub import PeerHub
@@ -64,6 +66,9 @@ class FakeAgent:
 
 class ClientTests(unittest.TestCase):
     def setUp(self):
+        platform = patch('lanpilot.peer_client.desktop_platform', return_value='macos')
+        platform.start()
+        self.addCleanup(platform.stop)
         self.folder = tempfile.TemporaryDirectory()
         self.hub = PeerHub(Path(self.folder.name) / 'hub.sqlite')
         LocalTransport.hub = self.hub
@@ -545,6 +550,74 @@ class ClientTests(unittest.TestCase):
         finally:
             one.close()
             two.close()
+
+
+class LinuxClientTests(unittest.TestCase):
+    def make_client(self, home):
+        endpoint = {'url': 'https://hub.example:443', 'pin': 'a' * 64}
+        return DesktopClient(home, endpoint, LocalTransport)
+
+    def test_linux_profile_uses_absolute_xdg_config_or_home_fallback(self):
+        with patch('lanpilot.peer_client.sys.platform', 'linux'), patch('lanpilot.peer_client.Path.home', return_value=Path('/home/test')):
+            for configured, expected in (('/test/config', '/test/config'), ('relative', '/home/test/.config'), ('', '/home/test/.config')):
+                with patch.dict(os.environ, {'XDG_CONFIG_HOME': configured}):
+                    self.assertEqual(Path(expected) / 'linko-remote', default_home())
+
+    def test_linux_can_pair_and_start_existing_desktop_modes_without_a_native_worker(self):
+        with tempfile.TemporaryDirectory() as directory, closing(PeerHub(Path(directory) / 'hub.sqlite')) as hub:
+            root = Path(directory)
+            token = secrets.token_urlsafe(32)
+            target = hub.dispatch('register', token, {'platform': 'windows', 'name': 'Fixture PC', 'live_version': 1})['id']
+            hub.dispatch('availability', token, {'enabled': True})
+            code = hub.dispatch('code', token, {})['code']
+            with patch.object(LocalTransport, 'hub', hub), patch('lanpilot.peer_client.sys.platform', 'linux'), patch('lanpilot.peer_client.subprocess.Popen') as popen:
+                linux = self.make_client(root / 'profile')
+                with patch.object(linux.stop_event, 'wait', side_effect=lambda _: linux.stop_event.set()):
+                    linux._pump()
+                linux.stop_event.clear()
+                state = linux.local_state()
+                self.assertEqual('linux', state['self']['platform'])
+                self.assertFalse(state['self']['accepts_desktop'])
+                self.assertTrue(state['connected'])
+                self.assertFalse(state['supports_incoming'])
+                self.assertFalse(state['supports_updates'])
+                self.assertNotIn('poll', linux.agent_hub.calls)
+                for enable in (linux.api, linux.ui_hub.call):
+                    with self.assertRaisesRegex(PermissionError, '暂未支持接收'):
+                        enable('availability', {'enabled': True})
+                with self.assertRaisesRegex(PermissionError, '暂未支持接收'):
+                    linux.agent.start()
+                with self.assertRaisesRegex(ValueError, '通过安装包更新'):
+                    linux.api('update-check', {})
+
+                approval = linux.api('connect', {'code': code})['approval']
+                hub.dispatch('approve', token, {'approval': approval, 'allow': True})
+                peer = hub.dispatch('state', token, {})['peers'][0]
+                self.assertFalse(peer['accepts_desktop'])
+                self.assertFalse(peer['live'])
+                guarded = linux.api('remote', {'peer': target, 'request': {'action': 'observe'}})
+                self.assertEqual(guarded['id'], hub.dispatch('poll', token, {})['id'])
+                receipt = {'ok': True, 'input_attempted': False, 'request_id': guarded['id']}
+                hub.dispatch('result', token, {'id': guarded['id'], 'result': receipt})
+                self.assertEqual(receipt, linux.api('recover', {'id': guarded['id']})['result'])
+                with patch('lanpilot.peer_client.LiveView.start'):
+                    live = linux.api('live-open', {'peer': target})
+                self.assertEqual(live, hub.dispatch('live-agent-state', token, {})['sessions'][0])
+                self.assertEqual({'closed': True}, linux.api('live-close', live))
+                popen.assert_not_called()
+
+    def test_linux_ssh_launches_open_ssh_in_desktop_terminal_with_separate_arguments(self):
+        tools = {'ssh': '/usr/bin/ssh', 'konsole': '/usr/bin/konsole'}
+        with tempfile.TemporaryDirectory() as directory, patch('lanpilot.peer_client.sys.platform', 'linux'):
+            linux = self.make_client(directory)
+            ssh = linux.save_ssh({'name': 'Test host', 'port': 2222, 'user': 'alice', 'host': 'fixture.example'})
+            with patch.dict(os.environ, {'WAYLAND_DISPLAY': 'wayland-0'}), patch('lanpilot.peer_client.shutil.which', side_effect=tools.get), patch('lanpilot.peer_client.subprocess.Popen') as popen:
+                self.assertEqual({'opened': True}, linux.open_ssh(ssh['id']))
+                self.assertEqual(['/usr/bin/konsole', '-e', '/usr/bin/ssh', '-p', '2222', '-l', 'alice', '--', 'fixture.example'], popen.call_args.args[0])
+                self.assertFalse(popen.call_args.kwargs.get('shell', False))
+            with patch.dict(os.environ, {'WAYLAND_DISPLAY': '', 'DISPLAY': ''}), patch('lanpilot.peer_client.shutil.which', side_effect=tools.get):
+                with self.assertRaisesRegex(ValueError, 'ssh -p 2222 -l alice -- fixture.example'):
+                    linux.open_ssh(ssh['id'])
 
 
 class LocalHTTPTests(unittest.TestCase):

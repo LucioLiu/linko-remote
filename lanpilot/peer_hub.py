@@ -21,6 +21,8 @@ from .live import LIVE_WAIT_MS, LiveSessions
 
 READ_ONLY_TIMEOUTS = {'observe': 'SCREEN_CAPTURE_TIMED_OUT', 'status': 'STATUS_TIMED_OUT'}
 BEFORE_DELIVERY = 'EXPIRED_OR_ACCESS_REVOKED_BEFORE_DELIVERY'
+DESKTOP_PLATFORMS = frozenset(('macos', 'windows'))
+DESKTOP_UNAVAILABLE = 'Linux 预览版可发起连接，暂未支持接收桌面控制'
 
 
 def digest(value):
@@ -90,7 +92,9 @@ class PeerHub:
         return row
 
     def _identity(self, row):
-        return {k: row[k] for k in ('id', 'name', 'platform')}
+        value = {k: row[k] for k in ('id', 'name', 'platform')}
+        value['accepts_desktop'] = row['platform'] in DESKTOP_PLATFORMS
+        return value
 
     def _approval(self, row):
         result = dict(row)
@@ -159,7 +163,7 @@ class PeerHub:
                 raise PermissionError('身份验证失败')
             name = display_name(body.get('name'))
             platform = body.get('platform')
-            if platform not in ('macos', 'windows'):
+            if not isinstance(platform, str) or platform not in DESKTOP_PLATFORMS | {'linux'}:
                 raise ValueError('不支持的系统')
             identifier = digest(credential)[:12]
             existing = self._one('SELECT * FROM devices WHERE id=?', (identifier,))
@@ -170,7 +174,8 @@ class PeerHub:
             self.db.execute('INSERT INTO devices VALUES(?,?,?,?,?,0) '
                             'ON CONFLICT(id) DO UPDATE SET name=excluded.name,seen=excluded.seen',
                             (identifier, digest(credential), name, platform, now))
-            self.db.execute('INSERT OR REPLACE INTO capabilities VALUES(?,?)', (identifier, int(body.get('live_version') == 1)))
+            live = platform in DESKTOP_PLATFORMS and body.get('live_version') == 1
+            self.db.execute('INSERT OR REPLACE INTO capabilities VALUES(?,?)', (identifier, int(live)))
             return {'id': identifier, 'name': name, 'platform': platform}
         device = self._device(credential)
         me = device['id']
@@ -185,6 +190,8 @@ class PeerHub:
         if operation == 'availability':
             if type(body.get('enabled')) is not bool:
                 raise ValueError('请明确选择是否允许连接')
+            if body['enabled'] and device['platform'] not in DESKTOP_PLATFORMS:
+                raise PermissionError(DESKTOP_UNAVAILABLE)
             self.db.execute('UPDATE devices SET incoming=? WHERE id=?', (body['enabled'], me))
             if not body['enabled']:
                 self.db.execute('DELETE FROM grants WHERE target=? AND expires IS NOT NULL', (me,))
