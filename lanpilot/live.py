@@ -36,6 +36,9 @@ AVC_VIEW_BATCH_SECONDS = .25
 AVC_VIEW_BATCH_BYTES = 64 * 1024
 AVC_VIEW_RESPONSE_TIMEOUT = 2.5
 AVC_VIEW_MAX_RELAY_AGE = .35
+AVC_PROFILE_HIGH = 1
+AVC_PROFILE_LOW = 2
+AVC_PROFILE_MIN_INTERVAL = 8
 LIVE_STREAM_RECORD_MAX = 1_510_000
 LIVE_STREAM_TYPE = 'application/x-ndjson'
 
@@ -138,6 +141,10 @@ class LiveSessions:
 
     def sender_media_options(self, session, body):
         options = self.media_options(session)
+        version = body.get('accept_avc_profile')
+        if options.get('live_avc') == 1 and type(version) is int and version == 1 and 'avc_profile' in session:
+            session['avc_profile_sender'] = True
+            options['avc_profile'] = session['avc_profile']
         requested = body.get('accept_avc_batch')
         if options.get('live_avc') == 1 and type(requested) is int and requested == 1:
             options['avc_batch'] = 1
@@ -163,7 +170,9 @@ class LiveSessions:
             if identifier not in self.sessions or session['error']:
                 return True
             if op == 'live-exchange':
-                return bool(session['queue'])
+                profile_changed = ('avc_profile' in result and
+                                   session.get('avc_profile') != result['avc_profile'])
+                return bool(session['queue']) or profile_changed
             frame = session['frame']
             fresh_frame = frame and frame['seq'] != body.get('after') and self.hub.clock() - session['frame_at'] < 2
             return session['ack'] != result['ack'] or bool(fresh_frame)
@@ -195,6 +204,10 @@ class LiveSessions:
             result = {'id':identifier, **self.media_options(s)}
             if s.get('avc') is not None and accepts_bounded_view(body):
                 result['avc_view_batch'] = 1
+                version = body.get('accept_avc_profile')
+                if type(version) is int and version == 1:
+                    s.update(avc_profile=AVC_PROFILE_HIGH, avc_profile_changed=float('-inf'))
+                    result['accept_avc_profile'] = 1
             return result
         if op == 'live-agent-state':
             return {'sessions': [{'id': s['id'], **self.sender_media_options(s, body)}
@@ -364,7 +377,7 @@ class LiveSessions:
             # A reconnect must use the legacy path and start with a fresh IDR.
             session['upload_retired'] = True
 
-    def begin_stream(self, credential, identifier, accept_avc):
+    def begin_stream(self, credential, identifier, accept_avc, *, bounded=False, profile=None):
         if not isinstance(identifier, str) or not re.fullmatch('[a-f0-9]{32}', identifier):
             raise ValueError('无效连续桌面请求')
         with self.hub.lock:
@@ -384,6 +397,12 @@ class LiveSessions:
             # Only an authenticated renewal request touches the existing viewer lease.
             if not accept_avc:
                 self.downgrade(session)
+            if (accept_avc and bounded and session.get('avc') is not None
+                    and session.get('avc_profile_sender') and type(profile) is int
+                    and profile in (AVC_PROFILE_HIGH, AVC_PROFILE_LOW) and profile != session['avc_profile']
+                    and now - session['avc_profile_changed'] >= AVC_PROFILE_MIN_INTERVAL):
+                session.update(avc_profile=profile, avc_profile_changed=now)
+                session['changed'].notify_all()
             session['streaming'] = True
             session['viewed'] = now
             return session

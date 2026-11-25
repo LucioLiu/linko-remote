@@ -75,7 +75,10 @@ function Invoke-LiveAvc($Control,[string]$Geometry){
    $script:liveAvc=[LiveAvc]::Start($script:liveAvcPath,$script:liveAvcNativeDeadline)
    $script:liveAvcTimer.Restart()
   }
-  $script:liveAvc.Maintain($script:liveAvcNativeDeadline,($Control.avc_key -gt $script:liveAvcKey))
+  # Match the bounded product profiles. Old leases omit the field.
+  $profile=1
+  if(($Control.avc_profile -is [int] -or $Control.avc_profile -is [long]) -and $Control.avc_profile -eq 2){$profile=2}
+  $script:liveAvc.Maintain($script:liveAvcNativeDeadline,($Control.avc_key -gt $script:liveAvcKey),$profile)
   $script:liveAvcKey=$Control.avc_key
   $frame=$script:liveAvc.TakeFrame()
   if($frame -and ($script:liveAvcStarted -or $frame.Idr)){

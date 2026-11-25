@@ -2,7 +2,7 @@
 
 `lanpilot-avc.exe` is an on-demand child process for the interactive desktop worker. It uses GDI to capture the WinSta0 Default desktop across the virtual screen, scales into a top-down DIB, converts to NV12 and encodes with the Windows Media Foundation software H.264 MFT. The encoder uses Baseline, CBR, a two-second GOP setting and low-latency mode. Capture is paced from each frame's start. There is one capture/encode/write loop and no application-level frame queue. The helper terminates on a desktop or virtual-screen geometry change so the worker can revalidate and restart. It draws the visible system cursor at its scaled hotspot before conversion to NV12. It opens no network connection or output file.
 
-The target is Windows 10 version 1703 or later with Media Foundation and the Microsoft H.264 encoder present. Software encoding is the first path. DXGI, hardware MFT selection and product wiring are outside this implementation. Windows N installations may require the system Media Feature Pack. See the [Microsoft encoder](https://learn.microsoft.com/en-us/windows/win32/medfound/h-264-video-encoder) and [low-latency property](https://learn.microsoft.com/en-us/windows/win32/medfound/codecapi-avlowlatencymode).
+The target is Windows 10 version 1703 or later with Media Foundation and the Microsoft H.264 encoder present. Software encoding is the first path. The desktop worker starts the helper through `LiveAvc.cs`. The capture path uses the software MFT and GDI. Windows N installations may require the system Media Feature Pack. See the [Microsoft encoder](https://learn.microsoft.com/en-us/windows/win32/medfound/h-264-video-encoder) and [low-latency property](https://learn.microsoft.com/en-us/windows/win32/medfound/codecapi-avlowlatencymode).
 
 ## Worker contract
 
@@ -22,7 +22,10 @@ Stdin commands are fixed nine bytes with the last eight in little endian. Serial
 | --- | --- | --- |
 | `R` | Absolute deadline tick | Replace the live lease with the supplied deadline. An expired process cannot be resumed. |
 | `K` | Zero | Request IDR for the next input processed after the command is handled. Pending requests coalesce. |
+| `Q` | `1` or `2` | Set the negotiated profile. Profile 1 uses the launch parameters. Profile 2 uses 750,000 bit/s CBR and a 12,500-byte HRD buffer. |
 | `S` | Zero | Stop without draining buffered video. |
+
+A profile change starts a fresh IDR within the same helper and keeps the capture geometry, Windows clock, FPS and frame sequence. The helper retains the current encoder if the replacement cannot be configured. HRD size is an encoder setting. Measure actual IDR size on Windows.
 
 An independent watchdog checks the process handle, command pipe and lease while the main thread is in GDI, Media Foundation or a blocking stdout write. It polls commands every 5 ms subject to scheduler granularity. A stop can leave a partial record or buffered earlier bytes in the pipe. The worker must discard partial records and suppress any AVC publication once its own session check fails.
 
@@ -64,10 +67,10 @@ From a Visual Studio Developer Command Prompt with a Windows SDK:
 cl /nologo /std:c++17 /O2 /EHsc /MT windows\video\sender.cpp /Fe:lanpilot-avc.exe mfplat.lib mfuuid.lib ole32.lib uuid.lib gdi32.lib user32.lib
 ```
 
-Run the Windows smoke test only from an authorized interactive test desktop. It reads frames in RAM and exercises the first IDR and parameter sets, sequence and dimensions, key requests, independent stop, expiry with unread stdout, watched process exit, and a closed control pipe.
+Run the Windows smoke test only from an authorized interactive test desktop. It reads frames in RAM and exercises the first IDR and parameter sets, sequence and dimensions, key requests, profile changes, independent stop, expiry with unread stdout, watched process exit, and a closed control pipe.
 
 ```powershell
 py -3 windows/video/test_windows.py C:\path\to\lanpilot-avc.exe
 ```
 
-Verified on an Apple Silicon Mac with llvm-mingw 20251007. The x64 and ARM64 builds both linked, and PE inspection found imports from Windows system DLLs only. The portable protocol, NAL marker and NV12 conversion tests passed under AddressSanitizer and UndefinedBehaviorSanitizer. All five Windows smoke cases were discovered and skipped on macOS. Windows GDI capture, actual MFT output and watchdog behavior have yet to be exercised on Windows. The Visual Studio build recipe was not executed.
+Verified on an Apple Silicon Mac with llvm-mingw 20251007. The x64 and ARM64 builds both linked, and PE inspection found imports from Windows system DLLs only. The portable protocol, NAL marker and NV12 conversion tests passed under AddressSanitizer and UndefinedBehaviorSanitizer. The Windows smoke suite requires an interactive Windows test machine. Windows GDI capture, actual MFT output and watchdog behavior have yet to be exercised on Windows. The Visual Studio build recipe was not executed.

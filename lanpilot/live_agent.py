@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 
-from .live import (AVC_BATCH_BYTES, AVC_BATCH_FRAMES, AVC_MAX_ENCODED,
+from .live import (AVC_BATCH_BYTES, AVC_BATCH_FRAMES, AVC_MAX_ENCODED, AVC_PROFILE_HIGH, AVC_PROFILE_LOW,
                    AVC_UPLOAD_MAX_QUEUE_AGE_MS, AVC_UPLOAD_PROGRESS_TIMEOUT,
                    AVC_UPLOAD_WINDOW_FRAMES, LIVE_WAIT_MS)
 
@@ -352,7 +352,7 @@ class LiveAgent:
                 if self.current:
                     sessions = [{'id': self.current}]
                 else:
-                    options = {'accept_avc_batch': 1} if self.avc_enabled else {}
+                    options = {'accept_avc_batch': 1, 'accept_avc_profile': 1} if self.avc_enabled else {}
                     if self.avc_enabled and hasattr(self.frame_hub, 'avc_upload'):
                         options['accept_avc_upload'] = 1
                     sessions = self.hub.call('live-agent-state', options)['sessions']
@@ -379,6 +379,8 @@ class LiveAgent:
                 if ended.get('id')==ident: raise RuntimeError(ended.get('error','连续桌面已停止'))
                 receipt=self.read('live-receipt.json')
                 body={'id':ident,'ack':receipt.get('seq',0) if receipt.get('id')==ident else 0}
+                if self.avc_enabled:
+                    body['accept_avc_profile'] = 1
                 if (starting and sessions[0].get('avc_batch') == 1) or self.avc_batch:
                     body['accept_avc_batch'] = 1
                 if (starting and sessions[0].get('avc_upload') == 1) or self.avc_stream:
@@ -404,6 +406,9 @@ class LiveAgent:
                     if self.avc_active:
                         self.avc_lease = time.monotonic() + lease
                         control.update(live_avc=1, avc_key=self.avc_key)
+                        profile = value.get('avc_profile')
+                        if type(profile) is int and profile in (AVC_PROFILE_HIGH, AVC_PROFILE_LOW):
+                            control['avc_profile'] = profile
                         if self.avc_batch:
                             control['avc_batch'] = 1
                     self.write(self.root/'live-control.json', control)

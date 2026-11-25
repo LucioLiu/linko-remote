@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -64,6 +65,7 @@ struct Session {
     HANDLE output;
     std::atomic<uint64_t> deadline;
     std::atomic<bool> key_requested{false};
+    std::atomic<unsigned> profile{profile_high};
 
     void check_lease() const {
         const DWORD state = WaitForSingleObject(parent, 0);
@@ -90,6 +92,10 @@ struct Session {
                     case 'K':
                         if (value != 0) stop(bad_control);
                         key_requested.store(true);
+                        break;
+                    case 'Q':
+                        if (value != profile_high && value != profile_low) stop(bad_control);
+                        profile.store(unsigned(value));
                         break;
                     case 'R': {
                         const uint64_t now = GetTickCount64();
@@ -269,7 +275,7 @@ class Encoder {
     }
 
 public:
-    void init(unsigned width, unsigned height, unsigned fps, unsigned bitrate) {
+    void init(unsigned width, unsigned height, unsigned fps, unsigned bitrate, unsigned buffer_bytes = 0) {
         fps_ = fps;
         input_size_ = width * height * 3 / 2;
         mf(CoCreateInstance(encoder_clsid, nullptr, CLSCTX_INPROC_SERVER,
@@ -281,6 +287,7 @@ public:
         mf(codec_->SetValue(&CODECAPI_AVLowLatencyMode, &latency), "enable low-latency encoder");
         codec_setting(codec_.Get(), CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
 
+        if (buffer_bytes) codec_setting(codec_.Get(), CODECAPI_AVEncCommonBufferSize, buffer_bytes);
         auto output = type(MFVideoFormat_H264, width, height, fps);
         mf(output->SetUINT32(MF_MT_AVG_BITRATE, bitrate), "average bitrate");
         mf(output->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base), "baseline profile");
@@ -375,17 +382,37 @@ void run(Session& session, unsigned max_width, unsigned max_height, unsigned fps
     desktop.init(max_width, max_height);
     mf(CoInitializeEx(nullptr, COINIT_MULTITHREADED), "CoInitializeEx");
     mf(MFStartup(MF_VERSION, MFSTARTUP_LITE), "MFStartup");
-    Encoder encoder;
-    encoder.init(desktop.width, desktop.height, fps, bitrate);
+    auto encoder = std::make_unique<Encoder>();
+    encoder->init(desktop.width, desktop.height, fps, bitrate);
+    unsigned requested_profile = profile_high, active_profile = profile_high;
 
     using Clock = std::chrono::steady_clock;
     const auto period = std::chrono::nanoseconds(1000000000 / fps);
     for (uint64_t sequence = 1;; ++sequence) {
         session.check_lease();
         const auto start = Clock::now();
+        const auto profile = session.profile.load();
+        if (profile != requested_profile) {
+            requested_profile = profile;
+            // Apply CBR buffer settings to a new transform, while keeping the
+            // same process, physical desktop, clock and monotonically increasing sequence.
+            try {
+                if (profile != active_profile) {
+                    auto replacement = std::make_unique<Encoder>();
+                    const bool low = profile == profile_low;
+                    replacement->init(desktop.width, desktop.height, fps,
+                                      low ? low_bitrate : bitrate, low ? low_buffer_bytes : 0);
+                    encoder = std::move(replacement);
+                    active_profile = profile;
+                }
+            } catch (const std::exception& error) {
+                // A rejected optional profile cannot stop an otherwise working stream.
+                std::fprintf(stderr, "lanpilot-avc: profile %u unavailable: %s\n", profile, error.what());
+            }
+        }
         const auto capture_tick = GetTickCount64();
         bool key = false;
-        const auto payload = encoder.encode(desktop, session, session.key_requested.exchange(false), key);
+        const auto payload = encoder->encode(desktop, session, session.key_requested.exchange(false), key);
         check_desktop();
         const auto header = frame_header(uint32_t(payload.size()), sequence, capture_tick,
                                          uint16_t(desktop.width), uint16_t(desktop.height), key, desktop.bounds);

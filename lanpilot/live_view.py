@@ -3,12 +3,45 @@ from collections import deque
 import threading
 import time
 
-from .live import LIVE_WAIT_MS
+from .live import AVC_PROFILE_HIGH, AVC_PROFILE_LOW, LIVE_WAIT_MS
 from .live_delta import DeltaError, decode_delta
 
 
+class AvcQuality:
+    """Choose between the negotiated AVC profiles using media delivery samples."""
+
+    min_sample_bytes = 8 * 1024
+
+    def __init__(self):
+        self.profile = AVC_PROFILE_HIGH
+        self.changed_at = self.sampled_at = float('-inf')
+        self.slow = self.fast = 0
+
+    def observe(self, now, size, serialization):
+        # Account for time spent delivering actual bytes, after subtracting
+        # request RTT (response headers) and relay-side production time.
+        # A tiny or empty batch gives no evidence about available bandwidth.
+        if size < self.min_sample_bytes:
+            return
+        if now - self.sampled_at > 4:
+            self.slow = self.fast = 0
+        self.sampled_at = now
+        mbps = size * 8 / max(serialization, .001) / 1_000_000
+        self.slow = self.slow + 1 if serialization >= .045 and mbps <= 2.2 else 0
+        self.fast = self.fast + 1 if mbps >= 4.0 else 0
+        if self.profile == AVC_PROFILE_HIGH and self.slow >= 3 and now - self.changed_at >= 8:
+            self.switch(AVC_PROFILE_LOW, now)
+        elif self.profile == AVC_PROFILE_LOW and self.fast >= 5 and now - self.changed_at >= 12:
+            self.switch(AVC_PROFILE_HIGH, now)
+
+    def switch(self, profile, now):
+        self.profile = profile
+        self.changed_at = now
+        self.slow = self.fast = 0
+
+
 class LiveView:
-    def __init__(self, hub, identifier, stop_event, *, stream_version=None, avc=False, bounded=False):
+    def __init__(self, hub, identifier, stop_event, *, stream_version=None, avc=False, bounded=False, adaptive=False):
         self.hub=hub;self.id=identifier;self.client_stop=stop_event
         self.stop=threading.Event();self.changed=threading.Condition()
         self.value={'id':identifier,'frame':None,'ack':0,'error':''}
@@ -18,6 +51,7 @@ class LiveView:
         self.stream = None
         self.media_feed = avc
         self.bounded = bounded
+        self.quality = AvcQuality() if bounded and adaptive else None
         self.jpeg_requested = threading.Event()
         self.media = deque()
         self.media_serial = 0
@@ -114,7 +148,9 @@ class LiveView:
         with self.changed:
             if not self.active():
                 return True
-            if self.bounded:
+            if self.quality:
+                stream = factory(self.id, accept_avc=True, bounded=True, quality=self.quality)
+            elif self.bounded:
                 stream = factory(self.id, accept_avc=True, bounded=True)
             elif self.media_feed:
                 stream = factory(self.id, accept_avc=True)

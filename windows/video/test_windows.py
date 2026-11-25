@@ -117,6 +117,34 @@ class SenderTest(unittest.TestCase):
         self.command(child, b"S")
         self.assertEqual(child.wait(timeout=2), 0)
 
+    def test_switch_and_restore_profile_with_continuous_sequence_and_geometry(self):
+        child = self.start(4000)
+        prior = self.frame(child)[0]
+        geometry = prior[4:6], prior[7:11]
+        for profile in (2, 1):
+            self.command(child, b"R", self.kernel.GetTickCount64() + 4000)
+            self.command(child, b"Q", profile)
+            for _ in range(15):  # shorter than the native two-second periodic GOP
+                frame = self.frame(child)
+                header = frame[0]
+                self.assertEqual(header[2], prior[2] + 1)
+                self.assertGreaterEqual(header[3], prior[3])
+                self.assertEqual((header[4:6], header[7:11]), geometry)
+                prior = header
+                if header[6]:
+                    self.idr(frame)
+                    break
+            else:
+                self.fail(f"profile {profile} produced no immediate IDR")
+        self.command(child, b"S")
+        self.assertEqual(child.wait(timeout=2), 0)
+
+    def test_invalid_profile_command_fails_closed(self):
+        child = self.start(4000)
+        self.frame(child)
+        self.command(child, b"Q", 750000)
+        self.assertEqual(child.wait(timeout=2), 4)
+
     def test_already_expired(self):
         child = self.start(0)
         self.assertEqual(child.wait(timeout=2), 2)

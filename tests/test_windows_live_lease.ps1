@@ -45,7 +45,7 @@ public sealed class LiveAvc : IDisposable {
   public bool Idr = true;
   public byte[] Bytes = new byte[]{76,80,65,49};
  }
- public static int Launches, Stops, Keys;
+ public static int Launches, Stops, Keys, Profile;
  public static ulong Deadline;
  public static bool Fail;
  public static Frame Next;
@@ -56,7 +56,8 @@ public sealed class LiveAvc : IDisposable {
   Deadline = deadline;
   return new LiveAvc();
  }
- public void Maintain(ulong deadline, bool requestKey) {
+ public void Maintain(ulong deadline, bool requestKey, int profile) {
+  Profile = profile;
   Deadline = deadline;
   if(requestKey)Keys++;
   if(Fail)throw new Exception("fixture encoder failure");
@@ -78,10 +79,11 @@ $script:workerStop=$false
 function Test-WorkerStop {return $script:workerStop}
 function Assert($Condition,[string]$Message){if(-not $Condition){throw $Message}}
 function Now-Live {return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()/1000.0}
-function Write-Control($Expires,[switch]$Avc,[int]$Key=0,[switch]$AvcBatch){
+function Write-Control($Expires,[switch]$Avc,[int]$Key=0,[switch]$AvcBatch,$Profile){
  $control=@{id=$id;expires=$Expires}
  if($Avc){$control.live_avc=1;$control.avc_key=$Key}
  if($AvcBatch){$control.avc_batch=1}
+ if($null -ne $Profile){$control.avc_profile=$Profile}
  Write-LiveJson 'live-control.json' $control
 }
 function Write-Batch([int]$Seq,$Events,[double]$Expires=((Now-Live)+1.5)){
@@ -257,6 +259,24 @@ try{
   Write-Control 0
   Invoke-LiveDesktop
   Assert ([LiveAvc]::Stops -eq 1 -and -not $script:liveId) 'Revoke did not stop native capture'
+ }
+ Run-Case 'AVC profile changes preserve the worker, capture sequence and input lease' {
+  [IO.File]::WriteAllText($script:liveAvcPath,'')
+  $sequence=0
+  foreach($profile in @(1,2,2,'2',1)){
+   Write-Control ((Now-Live)+2.5) -Avc -Profile $profile
+   [LiveAvc]::Next=[LiveAvc+Frame]::new()
+   [LiveAvc]::Next.Sequence=(++$sequence)
+   Invoke-LiveDesktop
+   $frame=Get-Content -LiteralPath (Join-Path $root 'live-frame.json') -Raw|ConvertFrom-Json
+   Assert ($frame.seq -eq $sequence) 'Profile changed capture sequence'
+   $expected=1
+   if($profile -is [int] -and $profile -eq 2){$expected=2}
+   Assert ([LiveAvc]::Profile -eq $expected -and $script:liveId -eq $id) 'Profile or lease changed unexpectedly'
+  }
+  Write-Batch 1 @(@{type='move';x=500;y=300})
+  Invoke-LiveDesktop
+  Assert ([LiveAvc]::Launches -eq 1 -and [LiveAvc]::Stops -eq 0 -and $script:liveAck -eq 1) 'Profile restarted capture or interrupted input'
  }
  Run-Case 'AVC batch publishes an eight-slot ring and revocation clears it' {
   [IO.File]::WriteAllText($script:liveAvcPath,'')

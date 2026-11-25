@@ -136,12 +136,13 @@ class RelayIdentityError(PermissionError):
 
 
 class LiveStream:
-    def __init__(self, host, port, pin, credential, identifier, *, accept_avc=False, bounded=False):
+    def __init__(self, host, port, pin, credential, identifier, *, accept_avc=False, bounded=False, quality=None):
         self.connection = PinnedConnection(host, port, pin)
         self.credential = credential
         self.identifier = identifier
         self.accept_avc = accept_avc
         self.bounded = bounded
+        self.quality = quality
         if bounded:
             self.connection.timeout = AVC_VIEW_RESPONSE_TIMEOUT
 
@@ -168,6 +169,8 @@ class LiveStream:
                     request['accept_avc'] = 1
                 if self.bounded:
                     request['avc_view_batch'] = 1
+                    if self.quality:
+                        request['avc_profile'] = self.quality.profile
                 payload = json.dumps(request, separators=(',', ':')).encode()
                 started = time.monotonic()
                 with ExitStack() as batch:
@@ -180,6 +183,10 @@ class LiveStream:
                         batch.callback(deadline.cancel)
                     self.connection.request('POST', '/v2/live-stream', payload, headers)
                     response = batch.enter_context(self.connection.getresponse())
+                    headers_at = time.monotonic()
+                    measure_quality = (self.quality and
+                                       response.getheader('X-LanPilot-AVC-Profile') in ('1', '2'))
+                    bytes_received, sample_bytes, sample_delay = 0, 0, 0
                     if response.status in (404, 405, 501, 503):
                         return False
                     if response.status != 200:
@@ -195,6 +202,7 @@ class LiveStream:
                             continue
                         if len(raw) > limit or not raw.endswith(b'\n'):
                             raise ValueError('连续画面消息无效')
+                        received_at = time.monotonic()
                         value = json.loads(raw)
                         if not isinstance(value, dict) or value.get('id') != self.identifier:
                             raise ValueError('连续画面会话响应无效')
@@ -202,6 +210,12 @@ class LiveStream:
                         if type(sent) is not int or not 0 <= sent < LIVE_STREAM_SECONDS * 1000:
                             raise ValueError('连续画面时间无效')
                         frame = value['frame']
+                        if measure_quality and frame and 'avc_base64' in frame:
+                            bytes_received += len(raw)
+                            lag = received_at - headers_at - sent / 1000
+                            if (bytes_received >= self.quality.min_sample_bytes
+                                    and (lag > sample_delay or not sample_bytes)):
+                                sample_bytes, sample_delay = bytes_received, lag
                         if frame and ('delta_after' in frame or 'delta_base64' in frame):
                             raise ValueError('连续画面格式无效')
                         if frame and 'avc_base64' in frame and not self.accept_avc:
@@ -230,6 +244,8 @@ class LiveStream:
                                 after = None
                         if value['error']:
                             return True
+                    if measure_quality:
+                        self.quality.observe(time.monotonic(), sample_bytes, sample_delay)
             return True
         except (HubRejection, RelayIdentityError):
             raise
@@ -306,9 +322,9 @@ class PinnedHub:
         self.connection = None
         self.last_response = 0
 
-    def live_stream(self, identifier, *, accept_avc=False, bounded=False):
+    def live_stream(self, identifier, *, accept_avc=False, bounded=False, quality=None):
         return LiveStream(self.host, self.port, self.pin, self.credential, identifier,
-                          accept_avc=accept_avc, bounded=bounded)
+                          accept_avc=accept_avc, bounded=bounded, quality=quality)
 
     def avc_upload(self, identifier):
         return AvcUpload(self.host, self.port, self.pin, self.credential, identifier)
@@ -735,7 +751,7 @@ class DesktopClient:
             if operation == 'live-open' and self.live_view and not self.live_view.stop.is_set():
                 raise ValueError('请先关闭当前远程桌面')
             if operation == 'live-open' and accepts_avc(body):
-                body = dict(body, avc_view_batch=1)
+                body = dict(body, avc_view_batch=1, accept_avc_profile=1)
             value = self.live_input_hub.call(operation, body)
             if operation == 'live-open':
                 self.live_session = value['id']
@@ -744,7 +760,8 @@ class DesktopClient:
                     value.get('view_stream') if body.get('viewer_transport') == 'stream' else None)
                 self.live_view = LiveView(self.live_hub, value['id'], self.stop_event,
                                           stream_version=stream_version, avc=avc,
-                                          bounded=avc and value.get('avc_view_batch') == 1)
+                                          bounded=avc and value.get('avc_view_batch') == 1,
+                                          adaptive=avc and value.get('accept_avc_profile') == 1)
                 self.live_view.start()
             return value
         if not self.supports_updates and operation.startswith('update-'):

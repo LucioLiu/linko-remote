@@ -292,7 +292,7 @@ class LiveStreamTLSTests(unittest.TestCase):
                          self.sender.call('live-agent-state')['sessions'][0])
         return session['id']
 
-    def avc_stream(self, identifier, *, connection=None, after=None, hub=None, accept_avc=1, bounded=False):
+    def avc_stream(self, identifier, *, connection=None, after=None, hub=None, accept_avc=1, bounded=False, profile=None):
         hub = hub or self.controller
         if connection is None:
             connection = PinnedConnection(hub.host, hub.port, hub.pin)
@@ -301,6 +301,8 @@ class LiveStreamTLSTests(unittest.TestCase):
         request = {'id': identifier, 'after': after, 'accept_avc': accept_avc}
         if bounded:
             request['avc_view_batch'] = 1
+        if profile is not None:
+            request['avc_profile'] = profile
         body = json.dumps(request)
         connection.request('POST', '/v2/live-stream', body, headers)
         response = connection.getresponse()
@@ -343,6 +345,49 @@ class LiveStreamTLSTests(unittest.TestCase):
         self.wait_for(lambda: (self.client.live_view.snapshot()['frame'] or {}).get('seq') == 1)
         self.assertIn('/v2/live-stream', self.relay.paths)
         self.assertNotIn('/v2/live-view', self.relay.paths)
+
+    def test_avc_profile_negotiates_only_with_authorized_bounded_viewer_and_opted_in_sender(self):
+        self.sender.call('register', {'name': 'Windows', 'platform': 'windows',
+                                      'live_version': 1, 'live_avc': 1})
+        value = self.controller.call('live-open', {'peer': self.target, 'accept_avc': 1,
+                                                    'avc_view_batch': 1, 'accept_avc_profile': 1})
+        self.assertEqual(value['accept_avc_profile'], 1)
+        identifier = value['id']
+        self.assertNotIn('avc_profile', self.sender.call('live-agent-state')['sessions'][0])
+        _, response = self.avc_stream(identifier, bounded=True, profile=2)
+        self.assertIsNone(response.getheader('X-LanPilot-AVC-Profile'))
+        response.read()
+
+        def exchange(opt_in=1):
+            return self.sender.call('live-exchange', {'id': identifier, 'accept_avc_profile': opt_in,
+                                                       'wait_ms': 20})
+        self.assertEqual(exchange()['avc_profile'], 1)
+        _, forbidden = self.avc_stream(identifier, bounded=True, profile=2, hub=self.sender)
+        self.assertEqual(forbidden.status, 403)
+        for invalid in ('2', True, 3, {'bitrate': 100000}):
+            _, response = self.avc_stream(identifier, bounded=True, profile=invalid)
+            self.assertEqual(response.getheader('X-LanPilot-AVC-Profile'), '1')
+            response.read()
+        _, response = self.avc_stream(identifier, profile=2)
+        self.assertIsNone(response.getheader('X-LanPilot-AVC-Profile'))
+        response.read()
+        self.assertEqual(exchange()['avc_profile'], 1)
+        _, response = self.avc_stream(identifier, bounded=True, profile=2)
+        self.assertEqual(response.getheader('X-LanPilot-AVC-Profile'), '2')
+        response.read()
+        self.assertEqual(exchange()['avc_profile'], 2)
+        self.assertNotIn('avc_profile', exchange(False))
+        _, response = self.avc_stream(identifier, bounded=True, profile=1)
+        self.assertEqual(response.getheader('X-LanPilot-AVC-Profile'), '2')
+        response.read()
+        with self.relay.hub.lock:
+            self.relay.hub.live.sessions[identifier]['avc_profile_changed'] -= 10
+        _, response = self.avc_stream(identifier, bounded=True, profile=1)
+        self.assertEqual(response.getheader('X-LanPilot-AVC-Profile'), '1')
+        response.read()
+        self.sender.call('disconnect', {'peer': self.controller.call('state')['self']['id']})
+        _, forbidden = self.avc_stream(identifier, bounded=True, profile=2)
+        self.assertEqual(forbidden.status, 403)
 
     def test_bounded_view_renews_with_confirmed_cursor_and_requests_fresh_idr(self):
         self.sender.call('register', {'name': 'Windows', 'platform': 'windows',
@@ -572,7 +617,14 @@ class LiveStreamTLSTests(unittest.TestCase):
             self.assertEqual(26, len(sent))
             self.assertEqual(1, agent.avc_key)
             agent.read_avc_mailbox = lambda _: []
-            elapsed = agent.avc_pending[0][1] + 2
+            # An older pending frame can outlive the timeout while the relay
+            # continues to acknowledge other frames on the control connection.
+            oldest = agent.avc_pending[0][1]
+            agent.media_at = oldest + 1
+            with patch('lanpilot.live_agent.time.monotonic', return_value=oldest + 1.5):
+                agent.send_avc_stream('session', upload)
+            self.assertTrue(agent.avc_stream)
+            elapsed = agent.media_at + 2
             with patch('lanpilot.live_agent.time.monotonic', return_value=elapsed):
                 agent.send_avc_stream('session', upload)
             self.assertFalse(agent.avc_stream)

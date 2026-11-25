@@ -76,7 +76,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not isinstance(body, dict):
                     raise ValueError('Invalid stream request')
                 return self.stream_live(authorization[0][7:], body.get('id'), body.get('after'),
-                                        accepts_avc(body), bounded=accepts_bounded_view(body))
+                                        accepts_avc(body), bounded=accepts_bounded_view(body),
+                                        profile=body.get('avc_profile'))
             if operation == 'live-frame' and isinstance(body, dict):
                 frame = body.get('frame')
                 if isinstance(frame, dict) and 'avc_base64' in frame:
@@ -173,12 +174,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Include wall time spent receiving and parsing the request body.
             frame['capture_age_ms'] += round((time.monotonic() - received_at) * 1000)
 
-    def stream_live(self, credential, identifier, confirmed, accept_avc, *, bounded=False):
+    def stream_live(self, credential, identifier, confirmed, accept_avc, *, bounded=False, profile=None):
         if not self.server.stream_capacity.acquire(blocking=False):
             return self.answer(503, {'ok': False, 'error': '连续画面连接繁忙'})
         try:
             live = self.server.hub.live
-            session = live.begin_stream(credential, identifier, accept_avc)
+            session = live.begin_stream(credential, identifier, accept_avc, bounded=bounded, profile=profile)
             timeout = self.connection.gettimeout()
             bounded = bounded and accept_avc
             try:
@@ -188,6 +189,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Content-Type', LIVE_STREAM_TYPE)
                 self.send_header('Transfer-Encoding', 'chunked')
                 self.send_header('Cache-Control', 'no-store')
+                if bounded and session.get('avc') is not None and session.get('avc_profile_sender'):
+                    self.send_header('X-LanPilot-AVC-Profile', str(session['avc_profile']))
                 started = time.monotonic()
                 self.end_headers()
 

@@ -10,6 +10,10 @@ constexpr uint32_t max_payload = 2 * 1024 * 1024;
 constexpr uint64_t max_lease_ms = 4000;
 constexpr size_t command_size = 9;
 constexpr size_t header_size = 48;
+constexpr unsigned profile_high = 1;
+constexpr unsigned profile_low = 2;
+constexpr unsigned low_bitrate = 750000;
+constexpr unsigned low_buffer_bytes = 12500;
 using Bytes = std::vector<uint8_t>;
 using Command = std::array<uint8_t, command_size>;
 

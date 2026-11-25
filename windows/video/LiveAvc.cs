@@ -19,6 +19,8 @@ public sealed class LiveAvc : IDisposable {
     int queuedBytes;
     bool stopped, failed, writerDone, keyRequested;
     ulong pendingDeadline, lastDeadline;
+    const int HighProfile = 1, LowProfile = 2;
+    int desiredProfile = HighProfile, sentProfile = HighProfile;
 
     public sealed class Frame {
         public ulong Sequence, CaptureTick;
@@ -94,19 +96,15 @@ public sealed class LiveAvc : IDisposable {
         new Thread(action) { IsBackground = true }.Start();
     }
 
-    public void Maintain(ulong deadline, bool requestKey) {
+    public void Maintain(ulong deadline, bool requestKey, int profile) {
         lock (gate) {
             if (stopped || failed || GetTickCount64() >= deadline || GetTickCount64() >= lastDeadline)
                 throw new IOException("AVC helper unavailable or lease expired");
-            if (deadline != lastDeadline || requestKey) {
-                // Shortening a lease also replaces any queued renewal.
-                if (deadline != lastDeadline) pendingDeadline = deadline;
-                else pendingDeadline = 0;
-                keyRequested |= requestKey;
-                changed.Set();
-            } else {
-                pendingDeadline = 0;
-            }
+            // Shortening a lease also replaces any queued renewal.
+            pendingDeadline = deadline != lastDeadline ? deadline : 0;
+            keyRequested |= requestKey;
+            desiredProfile = profile == LowProfile ? LowProfile : HighProfile;
+            if (pendingDeadline != 0 || requestKey || desiredProfile != sentProfile) changed.Set();
         }
     }
 
@@ -166,15 +164,19 @@ public sealed class LiveAvc : IDisposable {
                     changed.WaitOne();
                     ulong deadline;
                     bool requestKey;
+                    int profileChange;
                     lock (gate) {
                         if (stopped) return;  // Closing stdin also stops the helper.
                         deadline = pendingDeadline;
                         requestKey = keyRequested;
+                        profileChange = desiredProfile == sentProfile ? 0 : desiredProfile;
+                        sentProfile = desiredProfile;
                         if (deadline != 0) lastDeadline = deadline;
                         pendingDeadline = 0;
                         keyRequested = false;
                     }
                     if (deadline != 0) Command(stream, (byte)'R', deadline);
+                    if (profileChange != 0) Command(stream, (byte)'Q', (ulong)profileChange);
                     if (requestKey) Command(stream, (byte)'K', 0);
                 }
             }
