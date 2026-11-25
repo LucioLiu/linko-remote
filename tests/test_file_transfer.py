@@ -248,6 +248,12 @@ class FileTransferTests(unittest.TestCase):
             self.api(self.a, 'file-seal', ident)
             self.phase(self.b, ident['id'], 'failed')
         self.wait(lambda: not any(self.b_client.files.spool.glob('*.part')))
+        def local_failure():
+            return next((item for item in self.sync(self.b)['files']
+                         if item['id'] == ident['id'] and item['error'] == '接收文件完整性校验失败'), None)
+        failure = self.wait(local_failure)
+        self.assertEqual(FILE_CHUNK, failure['received'])
+        self.assertFalse(failure.get('downloadable'))
         with self.assertRaisesRegex(ValueError, '尚未接收'):
             self.api(self.b, 'file-download', ident)
 

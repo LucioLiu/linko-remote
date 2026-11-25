@@ -88,8 +88,9 @@ class ClientFiles:
                     continue
                 identifier = receipt.item['id']
                 if receipt.error:
-                    if items.get(identifier, {}).get('phase') in (*ACTIVE, None, 'complete'):
-                        items[identifier] = dict(receipt.item, phase='failed', error=receipt.error)
+                    latest = items.get(identifier, receipt.item)
+                    if latest.get('phase') not in ('declined', 'cancelled'):
+                        items[identifier] = dict(latest, phase='failed', error=receipt.error)
                 elif not receipt.cancel.is_set():
                     items[identifier] = dict(receipt.item, phase='complete',
                                              received=receipt.item['size'], downloadable=True)

@@ -26,6 +26,19 @@ function fileSize(bytes) {
  return (bytes / (1024 * 1024)).toFixed(1) + ' MiB';
 }
 
+function fileStatusText(item, receiving) {
+ if (item.phase === 'complete') {
+  if (!receiving) return '接收方已校验完整文件';
+  return item.downloadable ? '已校验，可保存到本机' : '接收方已确认完成，本机暂无可保存的副本';
+ }
+ if (item.phase === 'failed') {
+  const progress = '已确认 ' + fileSize(item.received) + ' / ' + fileSize(item.size);
+  const retry = receiving ? '请让发送方重新发送' : '请重新选择原文件发送';
+  return [item.error || filePhases.failed, progress, retry].join(' · ');
+ }
+ return item.error || (item.phase === 'offered' && receiving ? '等待你确认' : filePhases[item.phase]);
+}
+
 function fileFeedback(message, good = false) {
  const status = $('file-feedback');
  status.className = message ? 'notice' + (good ? ' good' : '') : 'hidden';
@@ -88,7 +101,7 @@ function renderFiles() {
   title.title = item.name;
   const summary = (receiving ? '来自 ' : '发往 ') + (peer?.name || peerId) + ' · ' + fileSize(item.size);
   meta.append(title, textNode('small', summary));
-  const status = item.error || (item.phase === 'offered' && receiving ? '等待你确认' : filePhases[item.phase]);
+  const status = fileStatusText(item, receiving);
   meta.append(textNode('small', status, 'file-status'));
   if (item.phase === 'transferring') {
    const progress = document.createElement('progress');
