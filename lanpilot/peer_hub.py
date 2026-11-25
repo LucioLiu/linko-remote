@@ -18,6 +18,7 @@ from pathlib import Path
 
 from desktop import make_request
 from .live import LIVE_WAIT_MS, LiveSessions
+from .live_delta import encode_delta
 
 READ_ONLY_TIMEOUTS = {'observe': 'SCREEN_CAPTURE_TIMED_OUT', 'status': 'STATUS_TIMED_OUT'}
 BEFORE_DELIVERY = 'EXPIRED_OR_ACCESS_REVOKED_BEFORE_DELIVERY'
@@ -144,7 +145,18 @@ class PeerHub:
                         body = {'id': body['id'], 'ack': body.get('ack', 0)}
                     result = self._dispatch_committed(operation, credential, body, source)
                 result['waited_ms'] = round((waited or 0) * 1000)
-            return result
+            work = self.live.prepare_view(body, result) if operation == 'live-view' else None
+
+        if work is not None:
+            session, base, current, _ = work
+            try:
+                delta = encode_delta(base['jpeg_base64'], current['jpeg_base64'], base['seq'])
+                with self.lock:
+                    self.live.finish_view_delta(result, work, delta)
+            finally:
+                with self.lock:
+                    session['delta_pending'] = False
+        return result
 
     def _dispatch_committed(self, operation, credential, body, source):
         self.db.execute('BEGIN IMMEDIATE')

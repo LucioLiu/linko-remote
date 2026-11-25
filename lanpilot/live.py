@@ -1,13 +1,15 @@
 """Bounded, ephemeral human desktop sessions, separate from guarded AI actions.
 
-Only the most recent JPEG is retained. Inputs are numbered, claimed once, and
-never retransmitted. A short worker lease releases held keys on transport loss.
+The latest JPEG and the viewer's last delivery are retained. Inputs are
+numbered, claimed once, and never retransmitted. A short worker lease releases
+held keys on transport loss.
 """
-import base64
 import re
 import threading
 import time
 import uuid
+
+from .live_delta import decode_jpeg
 
 KEYS = {**{f'Key{c}': ord(c) for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'},
         **{f'Digit{n}': ord(n) for n in '0123456789'},
@@ -118,6 +120,7 @@ class LiveSessions:
             if len(self.sessions)>=32: raise ValueError('连接服务繁忙，请稍候')
             identifier=uuid.uuid4().hex
             s.update(id=identifier,viewed=now,frame=None,frame_at=0,next=1,ack=0,queue=[],inflight=[],error='',agent_seen=now)
+            s.update(view_sent=None, delta_pending=False)
             s['changed'] = threading.Condition(self.hub.lock)
             self.sessions[identifier]=s
             return {'id':identifier}
@@ -147,9 +150,10 @@ class LiveSessions:
                 s['changed'].notify_all()
             age=now-s['frame_at']
             frame=s['frame'] if age<2 else None
-            unchanged=frame is not None and frame['seq']==body.get('after')
             after = body.get('after')
-            if (frame and not unchanged and body.get('accept_repeat') is True and
+            confirmed = body.get('accept_delta') is not True or self.confirmed_view_base(s, body)
+            unchanged = frame is not None and confirmed and frame['seq'] == after
+            if (frame and not unchanged and confirmed and body.get('accept_repeat') is True and
                     type(after) is int and s['same_since'] <= after < frame['seq']):
                 frame = {'seq': frame['seq'], 'geometry': frame['geometry'], 'repeat_after': after}
             return {'id':s['id'],'frame':None if unchanged else frame,'unchanged':unchanged,
@@ -205,6 +209,42 @@ class LiveSessions:
             return {'inputs':inputs if remaining else [],'active':not bool(s['error']) and remaining>0,'lease_ms':min(2500,remaining)}
         raise ValueError('无效连续桌面请求')
 
+    def confirmed_view_base(self, session, body):
+        sent = session['view_sent']
+        after = body.get('after')
+        return (sent is not None and type(after) is int and after == sent['seq'] and
+                body.get('after_geometry') == sent['geometry'])
+
+    def prepare_view(self, body, result):
+        """Record a complete/repeated delivery or capture immutable compression inputs."""
+        if result['frame'] is None:
+            return None
+        session = self.sessions[body['id']]
+        current = session['frame']
+        base = session['view_sent']
+        if (body.get('accept_delta') is True and self.confirmed_view_base(session, body) and
+                not session['delta_pending'] and 'repeat_after' not in result['frame'] and
+                current['seq'] > base['seq'] and current['geometry'] == base['geometry']):
+            session['delta_pending'] = True
+            return session, base, current, session['frame_at']
+        session['view_sent'] = current
+        return None
+
+    def finish_view_delta(self, result, work, delta):
+        session, base, current, captured_at = work
+        now = self.hub.clock()
+        if self.sessions.get(session['id']) is not session or not self.allowed(session, now):
+            raise PermissionError('连续桌面会话已结束')
+        age = now - captured_at
+        result['frame_age_ms'] = round(age * 1000)
+        if age >= 2:
+            result['frame'] = None
+            return
+        if delta is not None and session['view_sent'] is base:
+            result['frame'] = {'seq': current['seq'], 'geometry': current['geometry'],
+                               'delta_after': base['seq'], 'delta_base64': delta}
+        session['view_sent'] = current
+
     def frame(self,s,f,now,*,allow_repeat=False):
         if not isinstance(f,dict) or not re.fullmatch(r'-?\d+,-?\d+,\d+,\d+',str(f.get('geometry',''))) or type(f.get('seq')) is not int:
             raise ValueError('无效连续画面')
@@ -219,9 +259,7 @@ class LiveSessions:
             encoded = previous['jpeg_base64']
         else:
             encoded = f.get('jpeg_base64', '')
-            if not isinstance(encoded,str) or len(encoded)>1_400_000: raise ValueError('画面过大')
-            raw = base64.b64decode(encoded, validate=True)
-            if not raw.startswith(b'\xff\xd8') or not raw.endswith(b'\xff\xd9'): raise ValueError('无效画面格式')
+            decode_jpeg(encoded)
             if previous and seq <= previous['seq']:
                 # A transport retry can acknowledge a stored frame without
                 # giving that capture a new timestamp.

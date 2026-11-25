@@ -3,6 +3,7 @@ import threading
 import time
 
 from .live import LIVE_WAIT_MS
+from .live_delta import DeltaError, decode_delta
 
 
 class LiveView:
@@ -20,6 +21,16 @@ class LiveView:
         now=time.monotonic()
         with self.changed:
             previous=self.value.get('frame');frame=value.get('frame')
+            if frame and ('delta_after' in frame or 'delta_base64' in frame):
+                if (not previous or type(frame.get('delta_after')) is not int or
+                        previous['seq'] != frame['delta_after'] or
+                        type(frame.get('seq')) is not int or frame['seq'] <= previous['seq'] or
+                        frame.get('geometry') != previous['geometry'] or
+                        'repeat_after' in frame or 'jpeg_base64' in frame or value.get('unchanged')):
+                    raise DeltaError('画面差分缺少对应的上一帧')
+                jpeg = decode_delta(previous['jpeg_base64'], frame.get('delta_base64'))
+                frame = {'seq': frame['seq'], 'geometry': frame['geometry'], 'jpeg_base64': jpeg}
+                value = dict(value, frame=frame)
             if frame and 'repeat_after' in frame:
                 if (not previous or previous['seq'] != frame['repeat_after'] or
                         previous['geometry'] != frame['geometry']):
@@ -44,15 +55,25 @@ class LiveView:
             return result
 
     def run(self):
+        resync = False
         try:
             while not self.stop.is_set() and not self.client_stop.is_set() and time.monotonic()-self.ui_seen<12:
-                frame=self.value.get('frame')
+                frame = None if resync else self.value.get('frame')
                 started=time.monotonic()
                 value=self.hub.call('live-view',{'id':self.id,'after':frame['seq'] if frame else None,
-                                                 'after_ack':self.value['ack'],'wait_ms':LIVE_WAIT_MS,'accept_repeat':True})
+                                                 'after_geometry':frame['geometry'] if frame else None,
+                                                 'after_ack':self.value['ack'],'wait_ms':LIVE_WAIT_MS,
+                                                 'accept_repeat':True,'accept_delta':True})
                 # The relay reports age at send time, after its frame wait.
                 transit = max(0, time.monotonic()-started-value.get('waited_ms', 0)/1000)
-                self.publish(value,transit)
+                try:
+                    self.publish(value,transit)
+                    if value.get('frame'):
+                        resync = False
+                except DeltaError:
+                    if resync:
+                        raise
+                    resync = True
                 if 'waited_ms' not in value:
                     self.stop.wait(.06)
         except Exception as error:
