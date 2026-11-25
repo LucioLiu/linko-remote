@@ -1,5 +1,6 @@
 using System;
 using System.ComponentModel;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -13,7 +14,9 @@ public sealed class LiveAvc : IDisposable {
     readonly object gate = new object();
     readonly SafeFileHandle process;
     readonly AutoResetEvent changed = new AutoResetEvent(false);
-    Frame latest;
+    const int MaxQueuedFrames = 8, MaxQueuedBytes = 4 * 1024 * 1024;
+    readonly Queue<Frame> frames = new Queue<Frame>();
+    int queuedBytes;
     bool stopped, failed, writerDone, keyRequested;
     ulong pendingDeadline, lastDeadline;
 
@@ -110,8 +113,9 @@ public sealed class LiveAvc : IDisposable {
     public Frame TakeFrame() {
         lock (gate) {
             if (failed) throw new IOException("AVC helper stopped producing frames");
-            Frame frame = latest;
-            latest = null;
+            if (frames.Count == 0) return null;
+            Frame frame = frames.Dequeue();
+            queuedBytes -= frame.Bytes.Length;
             return frame;
         }
     }
@@ -139,8 +143,13 @@ public sealed class LiveAvc : IDisposable {
                     ReadExactly(stream, frame.Bytes, HeaderSize, (int)length);
                     lock (gate) {
                         if (stopped) return;
-                        // Keep an unread reference frame ahead of dependent frames.
-                        if (latest == null || !latest.Idr || frame.Idr) latest = frame;
+                        // Keep the freshest bounded range. Gaps in the sequence
+                        // force an IDR on the upload side before more P frames.
+                        while (frames.Count >= MaxQueuedFrames ||
+                               queuedBytes + frame.Bytes.Length > MaxQueuedBytes)
+                            queuedBytes -= frames.Dequeue().Bytes.Length;
+                        frames.Enqueue(frame);
+                        queuedBytes += frame.Bytes.Length;
                     }
                 }
             }
@@ -210,7 +219,8 @@ public sealed class LiveAvc : IDisposable {
         lock (gate) {
             if (stopped) return;
             stopped = true;
-            latest = null;
+            frames.Clear();
+            queuedBytes = 0;
             if (!writerDone) changed.Set();
         }
         // Also interrupt a blocked helper write or a stuck encoder immediately.

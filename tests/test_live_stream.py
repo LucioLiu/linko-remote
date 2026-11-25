@@ -11,10 +11,12 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from lanpilot.live import AVC_MAX_HISTORY_BYTES, AVC_MAX_PAYLOAD
-from lanpilot.peer_client import DesktopClient, HubRejection, PinnedConnection, PinnedHub, RelayIdentityError
+from lanpilot.live import AVC_BATCH_BYTES, AVC_BATCH_FRAMES, AVC_MAX_HISTORY_BYTES, AVC_MAX_PAYLOAD
+from lanpilot.live_agent import LiveAgent
+from lanpilot.peer_client import DesktopClient, HubRejection, PinnedConnection, PinnedHub, RelayIdentityError, atomic_json
 from lanpilot.peer_gateway import Handler, PeerGateway
 
 
@@ -29,12 +31,14 @@ ACCESS_UNITS = tuple(map(base64.b64decode, (
 )))
 
 
-def avc_upload(seq, unit, *, age=0, flags=None, limit=None):
+def avc_upload(seq, unit, *, age=0, flags=None, limit=None, tick=None):
     payload = ACCESS_UNITS[unit]
     if limit is not None:
         # Fill the record to its wire limit with a filler-data NAL.
         payload += b'\x00\x00\x00\x01\x0c' + b'\xff' * (limit - len(payload) - 6) + b'\x80'
-    header = struct.pack('<4sIQQHHIiiII', b'LPA1', len(payload), seq, 8500 + seq * 50,
+    if tick is None:
+        tick = 8500 + seq * 50
+    header = struct.pack('<4sIQQHHIiiII', b'LPA1', len(payload), seq, tick,
                          64, 64, int(unit % 2 == 0) if flags is None else flags, -1280, -20, 1280, 720)
     return {'avc_base64': base64.b64encode(header + payload).decode(), 'capture_age_ms': age}
 
@@ -50,6 +54,16 @@ class RecordingHandler(Handler):
     def answer(self, status, value):
         if self.path == '/v2/live-open' and self.server.legacy and value.get('ok'):
             value['value'].pop('view_stream')
+        if self.server.legacy_upload and value.get('ok'):
+            value['value'].pop('avc_batch', None)
+            for session in value['value'].get('sessions', []):
+                session.pop('avc_batch', None)
+        if self.path == '/v2/live-avc-batch' and self.server.hold_upload:
+            self.server.upload_committed.set()
+            self.server.release_upload.wait(3)
+            if self.server.lose_upload_ack:
+                self.close_connection = True
+                return
         super().answer(status, value)
 
     def stream_chunk(self, record):
@@ -79,7 +93,13 @@ class LiveStreamTLSTests(unittest.TestCase):
         self.relay.RequestHandlerClass = RecordingHandler
         self.relay.paths = []
         self.relay.records = []
+        self.home = home
         self.relay.legacy = False
+        self.relay.legacy_upload = False
+        self.relay.hold_upload = False
+        self.relay.lose_upload_ack = False
+        self.relay.upload_committed = threading.Event()
+        self.relay.release_upload = threading.Event()
         self.relay.reject_stream = False
         self.relay.pause_after = -1
         self.relay.pause_before = -1
@@ -322,6 +342,133 @@ class LiveStreamTLSTests(unittest.TestCase):
         self.assertIsNone(revoked['frame'])
         with self.assertRaises(HubRejection):
             self.upload_avc(identifier, avc_upload(9, 0))
+
+    def start_windows_upload(self, identifier):
+        workspace = self.home / 'worker'
+        workspace.mkdir()
+        client = SimpleNamespace(config={'endpoint': self.endpoint, 'credential': self.sender.credential},
+                                 incoming=True, stop_event=threading.Event(),
+                                 agent=SimpleNamespace(workspace=workspace))
+        agent = LiveAgent(client, PinnedHub, atomic_json)
+        agent.avc_enabled = True
+        self.addCleanup(self.close_hub, agent.hub)
+        self.addCleanup(self.close_hub, agent.frame_hub)
+        fixture_clock = patch('lanpilot.live_agent.windows_tick_ms', return_value=9800)
+        fixture_clock.start()
+        self.addCleanup(fixture_clock.stop)
+        workers = [threading.Thread(target=entry, daemon=True) for entry in (agent.run, agent.frames)]
+        for worker in workers:
+            worker.start()
+            self.addCleanup(worker.join, 4)
+        self.addCleanup(client.stop_event.set)
+        self.addCleanup(self.relay.release_upload.set)
+        self.wait_for(lambda: agent.read('live-control.json').get('live_avc') == 1)
+
+        def capture(seq, unit, *, batch=True):
+            tick = 9700 + seq
+            record = avc_upload(seq, unit, tick=tick)['avc_base64']
+            mailbox = f'live-avc-{seq % AVC_BATCH_FRAMES}.json' if batch else 'live-frame.json'
+            atomic_json(workspace / mailbox, {
+                'id': identifier, 'seq': seq, 'capture_tick': tick,
+                'idr': unit % 2 == 0, 'avc_base64': record,
+            })
+            return record
+
+        return agent, capture
+
+    def test_windows_batch_mailbox_pressure_lost_ack_and_receipts_over_tls(self):
+        identifier = self.open_avc()
+        _, response = self.avc_stream(identifier)
+        agent, capture = self.start_windows_upload(identifier)
+        self.assertEqual(1, agent.read('live-control.json')['avc_batch'])
+        self.relay.hold_upload = self.relay.lose_upload_ack = True
+        capture(7, 0)
+        self.assertTrue(self.relay.upload_committed.wait(2))
+        self.assertEqual(7, self.read_update(response)['frame']['seq'])
+
+        # Overflow all eight slots while the first media ACK is blocked.
+        for seq in range(8, 18):
+            capture(seq, 1)
+        self.assertEqual(AVC_BATCH_FRAMES, len(list(agent.root.glob('live-avc-*.json'))))
+        self.assertEqual(1, self.relay.paths.count('/v2/live-avc-batch'))
+        self.assertEqual({'accepted': 1}, self.controller.call('live-input', {
+            'id': identifier, 'seq': 1, 'geometry': AVC_GEOMETRY, 'events': [{'type': 'release'}],
+        }))
+        self.wait_for(lambda: agent.read(f'{identifier}-0000000001.live-input.json').get('seq') == 1)
+        atomic_json(agent.root / 'live-receipt.json', {'id': identifier, 'seq': 1})
+        self.wait_for(lambda: self.relay.hub.live.sessions[identifier]['ack'] == 1)
+        self.assertEqual(1, self.relay.paths.count('/v2/live-avc-batch'))
+
+        self.relay.release_upload.set()
+        self.wait_for(lambda: agent.read('live-control.json').get('avc_key') == 1)
+        self.wait_for(lambda: agent.avc_seen == 17)
+        self.assertEqual(1, self.relay.paths.count('/v2/live-avc-batch'))
+        self.relay.lose_upload_ack = False
+        self.relay.release_upload.clear()
+        self.relay.upload_committed.clear()
+        reference = capture(18, 2)
+        self.assertTrue(self.relay.upload_committed.wait(2))
+        frame = self.read_update(response)['frame']
+        self.assertEqual((18, reference, True), (frame['seq'], frame['avc_base64'], frame['idr']))
+        resumed = [capture(seq, 3) for seq in range(19, 22)]
+        self.relay.hold_upload = False
+        self.relay.release_upload.set()
+        for seq, record in zip(range(19, 22), resumed):
+            frame = self.read_update(response)['frame']
+            self.assertEqual((seq, record, AVC_GEOMETRY),
+                             (frame['seq'], frame['avc_base64'], frame['geometry']))
+        self.wait_for(lambda: agent.avc_seq == 21)
+        self.assertEqual(3, self.relay.paths.count('/v2/live-avc-batch'))
+
+        self.sender.call('availability', {'enabled': False})
+        self.wait_for(lambda: agent.read('live-control.json').get('expires') == 0)
+        requests = self.relay.paths.count('/v2/live-avc-batch')
+        capture(22, 0)
+        self.assertTrue(self.read_update(response)['error'])
+        self.assertEqual(requests, self.relay.paths.count('/v2/live-avc-batch'))
+
+    def test_windows_upload_uses_serial_avc_when_legacy_relay_omits_batch(self):
+        identifier = self.open_avc()
+        self.relay.legacy_upload = True
+        _, response = self.avc_stream(identifier)
+        agent, capture = self.start_windows_upload(identifier)
+        self.assertNotIn('avc_batch', agent.read('live-control.json'))
+        capture(7, 0, batch=False)
+        self.assertEqual(7, self.read_update(response)['frame']['seq'])
+        self.assertIn('/v2/live-frame', self.relay.paths)
+        self.assertNotIn('/v2/live-avc-batch', self.relay.paths)
+
+    def test_avc_upload_batch_validates_all_records_before_publishing(self):
+        identifier = self.open_avc()
+
+        def upload(*records, hub=self.sender):
+            return hub.call('live-avc-batch', {'id': identifier, 'frames': list(records)})
+
+        key = avc_upload(1, 0)
+        p_frame = avc_upload(2, 1)
+        # The frames fit the total HTTP envelope but exceed its AVC payload budget.
+        oversized = AVC_BATCH_BYTES * 3 // 8
+        for invalid in ((key, p_frame, dict(key, avc_base64='***')), (p_frame, key),
+                        tuple(avc_upload(seq, 0) for seq in range(1, AVC_BATCH_FRAMES + 2)),
+                        (avc_upload(1, 0, limit=oversized), avc_upload(2, 1, limit=oversized))):
+            with self.assertRaises(HubRejection):
+                upload(*invalid)
+        with self.assertRaises(HubRejection):
+            upload(key, hub=self.controller)
+        history = self.relay.hub.live.sessions[identifier]['avc']
+        self.assertFalse(history.frames)
+        self.assertEqual(2, upload(key, p_frame)['frame_seq'])
+        stale = upload(avc_upload(3, 0, age=1500), avc_upload(4, 1))
+        self.assertIsNone(stale['frame_seq'])
+        self.assertTrue(stale['need_idr'])
+        self.assertFalse(history.frames)
+        changed = avc_upload(6, 1)
+        binary = bytearray(base64.b64decode(changed['avc_base64']))
+        struct.pack_into('<i', binary, 32, -1200)
+        changed['avc_base64'] = base64.b64encode(binary).decode()
+        self.assertTrue(upload(avc_upload(5, 0), changed)['need_idr'])
+        self.assertFalse(history.frames)
+        self.assertEqual(7, upload(avc_upload(7, 0))['frame_seq'])
 
     def test_avc_batch_cursor_requires_same_tls_connection_and_confirmed_sequence(self):
         identifier = self.open_avc()

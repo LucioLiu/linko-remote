@@ -78,9 +78,10 @@ $script:workerStop=$false
 function Test-WorkerStop {return $script:workerStop}
 function Assert($Condition,[string]$Message){if(-not $Condition){throw $Message}}
 function Now-Live {return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()/1000.0}
-function Write-Control($Expires,[switch]$Avc,[int]$Key=0){
+function Write-Control($Expires,[switch]$Avc,[int]$Key=0,[switch]$AvcBatch){
  $control=@{id=$id;expires=$Expires}
  if($Avc){$control.live_avc=1;$control.avc_key=$Key}
+ if($AvcBatch){$control.avc_batch=1}
  Write-LiveJson 'live-control.json' $control
 }
 function Write-Batch([int]$Seq,$Events,[double]$Expires=((Now-Live)+1.5)){
@@ -256,6 +257,23 @@ try{
   Write-Control 0
   Invoke-LiveDesktop
   Assert ([LiveAvc]::Stops -eq 1 -and -not $script:liveId) 'Revoke did not stop native capture'
+ }
+ Run-Case 'AVC batch publishes an eight-slot ring and revocation clears it' {
+  [IO.File]::WriteAllText($script:liveAvcPath,'')
+  Write-Control ((Now-Live)+2.5) -Avc -AvcBatch
+  foreach($seq in 1..10){
+   [LiveAvc]::Next=[LiveAvc+Frame]::new()
+   [LiveAvc]::Next.Sequence=$seq
+   [LiveAvc]::Next.Idr=($seq -eq 1)
+   Invoke-LiveDesktop
+  }
+  $slots=@(Get-ChildItem -LiteralPath $root -Filter 'live-avc-*.json')
+  $sequences=@($slots|ForEach-Object{(Get-Content -LiteralPath $_.FullName -Raw|ConvertFrom-Json).seq}|Sort-Object)
+  Assert ($slots.Count -eq 8 -and ($sequences -join ',') -eq '3,4,5,6,7,8,9,10') 'Mailbox ring lost recent frames or grew'
+  Assert (-not (Test-Path -LiteralPath (Join-Path $root 'live-frame.json'))) 'Batch used the serial mailbox'
+  Write-Control 0
+  Invoke-LiveDesktop
+  Assert (-not (Get-ChildItem -LiteralPath $root -Filter 'live-avc-*.json')) 'Revoked AVC frames remain in the ring'
  }
  Run-Case 'AVC failure falls back to JPEG for the rest of the session' {
   [IO.File]::WriteAllText($script:liveAvcPath,'')

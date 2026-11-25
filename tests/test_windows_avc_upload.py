@@ -46,7 +46,7 @@ class WindowsAvcUploadTests(unittest.TestCase):
 
     def upload(self, frame):
         with patch('lanpilot.live_agent.windows_tick_ms', return_value=1000):
-            self.agent.upload_avc('session', frame)
+            self.agent.upload_avc('session', [frame])
 
     def test_upload_wire_shape_and_wait_for_idr_after_missing_sequence(self):
         first = avc_frame(1, idr=True)

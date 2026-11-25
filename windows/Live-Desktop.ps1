@@ -6,6 +6,7 @@ $script:liveTimer=[Diagnostics.Stopwatch]::StartNew()
 $script:liveControlPath=Join-Path $root 'live-control.json'
 $script:liveAvcPath=Join-Path $PSScriptRoot 'video/lanpilot-avc.exe'
 $script:liveAvc=$null
+$script:liveAvcSlots=8 # Version 1 uploader mailbox ring.
 $script:liveAvcDisabled=$false
 $script:liveAvcKey=0
 $script:liveAvcDeadline=0
@@ -90,7 +91,11 @@ function Invoke-LiveAvc($Control,[string]$Geometry){
      return $true
     }
     try{
-     Write-LiveJson 'live-frame.json' @{id=$script:liveId;seq=$frame.Sequence;capture_tick=$frame.CaptureTick;idr=$frame.Idr;avc_base64=$base64}
+     # The negotiated uploader can collect across its previous batch's ACK.
+     # Keep a bounded ring. An overwritten slot becomes a detectable sequence gap.
+     $mailbox='live-frame.json'
+     if($Control.avc_batch -eq 1){$mailbox='live-avc-'+($frame.Sequence % $script:liveAvcSlots)+'.json'}
+     Write-LiveJson $mailbox @{id=$script:liveId;seq=$frame.Sequence;capture_tick=$frame.CaptureTick;idr=$frame.Idr;avc_base64=$base64}
     }catch [IO.IOException]{
      # A concurrent mailbox reader can briefly prevent replacement on Windows.
      # Let the next iteration publish a fresh record or time out to JPEG.
@@ -117,6 +122,9 @@ function Stop-LiveSession([string]$Reason,[string]$Id=$script:liveId){
  $script:liveId=''
  $script:liveDeadline=0
  if($Id -and $script:liveEnded.Add($Id)){
+  for($slot=0;$slot -lt $script:liveAvcSlots;$slot++){
+   Remove-Item -LiteralPath (Join-Path $root ('live-avc-'+$slot+'.json')) -ErrorAction SilentlyContinue
+  }
   # Retain a per-session end marker across worker restarts in this workspace.
   [IO.File]::WriteAllText((Join-Path $root ($Id+'.live-ended')),'')
   Write-LiveJson 'live-ended.json' @{id=$Id;error=$Reason}

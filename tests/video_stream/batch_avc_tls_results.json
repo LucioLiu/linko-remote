@@ -1,0 +1,383 @@
+{
+  "platform": "macOS-26.7-arm64-arm-64bit",
+  "python": "3.12.14",
+  "seconds_per_trial": 15,
+  "fixture": {
+    "frames": 300,
+    "annex_b_bytes": 4670701,
+    "min_frame_bytes": 1530,
+    "max_frame_bytes": 182814,
+    "sha256": "0cabf8ba2545f274f67116e8c96c6b69af25e0d4bed5f180b011a0a6797af8dc"
+  },
+  "fps": 20,
+  "gop_frames": 20,
+  "measurement": {
+    "transport": "Pinned TLS with sender-only symmetric byte delay from serial_avc_tls; viewer direct loopback",
+    "source": "Same preencoded moving frames, 20 fps independent of ACK, through product LiveAgent file mailbox",
+    "serial": "Legacy sender negotiation, with one latest-frame mailbox",
+    "batch": "Negotiated bounded mailbox ring and AVC batch uploads",
+    "loss": "Absent source sequences after drain. Exactly two source slots omitted midway in each trial",
+    "recovery": "First arrival after the injected gap, measured from first omitted capture slot. Fixture uses scheduled IDRs rather than synthesizing one when the sender requests it"
+  },
+  "trials": [
+    {
+      "repeat": 1,
+      "mode": "serial",
+      "sender_rtt_ms": 0,
+      "received_in_window": 284,
+      "arrival_fps": 18.933,
+      "received_unique": 284,
+      "arrival_latency_p95_ms": 34.049,
+      "missing_after_drain": 16,
+      "missing_excluding_injected": 14,
+      "recovery_from_first_dropped_frame_ms": 820.275,
+      "first_recovered_seq": 161,
+      "idr_requests": 1,
+      "upload_acks": 284,
+      "upload_size_distribution": {
+        "1": 284
+      },
+      "upload_ack_p95_ms": 5.947
+    },
+    {
+      "repeat": 1,
+      "mode": "batch",
+      "sender_rtt_ms": 0,
+      "received_in_window": 284,
+      "arrival_fps": 18.933,
+      "received_unique": 284,
+      "arrival_latency_p95_ms": 18.263,
+      "missing_after_drain": 16,
+      "missing_excluding_injected": 14,
+      "recovery_from_first_dropped_frame_ms": 805.291,
+      "first_recovered_seq": 161,
+      "idr_requests": 1,
+      "upload_acks": 284,
+      "upload_size_distribution": {
+        "1": 284
+      },
+      "upload_ack_p95_ms": 2.926
+    },
+    {
+      "repeat": 1,
+      "mode": "batch",
+      "sender_rtt_ms": 100,
+      "received_in_window": 280,
+      "arrival_fps": 18.667,
+      "received_unique": 284,
+      "arrival_latency_p95_ms": 176.543,
+      "missing_after_drain": 16,
+      "missing_excluding_injected": 14,
+      "recovery_from_first_dropped_frame_ms": 883.209,
+      "first_recovered_seq": 161,
+      "idr_requests": 1,
+      "upload_acks": 118,
+      "upload_size_distribution": {
+        "1": 2,
+        "3": 49,
+        "2": 67
+      },
+      "upload_ack_p95_ms": 121.034
+    },
+    {
+      "repeat": 1,
+      "mode": "serial",
+      "sender_rtt_ms": 100,
+      "received_in_window": 15,
+      "arrival_fps": 1.0,
+      "received_unique": 15,
+      "arrival_latency_p95_ms": 86.497,
+      "missing_after_drain": 285,
+      "missing_excluding_injected": 283,
+      "recovery_from_first_dropped_frame_ms": 866.716,
+      "first_recovered_seq": 161,
+      "idr_requests": 15,
+      "upload_acks": 15,
+      "upload_size_distribution": {
+        "1": 15
+      },
+      "upload_ack_p95_ms": 113.055
+    },
+    {
+      "repeat": 1,
+      "mode": "serial",
+      "sender_rtt_ms": 200,
+      "received_in_window": 15,
+      "arrival_fps": 1.0,
+      "received_unique": 15,
+      "arrival_latency_p95_ms": 169.629,
+      "missing_after_drain": 285,
+      "missing_excluding_injected": 283,
+      "recovery_from_first_dropped_frame_ms": 966.978,
+      "first_recovered_seq": 161,
+      "idr_requests": 15,
+      "upload_acks": 15,
+      "upload_size_distribution": {
+        "1": 15
+      },
+      "upload_ack_p95_ms": 243.387
+    },
+    {
+      "repeat": 1,
+      "mode": "batch",
+      "sender_rtt_ms": 200,
+      "received_in_window": 279,
+      "arrival_fps": 18.6,
+      "received_unique": 284,
+      "arrival_latency_p95_ms": 312.869,
+      "missing_after_drain": 16,
+      "missing_excluding_injected": 14,
+      "recovery_from_first_dropped_frame_ms": 916.922,
+      "first_recovered_seq": 161,
+      "idr_requests": 1,
+      "upload_acks": 68,
+      "upload_size_distribution": {
+        "1": 3,
+        "4": 45,
+        "5": 20
+      },
+      "upload_ack_p95_ms": 214.824
+    },
+    {
+      "repeat": 2,
+      "mode": "batch",
+      "sender_rtt_ms": 100,
+      "received_in_window": 282,
+      "arrival_fps": 18.8,
+      "received_unique": 284,
+      "arrival_latency_p95_ms": 167.751,
+      "missing_after_drain": 16,
+      "missing_excluding_injected": 14,
+      "recovery_from_first_dropped_frame_ms": 853.649,
+      "first_recovered_seq": 161,
+      "idr_requests": 1,
+      "upload_acks": 123,
+      "upload_size_distribution": {
+        "1": 2,
+        "2": 83,
+        "3": 38
+      },
+      "upload_ack_p95_ms": 114.499
+    },
+    {
+      "repeat": 2,
+      "mode": "serial",
+      "sender_rtt_ms": 100,
+      "received_in_window": 15,
+      "arrival_fps": 1.0,
+      "received_unique": 15,
+      "arrival_latency_p95_ms": 97.585,
+      "missing_after_drain": 285,
+      "missing_excluding_injected": 283,
+      "recovery_from_first_dropped_frame_ms": 894.03,
+      "first_recovered_seq": 161,
+      "idr_requests": 15,
+      "upload_acks": 15,
+      "upload_size_distribution": {
+        "1": 15
+      },
+      "upload_ack_p95_ms": 121.739
+    },
+    {
+      "repeat": 2,
+      "mode": "serial",
+      "sender_rtt_ms": 200,
+      "received_in_window": 15,
+      "arrival_fps": 1.0,
+      "received_unique": 15,
+      "arrival_latency_p95_ms": 148.844,
+      "missing_after_drain": 285,
+      "missing_excluding_injected": 283,
+      "recovery_from_first_dropped_frame_ms": 935.09,
+      "first_recovered_seq": 161,
+      "idr_requests": 15,
+      "upload_acks": 15,
+      "upload_size_distribution": {
+        "1": 15
+      },
+      "upload_ack_p95_ms": 220.504
+    },
+    {
+      "repeat": 2,
+      "mode": "batch",
+      "sender_rtt_ms": 200,
+      "received_in_window": 281,
+      "arrival_fps": 18.733,
+      "received_unique": 284,
+      "arrival_latency_p95_ms": 318.58,
+      "missing_after_drain": 16,
+      "missing_excluding_injected": 14,
+      "recovery_from_first_dropped_frame_ms": 926.229,
+      "first_recovered_seq": 161,
+      "idr_requests": 1,
+      "upload_acks": 66,
+      "upload_size_distribution": {
+        "1": 3,
+        "5": 27,
+        "4": 35,
+        "3": 1
+      },
+      "upload_ack_p95_ms": 216.675
+    },
+    {
+      "repeat": 2,
+      "mode": "batch",
+      "sender_rtt_ms": 0,
+      "received_in_window": 284,
+      "arrival_fps": 18.933,
+      "received_unique": 284,
+      "arrival_latency_p95_ms": 20.278,
+      "missing_after_drain": 16,
+      "missing_excluding_injected": 14,
+      "recovery_from_first_dropped_frame_ms": 822.321,
+      "first_recovered_seq": 161,
+      "idr_requests": 1,
+      "upload_acks": 283,
+      "upload_size_distribution": {
+        "2": 1,
+        "1": 282
+      },
+      "upload_ack_p95_ms": 4.135
+    },
+    {
+      "repeat": 2,
+      "mode": "serial",
+      "sender_rtt_ms": 0,
+      "received_in_window": 284,
+      "arrival_fps": 18.933,
+      "received_unique": 284,
+      "arrival_latency_p95_ms": 31.06,
+      "missing_after_drain": 16,
+      "missing_excluding_injected": 14,
+      "recovery_from_first_dropped_frame_ms": 805.916,
+      "first_recovered_seq": 161,
+      "idr_requests": 1,
+      "upload_acks": 284,
+      "upload_size_distribution": {
+        "1": 284
+      },
+      "upload_ack_p95_ms": 4.083
+    },
+    {
+      "repeat": 3,
+      "mode": "serial",
+      "sender_rtt_ms": 200,
+      "received_in_window": 15,
+      "arrival_fps": 1.0,
+      "received_unique": 15,
+      "arrival_latency_p95_ms": 163.505,
+      "missing_after_drain": 285,
+      "missing_excluding_injected": 283,
+      "recovery_from_first_dropped_frame_ms": 920.709,
+      "first_recovered_seq": 161,
+      "idr_requests": 15,
+      "upload_acks": 15,
+      "upload_size_distribution": {
+        "1": 15
+      },
+      "upload_ack_p95_ms": 217.509
+    },
+    {
+      "repeat": 3,
+      "mode": "batch",
+      "sender_rtt_ms": 200,
+      "received_in_window": 280,
+      "arrival_fps": 18.667,
+      "received_unique": 284,
+      "arrival_latency_p95_ms": 321.488,
+      "missing_after_drain": 16,
+      "missing_excluding_injected": 14,
+      "recovery_from_first_dropped_frame_ms": 921.494,
+      "first_recovered_seq": 161,
+      "idr_requests": 1,
+      "upload_acks": 66,
+      "upload_size_distribution": {
+        "1": 2,
+        "4": 39,
+        "5": 24,
+        "2": 1
+      },
+      "upload_ack_p95_ms": 216.291
+    },
+    {
+      "repeat": 3,
+      "mode": "batch",
+      "sender_rtt_ms": 0,
+      "received_in_window": 284,
+      "arrival_fps": 18.933,
+      "received_unique": 284,
+      "arrival_latency_p95_ms": 20.319,
+      "missing_after_drain": 16,
+      "missing_excluding_injected": 14,
+      "recovery_from_first_dropped_frame_ms": 827.276,
+      "first_recovered_seq": 161,
+      "idr_requests": 1,
+      "upload_acks": 283,
+      "upload_size_distribution": {
+        "2": 1,
+        "1": 282
+      },
+      "upload_ack_p95_ms": 5.477
+    },
+    {
+      "repeat": 3,
+      "mode": "serial",
+      "sender_rtt_ms": 0,
+      "received_in_window": 284,
+      "arrival_fps": 18.933,
+      "received_unique": 284,
+      "arrival_latency_p95_ms": 32.036,
+      "missing_after_drain": 16,
+      "missing_excluding_injected": 14,
+      "recovery_from_first_dropped_frame_ms": 829.534,
+      "first_recovered_seq": 161,
+      "idr_requests": 1,
+      "upload_acks": 284,
+      "upload_size_distribution": {
+        "1": 284
+      },
+      "upload_ack_p95_ms": 5.491
+    },
+    {
+      "repeat": 3,
+      "mode": "serial",
+      "sender_rtt_ms": 100,
+      "received_in_window": 14,
+      "arrival_fps": 0.933,
+      "received_unique": 14,
+      "arrival_latency_p95_ms": 89.27,
+      "missing_after_drain": 286,
+      "missing_excluding_injected": 284,
+      "recovery_from_first_dropped_frame_ms": 877.46,
+      "first_recovered_seq": 161,
+      "idr_requests": 15,
+      "upload_acks": 14,
+      "upload_size_distribution": {
+        "1": 14
+      },
+      "upload_ack_p95_ms": 120.264
+    },
+    {
+      "repeat": 3,
+      "mode": "batch",
+      "sender_rtt_ms": 100,
+      "received_in_window": 282,
+      "arrival_fps": 18.8,
+      "received_unique": 284,
+      "arrival_latency_p95_ms": 174.625,
+      "missing_after_drain": 16,
+      "missing_excluding_injected": 14,
+      "recovery_from_first_dropped_frame_ms": 868.327,
+      "first_recovered_seq": 161,
+      "idr_requests": 1,
+      "upload_acks": 118,
+      "upload_size_distribution": {
+        "1": 2,
+        "2": 70,
+        "3": 45,
+        "5": 1
+      },
+      "upload_ack_p95_ms": 129.808
+    }
+  ]
+}

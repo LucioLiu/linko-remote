@@ -42,6 +42,9 @@ AVC_MAX_ENCODED = (AVC_HEADER.size + AVC_MAX_PAYLOAD + 2) // 3 * 4
 LIVE_AVC_STREAM_RECORD_MAX = AVC_MAX_ENCODED + 1024
 AVC_MAX_HISTORY_BYTES = 4 * 1024 * 1024  # Includes base64 expansion
 AVC_MAX_HISTORY_FRAMES = 64
+AVC_BATCH_FRAMES = 8
+AVC_BATCH_BYTES = 4 * 1024 * 1024  # Encoded access units
+AVC_BATCH_BODY_MAX = AVC_BATCH_BYTES + 2048
 AVC_MAX_CAPTURE_AGE_MS = 1500
 AVC_FRAME_TTL = 2
 AVC_START_CODE = re.compile(rb'\x00\x00\x01')
@@ -121,6 +124,13 @@ class LiveSessions:
         return {'live_avc': int(avc is not None),
                 'need_idr': avc is not None and avc.need_idr}
 
+    def sender_media_options(self, session, body):
+        options = self.media_options(session)
+        requested = body.get('accept_avc_batch')
+        if options.get('live_avc') == 1 and type(requested) is int and requested == 1:
+            options['avc_batch'] = 1
+        return options
+
     def wait_for_update(self, op, body, result, wait_ms):
         """Wait with no open SQLite transaction and release the hub lock."""
         identifier = body['id']
@@ -168,7 +178,7 @@ class LiveSessions:
             self.sessions[identifier]=s
             return {'id':identifier, **self.media_options(s)}
         if op == 'live-agent-state':
-            return {'sessions': [{'id': s['id'], **self.media_options(s)}
+            return {'sessions': [{'id': s['id'], **self.sender_media_options(s, body)}
                                  for s in self.sessions.values() if s['target'] == me]}
         identifier=body.get('id')
         s=self.sessions.get(identifier)
@@ -221,6 +231,28 @@ class LiveSessions:
                 accepted = (self.frame(s, frame, now, allow_repeat=True)
                             if active or s.get('avc') is None else None)
             return {'active': active, 'frame_seq': accepted, **self.media_options(s)}
+        if op == 'live-avc-batch':
+            if me != s['target']: raise PermissionError('无权发送此桌面')
+            if 'avc' not in s:
+                raise ValueError('未协商 AVC 连续画面')
+            active = not s['error'] and now - s['viewed'] < 8
+            accepted = None
+            if active and s['avc'] is not None:
+                records = body.get('frames')
+                if (not isinstance(records, list) or not 1 <= len(records) <= AVC_BATCH_FRAMES or
+                        any(not isinstance(record, dict) or not isinstance(record.get('avc_base64'), str)
+                            for record in records) or
+                        sum(len(record['avc_base64']) for record in records) > AVC_BATCH_BYTES):
+                    raise ValueError('无效 AVC 批次')
+                # Validate the entire request before changing the reference chain.
+                decoded = [decode_avc_record(record) for record in records]
+                sequences = [entry[0]['seq'] for entry in decoded]
+                if any(right <= left for left, right in zip(sequences, sequences[1:])):
+                    raise ValueError('AVC 批次序号无效')
+                for entry in decoded:
+                    accepted = s['avc'].add_decoded(entry, now)
+                s['changed'].notify_all()
+            return {'active': active, 'frame_seq': accepted, **self.media_options(s)}
         if op == 'live-exchange':
             if me != s['target']: raise PermissionError('无权发送此桌面')
             s['agent_seen']=now
@@ -252,7 +284,7 @@ class LiveSessions:
             s['queue']=[]
             if s['error']: inputs=[]
             remaining=max(0,int((s['viewed']+8-now)*1000))
-            return {'inputs':inputs if remaining else [],'active':not bool(s['error']) and remaining>0,'lease_ms':min(2500,remaining), **self.media_options(s)}
+            return {'inputs':inputs if remaining else [],'active':not bool(s['error']) and remaining>0,'lease_ms':min(2500,remaining), **self.sender_media_options(s, body)}
         raise ValueError('无效连续桌面请求')
 
     def view(self, session, now, after, accept_repeat):
@@ -456,7 +488,10 @@ class AvcHistory:
             self.discard_first()
 
     def add(self, record, now):
-        frame, tick, dimensions, age = decode_avc_record(record)
+        return self.add_decoded(decode_avc_record(record), now)
+
+    def add_decoded(self, record, now):
+        frame, tick, dimensions, age = record
         self.expire(now)
         seq = frame['seq']
         if seq <= self.last_seq:

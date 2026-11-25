@@ -15,7 +15,8 @@ import threading
 import time
 from pathlib import Path
 
-from .live import LIVE_AVC_STREAM_RECORD_MAX, LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE, accepts_avc
+from .live import (AVC_BATCH_BODY_MAX, AVC_BATCH_FRAMES, LIVE_AVC_STREAM_RECORD_MAX,
+                   LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE, accepts_avc)
 from .peer_hub import PeerHub
 
 
@@ -36,7 +37,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Keep the command and its receipt queries on one connection. Infrequent
         # UI changes still use short-lived connections.
         if self.path not in ('/v2/poll', '/v2/state', '/v2/result', '/v2/register', '/v2/submit', '/v2/recover',
-                              '/v2/live-open', '/v2/live-view', '/v2/live-input', '/v2/live-exchange', '/v2/live-agent-state', '/v2/live-frame'):
+                              '/v2/live-open', '/v2/live-view', '/v2/live-input', '/v2/live-exchange', '/v2/live-agent-state', '/v2/live-frame',
+                              '/v2/live-avc-batch'):
             self.close_connection = True
             self.send_header('Connection', 'close')
         self.end_headers()
@@ -46,7 +48,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         operations = {'register', 'name', 'availability', 'code', 'connect', 'access',
                       'approve', 'disconnect', 'state', 'poll', 'submit', 'result', 'recover',
                       'live-open', 'live-close', 'live-view', 'live-input', 'live-exchange', 'live-agent-state', 'live-frame',
-                      'live-stream'}
+                      'live-stream', 'live-avc-batch'}
         operation = self.path[4:] if self.path.startswith('/v2/') else ''
         if operation not in operations:
             self.close_connection = True
@@ -56,7 +58,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             return self.answer(401, {'ok': False, 'error': '身份验证失败'})
         maximum = {'result': 24_000_000, 'live-exchange': 1_500_000,
-                   'live-frame': LIVE_AVC_STREAM_RECORD_MAX}.get(operation, 16000)
+                   'live-frame': LIVE_AVC_STREAM_RECORD_MAX, 'live-avc-batch': AVC_BATCH_BODY_MAX}.get(operation, 16000)
         lengths = self.headers.get_all('Content-Length', [])
         if len(lengths) != 1 or not re.fullmatch('[0-9]{1,8}', lengths[0]) or not 1 <= int(lengths[0]) <= maximum or self.headers.get('Transfer-Encoding'):
             self.close_connection = True
@@ -74,13 +76,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if operation == 'live-frame' and isinstance(body, dict):
                 frame = body.get('frame')
                 if isinstance(frame, dict) and 'avc_base64' in frame:
-                    age = frame.get('capture_age_ms')
-                    if type(age) is int and age >= 0:
-                        # The sender measures age before upload on its own
-                        # monotonic clock. Include time spent receiving the body.
-                        frame['capture_age_ms'] += round((time.monotonic() - received_at) * 1000)
+                    self.age_avc(frame, received_at)
                 elif len(raw) > 1_500_000:
                     raise ValueError('Invalid JPEG frame request size')
+            if operation == 'live-avc-batch':
+                records = body.get('frames') if isinstance(body, dict) else None
+                if not isinstance(records, list) or not 1 <= len(records) <= AVC_BATCH_FRAMES:
+                    raise ValueError('Invalid AVC batch count')
+                for frame in records:
+                    self.age_avc(frame, received_at)
             value = self.server.hub.dispatch(operation, authorization[0][7:], body, self.client_address[0])
             if operation == 'live-open':
                 value['view_stream'] = 1
@@ -95,6 +99,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if operation == 'submit':
                 print('Submit rejected:', type(error).__name__, str(error)[:150], file=sys.stderr, flush=True)
             return self.answer(400, {'ok': False, 'error': '请求无效或上一操作尚未确认'})
+
+    @staticmethod
+    def age_avc(frame, received_at):
+        age = frame.get('capture_age_ms') if isinstance(frame, dict) else None
+        if type(age) is int and age >= 0:
+            # Include wall time spent receiving and parsing the request body.
+            frame['capture_age_ms'] += round((time.monotonic() - received_at) * 1000)
 
     def stream_live(self, credential, identifier, confirmed, accept_avc):
         if not self.server.stream_capacity.acquire(blocking=False):

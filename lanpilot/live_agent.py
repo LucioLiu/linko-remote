@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 
-from .live import LIVE_WAIT_MS
+from .live import AVC_BATCH_BYTES, AVC_BATCH_FRAMES, AVC_MAX_ENCODED, LIVE_WAIT_MS
 
 FIRST_FRAME_TIMEOUT = 15
 FRAME_GAP_TIMEOUT = 8
@@ -37,6 +37,8 @@ class LiveAgent:
 
     def reset_avc(self):
         self.avc_active = False
+        self.avc_batch = False
+        self.avc_mailbox = {}
         self.avc_seen = 0
         self.avc_seq = 0
         self.avc_key = 0
@@ -65,63 +67,102 @@ class LiveAgent:
         threading.Thread(target=self.frames,daemon=True).start()
 
     def frames(self):
-        # A slow image upload must never hold the native keyboard lease or
-        # delay key-up delivery. Only the newest captured frame is uploaded.
+        # The input lease and receipts run on their own connection. The
+        # Windows mailbox collects new captures while this thread sends media.
         while not self.client.stop_event.is_set():
-            ident=self.current
+            ident = self.current
             delay = .06
+            started = time.monotonic()
             try:
                 if ident:
-                    frame=self.read('live-frame.json')
-                    if self.avc_active:
-                        delay = .02
-                    started = time.monotonic()
+                    if self.avc_batch:
+                        delay = .01
+                        self.upload_avc(ident, self.read_avc_mailbox(ident))
+                    frame = self.read('live-frame.json')
                     if frame.get('id') == ident:
-                        if 'avc_base64' in frame:
-                            self.upload_avc(ident, frame)
-                        elif frame.get('seq', 0) > self.last_frame and time.time() - frame.get('created', 0) < 1:
+                        if 'avc_base64' in frame and not self.avc_batch:
+                            delay = .02
+                            self.upload_avc(ident, [frame])
+                        elif ('jpeg_base64' in frame and frame['seq'] > self.last_frame and
+                              time.time() - frame.get('created', 0) < 1):
                             self.upload_frame(ident, frame)
-                    # Include upload time in the send interval. Slow links
-                    # still send only the newest frame, with one in flight.
-                    delay = max(.01, delay - (time.monotonic() - started))
             except PermissionError as error:
-                self.end(ident,error)
+                self.end(ident, error)
             except (OSError, http.client.HTTPException):
-                # The next iteration sends only the latest available image.
-                # The input loop and its short native lease stay independent.
                 pass
             except Exception as error:
-                self.end(ident,error)
-            self.client.stop_event.wait(delay)
+                self.end(ident, error)
+            self.client.stop_event.wait(max(.005, delay - (time.monotonic() - started)))
 
-    def upload_avc(self, ident, frame):
+    def read_avc_mailbox(self, ident):
+        slots = self.avc_mailbox
+        available = []
+        for slot in range(AVC_BATCH_FRAMES):
+            name = f'live-avc-{slot}.json'
+            try:
+                stat = (self.root / name).stat()
+            except OSError:
+                continue
+            stamp = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+            if slot not in slots or slots[slot][0] != stamp:
+                if stat.st_size > AVC_MAX_ENCODED + 512:
+                    continue
+                frame = self.read(name)
+                if not frame:
+                    continue  # Retry a transient mailbox sharing failure.
+                slots[slot] = stamp, frame
+            frame = slots[slot][1]
+            if frame.get('id') == ident and frame['seq'] > self.avc_seen:
+                available.append(frame)
+        return sorted(available, key=lambda frame: frame['seq'])
+
+    def upload_avc(self, ident, frames):
+        if not frames:
+            return
         with self.lock:
             if (self.current != ident or not self.avc_active or not self.client.incoming or
                     self.client.stop_event.is_set() or time.monotonic() >= self.avc_lease):
                 return
-            seq = frame['seq']
-            if seq <= self.avc_seen:
-                return
-            self.avc_seen = seq
-            age = windows_tick_ms() - frame['capture_tick']
-            if not 0 <= age < 1000:
-                self.request_avc_key()
-                return
-            if frame['idr']:
-                self.avc_waiting_key = False
-            elif self.avc_waiting_key or not self.avc_seq or seq != self.avc_seq + 1:
-                self.request_avc_key()
+            batch = self.avc_batch
+            payloads = []
+            last_seq = self.avc_seq
+            size = 0
+            now_tick = windows_tick_ms()
+            for frame in frames:
+                seq = frame['seq']
+                if seq <= self.avc_seen:
+                    continue
+                encoded = frame['avc_base64']
+                if len(payloads) == AVC_BATCH_FRAMES or size + len(encoded) > AVC_BATCH_BYTES:
+                    break
+                self.avc_seen = seq
+                age = now_tick - frame['capture_tick']
+                if not 0 <= age < 1000:
+                    self.request_avc_key()
+                    continue
+                if frame['idr']:
+                    self.avc_waiting_key = False
+                elif self.avc_waiting_key or not last_seq or seq != last_seq + 1:
+                    self.request_avc_key()
+                    continue
+                payloads.append({'avc_base64': encoded, 'capture_age_ms': age})
+                size += len(encoded)
+                last_seq = seq
+                if not batch:
+                    break
+            if not payloads:
                 return
 
-        payload = {'avc_base64': frame['avc_base64'], 'capture_age_ms': age}
+        operation = 'live-avc-batch' if batch else 'live-frame'
+        body = {'frames': payloads} if batch else {'frame': payloads[0]}
         try:
-            value = self.frame_hub.call('live-frame', {'id': ident, 'frame': payload})
+            value = self.frame_hub.call(operation, dict(body, id=ident))
         except PermissionError as error:
             if getattr(error, 'status', None) != 400:
                 raise
             with self.lock:
                 if self.current == ident:
-                    self.avc_active = False
+                    self.avc_active = self.avc_batch = False
             return
         except (OSError, http.client.HTTPException):
             with self.lock:
@@ -136,14 +177,12 @@ class LiveAgent:
                 raise RuntimeError('连续画面已停止')
             if not self.avc_active:
                 return
-            # A relay that confirms the downgrade may still have acknowledged
-            # the last AVC frame before the viewer changed transport.
-            if value.get('frame_seq') == seq:
-                self.avc_seq = seq
+            if value.get('frame_seq') == last_seq:
+                self.avc_seq = last_seq
                 self.media_at = time.monotonic()
             if value.get('live_avc', 1) != 1:
-                self.avc_active = False
-            elif value.get('need_idr') or value.get('frame_seq') != seq:
+                self.avc_active = self.avc_batch = False
+            elif value.get('need_idr') or value.get('frame_seq') != last_seq:
                 self.request_avc_key()
 
     def upload_frame(self, ident, frame):
@@ -151,7 +190,7 @@ class LiveAgent:
             if self.current != ident:
                 return
             # The worker has switched codecs for the rest of this session.
-            self.avc_active = False
+            self.avc_active = self.avc_batch = False
             base = self.upload_base
             # A lost response leaves the relay's current base uncertain.
             self.upload_base = None
@@ -206,7 +245,11 @@ class LiveAgent:
             try:
                 if not self.client.incoming:
                     self.expire();self.client.stop_event.wait(.3);continue
-                sessions=self.hub.call('live-agent-state')['sessions'] if not self.current else [{'id':self.current}]
+                if self.current:
+                    sessions = [{'id': self.current}]
+                else:
+                    options = {'accept_avc_batch': 1} if self.avc_enabled else {}
+                    sessions = self.hub.call('live-agent-state', options)['sessions']
                 if not sessions:
                     self.client.stop_event.wait(.3);continue
                 ident=sessions[0]['id']
@@ -216,7 +259,7 @@ class LiveAgent:
                     if starting:
                         self.expire();self.media_at=time.monotonic();self.current=ident
                     if self.avc_active and time.monotonic() - self.media_at > AVC_FALLBACK_TIMEOUT:
-                        self.avc_active = False
+                        self.avc_active = self.avc_batch = False
                     has_frame = self.last_frame or self.avc_seq
                     frame_timeout = FRAME_GAP_TIMEOUT if has_frame else FIRST_FRAME_TIMEOUT
                     timed_out = time.monotonic() - self.media_at > frame_timeout
@@ -228,6 +271,8 @@ class LiveAgent:
                 if ended.get('id')==ident: raise RuntimeError(ended.get('error','连续桌面已停止'))
                 receipt=self.read('live-receipt.json')
                 body={'id':ident,'ack':receipt.get('seq',0) if receipt.get('id')==ident else 0}
+                if (starting and sessions[0].get('avc_batch') == 1) or self.avc_batch:
+                    body['accept_avc_batch'] = 1
                 # The native worker needs its first lease before it can capture.
                 if not starting: body['wait_ms']=LIVE_WAIT_MS
                 if receipt.get('id')==ident and receipt.get('error'): body['error']=receipt['error']
@@ -241,11 +286,15 @@ class LiveAgent:
                     lease = min(2.5, value['lease_ms'] / 1000)
                     if starting:
                         self.avc_active = self.avc_enabled and sessions[0].get('live_avc') == 1
+                        self.avc_batch = sessions[0].get('avc_batch') == 1
                     self.avc_active = self.avc_active and value.get('live_avc') == 1
+                    self.avc_batch = self.avc_active and self.avc_batch and value.get('avc_batch') == 1
                     control = {'id': ident, 'expires': time.time() + lease}
                     if self.avc_active:
                         self.avc_lease = time.monotonic() + lease
                         control.update(live_avc=1, avc_key=self.avc_key)
+                        if self.avc_batch:
+                            control['avc_batch'] = 1
                     self.write(self.root/'live-control.json', control)
                     for batch in value['inputs']:
                         transit = max(0, time.monotonic() - started - relay_wait)

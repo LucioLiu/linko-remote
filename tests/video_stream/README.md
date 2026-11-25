@@ -52,3 +52,15 @@ py -3.12 -m venv $videoEnv
 运行 `python h264_benchmark.py` 可复测等画质全屏文字滚动。固定 4:4:4 色度采样，按整帧 RGB PSNR 校准，同时报告文字边缘的独立指标。每帧输入都在当次编码并解码。
 
 运行 `python wan_playback.py SSH主机别名` 可用自己管理的 SSH 服务器复测公网下行。合成测试帧预先放在远端临时目录，测试结束清除。客户端发出开始信号后，服务器按每秒 20 帧发送 80 帧，Mac 解码到 RGB 后计时，四轮采用 H.264、JPEG、JPEG、H.264 的顺序。首帧包含开始信号到第一帧解码的时间；批次尾部可能出现积压后突发到达，因此优先观察 4 秒内完成解码的帧数和全部 80 帧的交付时间。结果见 wan-playback-m1pro.jsonl。该测试测量服务器到 Mac 的路径，不包含 Windows 采集、公司上行或屏幕实际显示。
+
+### Windows AVC 上传
+
+`serial_avc_tls.py` 和 `serial_avc_tls_results.json` 保留逐帧等待 ACK 的原始吞吐基准。该基准在上一帧收到 ACK 后才释放下一帧。
+
+```sh
+/tmp/lanpilot-video-bench/bin/python tests/video_stream/batch_avc_tls.py \
+  --seconds 15 --repeats 3 > batch_avc_tls_results.json
+python3 -m unittest discover -s tests -p 'test_live_stream.py'
+```
+
+新对照使用同一份 720p、20fps AVC 片段和正常的 LiveAgent 上传及 TLS 中继。合成采集按固定时钟写入邮箱，两组分别使用旧的单文件和协商后的 8 槽邮箱。发送端到中继的 RTT 为 0、100 或 200ms，观看端直连本地中继。每轮在相同位置跳过两个采集序号，恢复时间从首个跳过的序号计到下一次有效到帧。片段每秒有一个 IDR。回归测试另验证提交未获 ACK、邮箱覆盖、输入回执及按需请求 IDR。到帧延迟测到观看端解析记录，Windows 实机采集和屏幕显示耗时需要另测。
