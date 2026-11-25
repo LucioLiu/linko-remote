@@ -255,6 +255,8 @@ const liveImage=$('remote-image');
 const liveVideo=$('remote-video');
 let liveClosing=null;
 const liveFrameLimit=1500;
+const liveAvcFirstFrameTimeout=15000;
+const liveAvcFrameGapTimeout=4000;
 function stopLive(){
  const prior=live;live=null;
  if(prior){
@@ -279,7 +281,7 @@ async function startLive(){
   remoteFrame=null;
   const canvas=acceptAvc && value.live_avc===1;
   live={id:value.id,seq:0,ack:0,queue:[],sending:false,frame:null,frameAt:0,halt:false,
-   canvas,mediaAt:performance.now(),pendingFrames:new Map()};
+   canvas,openedAt:performance.now(),mediaAt:null,pendingFrames:new Map()};
   if(canvas){
    liveImage.removeAttribute('src');
    live.mediaAbort=new AbortController();
@@ -465,7 +467,11 @@ async function pollLive(session){
   }
   const now=performance.now(), frame=value.frame;
   if(session.canvas){
-   if(!session.jpeg && now-session.mediaAt>4000)await requestLiveJpeg(session);
+   // Wait for a frame actually drawn on the canvas before applying the playback gap timeout.
+   const waitingForFirstFrame=session.mediaAt===null;
+   const elapsed=now-(waitingForFirstFrame?session.openedAt:session.mediaAt);
+   const timeout=waitingForFirstFrame?liveAvcFirstFrameTimeout:liveAvcFrameGapTimeout;
+   if(!session.jpeg && elapsed>timeout)await requestLiveJpeg(session);
   }else if(frame && (!session.frame || frame.seq!==session.frame.seq)){
    presentLiveFrame(session,frame,now-value.frame_age_ms);
   }
@@ -473,7 +479,7 @@ async function pollLive(session){
    if(session.frame && now-session.frameAt<liveFrameLimit){
     const codec=session.frame.codec?' · '+session.frame.codec:'';
     $('remote-state').textContent='连续桌面'+codec+' · '+Number(value.fps || 0).toFixed(1)+' 帧/秒 · 点击画面使用键鼠';
-   }else if(now-session.mediaAt>liveFrameLimit){
+   }else if(now-(session.mediaAt ?? session.openedAt)>liveFrameLimit){
     $('remote-state').textContent='正在等待新画面，键鼠已暂停';
    }
   }
