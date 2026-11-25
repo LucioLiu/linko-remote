@@ -171,6 +171,7 @@ $('approve').onclick=()=>approve(true);
 $('approve-persistent').onclick=()=>approve(true,true);
 $('deny').onclick=()=>approve(false);
 function openRemote(peer){
+ $('remote-lossless').checked=false;$('remote-inspect').disabled=true;
  selectedPeer=peer;remoteFrame=null;remotePending=state.pending[peer.id] || null;
  remotePendingRestored=Boolean(remotePending);
  $('remote-name').textContent=peer.name;$('remote-image').removeAttribute('src');
@@ -195,7 +196,7 @@ function displayReceipt(value, restored=false){
   return true;
  }
  const result=receipt.result || {}, image=result.jpeg_base64 || result.png_base64;
- if(image){$('remote-image').src='data:image/'+(result.jpeg_base64?'jpeg':'png')+';base64,'+image;$('remote-placeholder').classList.add('hidden');}
+ if(image){$('remote-inspect').disabled=false;$('remote-image').src='data:image/'+(result.jpeg_base64?'jpeg':'png')+';base64,'+image;$('remote-placeholder').classList.add('hidden');}
  if(!image){$('remote-state').textContent='原操作回执已保留，请重新取得画面';return true;}
  if(restored){$('remote-state').textContent='已显示原回执画面，连接可用时请重新取屏';return true;}
  remoteFrame=result;
@@ -216,8 +217,15 @@ async function perform(request){
  if(!selectedPeer || remoteBusy || liveOpening || liveClosing)return;if(remotePending){$('remote-state').textContent='上一操作未确认，请先查询原结果';return;}
  if(request.action!=='observe'){if(!remoteFrame){$('remote-state').textContent='请先取得新的画面';return;}request.frame_id=remoteFrame.frame_id;}
  const peerId=selectedPeer.id;remoteBusy=true;$('remote-state').textContent='正在等待回执…';
- try{const response=await api('remote',{peer:selectedPeer.id,request:{...request,image_format:'compact'}});if(selectedPeer?.id===peerId && !live){remotePending=response.id;remotePendingRestored=false;displayReceipt(response);}}catch(e){$('remote-state').textContent=e.message;await refresh();}finally{remoteBusy=false;}
+ try{const response=await api('remote',{peer:selectedPeer.id,request:{...request,image_format:request.action==='observe' && $('remote-lossless').checked?'png':'compact'}});if(selectedPeer?.id===peerId && !live){remotePending=response.id;remotePendingRestored=false;displayReceipt(response);}}catch(e){$('remote-state').textContent=e.message;await refresh();}finally{remoteBusy=false;}
 }
+$('remote-inspect').onclick=()=>{
+ const source=$('remote-image').getAttribute('src');
+ if(live || !source?.startsWith('data:image/'))return;
+ $('snapshot-image').src=source;
+ $('snapshot-dialog').showModal();
+};
+$('snapshot-dialog').addEventListener('close',()=>$('snapshot-image').removeAttribute('src'));
 $('remote-refresh').onclick=()=>live?restartLive():perform({action:'observe'});$('remote-recover').onclick=recoverPending;
 $('remote-image').onclick=event=>{if(live || !remoteFrame)return;const rect=event.target.getBoundingClientRect();perform({action:'click',x:Math.min(remoteFrame.bounds[2]-1,Math.floor((event.clientX-rect.left)*remoteFrame.bounds[2]/rect.width)),y:Math.min(remoteFrame.bounds[3]-1,Math.floor((event.clientY-rect.top)*remoteFrame.bounds[3]/rect.height)),button:'left'});};
 $('send-text').onclick=()=>{const value=$('remote-text').value;if(value){if(live){if(value.length>500){$('remote-state').textContent='连续桌面每次最多发送 500 字，请分段发送';return;}queueLive({type:'text',text:value});}else perform({action:'text',text:value});}};document.querySelectorAll('.key').forEach(button=>button.onclick=()=>{if(live){const code={ENTER:'Enter',TAB:'Tab',ESC:'Escape',BACKSPACE:'Backspace'}[button.dataset.key];queueLive({type:'keydown',code});queueLive({type:'keyup',code});}else perform({action:'key',keys:[button.dataset.key]});});
@@ -271,10 +279,11 @@ function stopLive(){
   closeLiveDecoder(prior);
   liveImage.removeAttribute('src');remoteFrame=null;
   liveVideo.classList.add('hidden');
-  liveVideo.width=liveVideo.height=1;
+  liveVideo.width=liveVideo.height=1;$('remote-inspect').disabled=true;
   $('remote-placeholder').classList.remove('hidden');
   liveClosing=api('live-close',{id:prior.id}).finally(()=>{liveClosing=null;});
  }
+ $('remote-quality').hidden=false;$('remote-inspect').hidden=false;
  $('remote-mode').textContent='连续桌面';$('remote-refresh').textContent='取新画面';$('remote-recover').hidden=false;
  return liveClosing || Promise.resolve();
 }
@@ -293,6 +302,7 @@ async function startLive(){
    live.mediaAbort=new AbortController();
    watchLiveMedia(live);
   }else liveImage.src='/live-feed/'+value.id+'?session='+encodeURIComponent(nonce);
+  $('remote-quality').hidden=true;$('remote-inspect').hidden=true;
   $('remote-mode').textContent='逐步操作';$('remote-refresh').textContent='重新连接';$('remote-recover').hidden=true;$('remote-state').textContent='正在建立连续画面…';pollLive(live);
  }catch(e){$('remote-state').textContent=e.message;}finally{liveOpening=false;}
 }

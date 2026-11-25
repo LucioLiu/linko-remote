@@ -112,7 +112,7 @@ final class PeerDesktop {
   guard rendered else { try fail("SCREEN_CAPTURE_FAILED") }
   return (image, pixels)
  }
- func observe() async throws -> [String: Any] {
+ func observe(lossless: Bool = false) async throws -> [String: Any] {
   try ensureAccess()
   let before = inputToken(), focused = try focus()
   let width = CGDisplayPixelsWide(display), height = CGDisplayPixelsHigh(display)
@@ -123,9 +123,10 @@ final class PeerDesktop {
   guard after.1 == region else { try fail("WINDOW_MOVED_DURING_CAPTURE") }
   let identifier = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
   frame = DesktopFrame(id: identifier, created: ProcessInfo.processInfo.systemUptime, pixels: pixels, width: image.width, height: image.height, owner: owner, window: region, focus: focused, input: before)
-  guard let encoded = NSBitmapImageRep(cgImage: image).representation(using: .jpeg, properties: [.compressionFactor: 0.86]) else { try fail("SCREEN_ENCODING_FAILED") }
+  let bitmap = NSBitmapImageRep(cgImage: image)
+  guard let encoded = bitmap.representation(using: lossless ? .png : .jpeg, properties: lossless ? [:] : [.compressionFactor: 0.86]) else { try fail("SCREEN_ENCODING_FAILED") }
   return ["frame_id": identifier, "session": session, "bounds": [0,0,image.width,image.height], "foreground_bounds": region,
-          "title": title, "platform": "macos", "input_enabled": true, "target_guard": true, "jpeg_base64": encoded.base64EncodedString()]
+          "title": title, "platform": "macos", "input_enabled": true, "target_guard": true, (lossless ? "png_base64" : "jpeg_base64"): encoded.base64EncodedString()]
  }
  func unchanged(_ before: DesktopFrame, _ after: Data, _ region: [Int]) -> Bool {
   let left = max(0, region[0]), top = max(0, region[1])
@@ -151,7 +152,7 @@ final class PeerDesktop {
    try ensureAccess()
    guard let expires = request["expires"] as? Double, expires >= Date().timeIntervalSince1970, expires <= Date().timeIntervalSince1970 + 120 else { try fail("REQUEST_EXPIRED_OR_CLOCK_MISMATCH") }
    let action = request["action"] as? String ?? ""
-   if action == "observe" { return ["ok":true,"input_attempted":false,"request_id":identifier,"action":action,"result":try await observe()] }
+   if action == "observe" { return ["ok":true,"input_attempted":false,"request_id":identifier,"action":action,"result":try await observe(lossless: request["image_format"] as? String == "png")] }
    if action == "status" { return ["ok":true,"input_attempted":false,"request_id":identifier,"result":["platform":"macos","input_enabled":true,"version":"0.8.0-unified-preview"]] }
    guard ["click","doubleclick","text","key","scroll"].contains(action) else { try fail("UNSUPPORTED_MAC_ACTION") }
    guard let current = frame, request["frame_id"] as? String == current.id, ProcessInfo.processInfo.systemUptime-current.created <= 60 else { try fail("STALE_FRAME_OBSERVE_AGAIN") }
