@@ -222,8 +222,14 @@ async function perform(request){
 $('remote-inspect').onclick=()=>{
  const source=$('remote-image').getAttribute('src');
  if(live || !source?.startsWith('data:image/'))return;
+ $('snapshot-info').textContent='截图原图';
  $('snapshot-image').src=source;
  $('snapshot-dialog').showModal();
+};
+$('snapshot-image').onload=()=>{
+ const image=$('snapshot-image');
+ if($('snapshot-dialog').open)$('snapshot-info').textContent='截图原图 · '+
+  (image.src.startsWith('data:image/png;')?'PNG 无损':'JPEG 压缩')+' · '+image.naturalWidth+' × '+image.naturalHeight;
 };
 $('snapshot-dialog').addEventListener('close',()=>$('snapshot-image').removeAttribute('src'));
 $('remote-refresh').onclick=()=>live?restartLive():perform({action:'observe'});$('remote-recover').onclick=recoverPending;
