@@ -27,6 +27,9 @@ MEDIA_FAILURES = {
     'frame_gap': '连续画面传输超时，已释放键鼠，请重新连接',
 }
 LIVE_WAIT_MS = 250
+LIVE_STREAM_SECONDS = 3
+LIVE_STREAM_RECORD_MAX = 1_510_000
+LIVE_STREAM_TYPE = 'application/x-ndjson'
 
 
 def validate_events(events):
@@ -145,19 +148,8 @@ class LiveSessions:
         if op == 'live-view':
             if me != s['caller']: raise PermissionError('无权查看此桌面')
             s['viewed']=now
-            if not s['error'] and s['inflight'] and now-s['inflight'][0]['claimed']>3:
-                s['error']='键鼠回执超时，已暂停输入，请结束连接后重连'
-                s['changed'].notify_all()
-            age=now-s['frame_at']
-            frame=s['frame'] if age<2 else None
-            after = body.get('after')
             confirmed = body.get('accept_delta') is not True or self.confirmed_view_base(s, body)
-            unchanged = frame is not None and confirmed and frame['seq'] == after
-            if (frame and not unchanged and confirmed and body.get('accept_repeat') is True and
-                    type(after) is int and s['same_since'] <= after < frame['seq']):
-                frame = {'seq': frame['seq'], 'geometry': frame['geometry'], 'repeat_after': after}
-            return {'id':s['id'],'frame':None if unchanged else frame,'unchanged':unchanged,
-                    'ack':s['ack'],'error':s['error'],'frame_age_ms':round(age*1000)}
+            return self.view(s, now, body.get('after') if confirmed else None, body.get('accept_repeat'))
         if op == 'live-input':
             if me != s['caller']: raise PermissionError('无权操作此桌面')
             if s['error']: raise ValueError(s['error'])
@@ -208,6 +200,59 @@ class LiveSessions:
             remaining=max(0,int((s['viewed']+8-now)*1000))
             return {'inputs':inputs if remaining else [],'active':not bool(s['error']) and remaining>0,'lease_ms':min(2500,remaining)}
         raise ValueError('无效连续桌面请求')
+
+    def view(self, session, now, after, accept_repeat):
+        inflight = session['inflight']
+        if not session['error'] and inflight and now - inflight[0]['claimed'] > 3:
+            session['error'] = '键鼠回执超时，已暂停输入，请结束连接后重连'
+            session['changed'].notify_all()
+        age = now - session['frame_at']
+        frame = session['frame'] if age < 2 else None
+        unchanged = frame is not None and frame['seq'] == after
+        if (frame and not unchanged and accept_repeat is True and
+                type(after) is int and session['same_since'] <= after < frame['seq']):
+            frame = {'seq': frame['seq'], 'geometry': frame['geometry'], 'repeat_after': after}
+        return {'id': session['id'], 'frame': None if unchanged else frame, 'unchanged': unchanged,
+                'ack': session['ack'], 'error': session['error'], 'frame_age_ms': round(age * 1000)}
+
+    def begin_stream(self, credential, identifier):
+        if not isinstance(identifier, str) or not re.fullmatch('[a-f0-9]{32}', identifier):
+            raise ValueError('无效连续桌面请求')
+        with self.hub.lock:
+            device = self.hub._device(credential)
+            caller = device['id']
+            now = self.hub.clock()
+            self.prune(now)
+            session = self.sessions.get(identifier)
+            if not session or session['caller'] != caller:
+                failure = self.media_failures.get(identifier)
+                raise PermissionError(failure['error'] if failure and failure['caller'] == caller
+                                      else '连续桌面会话已结束')
+            if session.get('streaming'):
+                raise PermissionError('此会话已有连续画面连接')
+            if now - device['seen'] >= 2:
+                self.hub.db.execute('UPDATE devices SET seen=? WHERE id=?', (now, caller))
+            # Only an authenticated renewal request touches the existing viewer lease.
+            session['streaming'] = True
+            session['viewed'] = now
+            return session
+
+    def stream_update(self, session, after, ack, wait):
+        with self.hub.lock:
+            now = self.hub.clock()
+            if self.sessions.get(session['id']) is not session or not self.allowed(session, now):
+                failure = self.media_failures.get(session['id'])
+                error = failure['error'] if failure and self.allowed(session, now) else '连续桌面会话已结束'
+                return {'id': session['id'], 'frame': None, 'ack': session['ack'], 'error': error}
+            result = self.view(session, now, after, True)
+            if result['frame'] or result['ack'] != ack or result['error']:
+                return result
+            session['changed'].wait(wait)
+            return None
+
+    def end_stream(self, session):
+        with self.hub.lock:
+            session['streaming'] = False
 
     def confirmed_view_base(self, session, body):
         sent = session['view_sent']

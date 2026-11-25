@@ -7,12 +7,15 @@ import argparse
 import http.server
 import json
 import re
+import select
 import socket
 import ssl
 import sys
 import threading
+import time
 from pathlib import Path
 
+from .live import LIVE_STREAM_RECORD_MAX, LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE
 from .peer_hub import PeerHub
 
 
@@ -42,7 +45,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         operations = {'register', 'name', 'availability', 'code', 'connect', 'access',
                       'approve', 'disconnect', 'state', 'poll', 'submit', 'result', 'recover',
-                      'live-open', 'live-close', 'live-view', 'live-input', 'live-exchange', 'live-agent-state', 'live-frame'}
+                      'live-open', 'live-close', 'live-view', 'live-input', 'live-exchange', 'live-agent-state', 'live-frame',
+                      'live-stream'}
         operation = self.path[4:] if self.path.startswith('/v2/') else ''
         if operation not in operations:
             self.close_connection = True
@@ -60,7 +64,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raw = self.rfile.read(int(lengths[0]))
             if len(raw) != int(lengths[0]):
                 raise ValueError('Incomplete body')
-            value = self.server.hub.dispatch(operation, authorization[0][7:], json.loads(raw), self.client_address[0])
+            body = json.loads(raw)
+            if operation == 'live-stream':
+                if not isinstance(body, dict):
+                    raise ValueError('Invalid stream request')
+                return self.stream_live(authorization[0][7:], body.get('id'), body.get('after'))
+            value = self.server.hub.dispatch(operation, authorization[0][7:], body, self.client_address[0])
+            if operation == 'live-open':
+                value['view_stream'] = 1
             return self.answer(200, {'ok': True, 'value': value})
         except PermissionError as error:
             if operation == 'submit':
@@ -73,6 +84,66 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 print('Submit rejected:', type(error).__name__, str(error)[:150], file=sys.stderr, flush=True)
             return self.answer(400, {'ok': False, 'error': '请求无效或上一操作尚未确认'})
 
+    def stream_live(self, credential, identifier, confirmed):
+        if not self.server.stream_capacity.acquire(blocking=False):
+            return self.answer(503, {'ok': False, 'error': '连续画面连接繁忙'})
+        try:
+            live = self.server.hub.live
+            session = live.begin_stream(credential, identifier)
+            timeout = self.connection.gettimeout()
+            try:
+                # Bound a stalled write. No frame queue is maintained per peer.
+                self.connection.settimeout(.5)
+                self.send_response(200)
+                self.send_header('Content-Type', LIVE_STREAM_TYPE)
+                self.send_header('Transfer-Encoding', 'chunked')
+                self.send_header('Cache-Control', 'no-store')
+                started = time.monotonic()
+                self.end_headers()
+
+                # Reuse across batches only when this connection's viewer
+                # explicitly confirms the sequence it consumed.
+                after = confirmed if (type(confirmed) is int and
+                                      getattr(self, 'stream_cursor', None) == (identifier, confirmed)) else None
+                self.stream_cursor = None
+                ack = None
+                deadline = started + LIVE_STREAM_SECONDS
+                heartbeat = time.monotonic() + .25
+                while (now := time.monotonic()) < deadline:
+                    # The client sends no bytes until the batch ends. Readability
+                    # here indicates a disconnect or an out-of-protocol request.
+                    if self.connection.pending() or select.select([self.connection], [], [], 0)[0]:
+                        self.close_connection = True
+                        return
+                    value = live.stream_update(session, after, ack, min(.1, deadline - now))
+                    if value is None:
+                        if now >= heartbeat:
+                            self.stream_chunk(b'\n')
+                            heartbeat = time.monotonic() + .25
+                        continue
+                    value['sent_ms'] = int((now - started) * 1000)
+                    self.stream_chunk(json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode() + b'\n')
+                    heartbeat = time.monotonic() + .25
+                    if value['error']:
+                        break
+                    if value['frame']:
+                        after = value['frame']['seq']
+                    elif not value.get('unchanged'):
+                        after = None
+                    ack = value['ack']
+                self.wfile.write(b'0\r\n\r\n')
+                self.stream_cursor = (identifier, after)
+            finally:
+                self.connection.settimeout(timeout)
+                live.end_stream(session)
+        finally:
+            self.server.stream_capacity.release()
+
+    def stream_chunk(self, record):
+        if len(record) > LIVE_STREAM_RECORD_MAX:
+            raise OSError('Live stream record too large')
+        self.wfile.write(f'{len(record):x}\r\n'.encode('ascii') + record + b'\r\n')
+
 
 class PeerGateway(http.server.ThreadingHTTPServer):
     daemon_threads = True
@@ -84,6 +155,7 @@ class PeerGateway(http.server.ThreadingHTTPServer):
         self.context.minimum_version = ssl.TLSVersion.TLSv1_2
         self.context.load_cert_chain(str(cert), str(key))
         self.capacity = threading.BoundedSemaphore(64)
+        self.stream_capacity = threading.BoundedSemaphore(24)
         super().__init__((bind, port), Handler)
 
     def process_request(self, request, address):

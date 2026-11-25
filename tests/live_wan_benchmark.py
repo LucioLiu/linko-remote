@@ -56,15 +56,38 @@ def ms_summary(seconds):
     return {'samples': 0}
 
 
-def measure(peer, seconds):
+class MeasuredView(LiveView):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.last_digest = None
+        self.content_changes = 0
+        self.wire_frames = 0
+        self.encoded_bytes = 0
+
+    def publish(self, value, roundtrip=0):
+        wire = value.get('frame')
+        super().publish(value, roundtrip)
+        if wire and not value.get('error'):
+            self.wire_frames += 1
+            self.encoded_bytes += len(wire.get('jpeg_base64', '')) + len(wire.get('delta_base64', ''))
+            if 'repeat_after' not in wire:
+                image = self.value['frame']['jpeg_base64']
+                digest = hashlib.sha256(image.encode('ascii')).digest()
+                self.content_changes += self.last_digest != digest
+                self.last_digest = digest
+
+
+def measure(peer, seconds, stream=False):
     config = json.loads((default_home() / 'client.json').read_text())
     endpoint, credential = config['endpoint'], config['credential']
     control = PinnedHub(endpoint, credential)
     media = TimedViewerHub(endpoint, credential)
     start = time.monotonic()
-    identifier = control.call('live-open', {'peer': peer})['id']
+    session = control.call('live-open', {'peer': peer})
+    identifier = session['id']
     opened = time.monotonic()
-    view = LiveView(media, identifier, threading.Event())
+    view = MeasuredView(media, identifier, threading.Event(),
+                        stream_version=session.get('view_stream') if stream else None)
     previous = None
     arrivals = []
     error = ''
@@ -95,6 +118,9 @@ def measure(peer, seconds):
     return {'seconds': round(end-opened, 2), 'open_ms': round((opened-start)*1000),
             'first_frame_ms': round((arrivals[0]-start)*1000) if arrivals else None,
             'visible_frames': len(arrivals), 'error': error,
+            'stream_requested': stream, 'stream_advertised': session.get('view_stream') == 1,
+            'wire_frames': view.wire_frames, 'wire_image_bytes': view.encoded_bytes,
+            'distinct_content_updates': view.content_changes,
             'frame_interval_ms': ms_summary(b-a for a,b in zip(arrivals, arrivals[1:])),
             'frame_request_ms': ms_summary(duration for duration,size,_ in calls if size),
             'empty_request_ms': ms_summary(duration for duration,size,_ in calls if not size),
@@ -111,5 +137,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('peer')
     parser.add_argument('--seconds', type=int, choices=range(5, 301), default=30, metavar='5..300')
+    parser.add_argument('--stream', action='store_true', help='Negotiate bounded HTTPS streaming')
     options = parser.parse_args()
-    print(json.dumps(measure(options.peer, options.seconds), indent=2, ensure_ascii=False))
+    print(json.dumps(measure(options.peer, options.seconds, options.stream), indent=2, ensure_ascii=False))

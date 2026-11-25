@@ -7,12 +7,14 @@ from .live_delta import DeltaError, decode_delta
 
 
 class LiveView:
-    def __init__(self, hub, identifier, stop_event):
+    def __init__(self, hub, identifier, stop_event, *, stream_version=None):
         self.hub=hub;self.id=identifier;self.client_stop=stop_event
         self.stop=threading.Event();self.changed=threading.Condition()
         self.value={'id':identifier,'frame':None,'ack':0,'error':''}
         self.arrivals=[];self.updated=0;self.ui_seen=time.monotonic()
         self.thread=None
+        self.stream_version = stream_version
+        self.stream = None
 
     def start(self):
         self.thread=threading.Thread(target=self.run,daemon=True);self.thread.start()
@@ -54,10 +56,29 @@ class LiveView:
             if result['frame_age_ms']>1500:result['frame']=None
             return result
 
+    def active(self):
+        return not self.stop.is_set() and not self.client_stop.is_set() and time.monotonic() - self.ui_seen < 12
+
+    def run_stream(self):
+        factory = getattr(self.hub, 'live_stream', None)
+        if self.stream_version != 1 or factory is None:
+            return False
+        with self.changed:
+            if not self.active():
+                return True
+            stream = self.stream = factory(self.id)
+        try:
+            return stream.run(self.active, self.publish)
+        finally:
+            with self.changed:
+                self.stream = None
+
     def run(self):
         resync = False
         try:
-            while not self.stop.is_set() and not self.client_stop.is_set() and time.monotonic()-self.ui_seen<12:
+            if self.run_stream():
+                return
+            while self.active():
                 frame = None if resync else self.value.get('frame')
                 started=time.monotonic()
                 value=self.hub.call('live-view',{'id':self.id,'after':frame['seq'] if frame else None,
@@ -86,4 +107,7 @@ class LiveView:
 
     def close(self):
         self.stop.set()
-        with self.changed:self.changed.notify_all()
+        with self.changed:
+            if self.stream is not None:
+                self.stream.abort()
+            self.changed.notify_all()

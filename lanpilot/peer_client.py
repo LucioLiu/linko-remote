@@ -24,6 +24,7 @@ import uuid
 import webbrowser
 
 from desktop import make_request
+from .live import LIVE_STREAM_RECORD_MAX, LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE
 from .peer_hub import DESKTOP_PLATFORMS, DESKTOP_UNAVAILABLE, READ_ONLY_TIMEOUTS, display_name
 from .version import VERSION
 from .updater import UpdateManager
@@ -127,6 +128,78 @@ class RelayIdentityError(PermissionError):
     """No request may be sent when the relay certificate changes."""
 
 
+class LiveStream:
+    def __init__(self, host, port, pin, credential, identifier):
+        self.connection = PinnedConnection(host, port, pin)
+        self.credential = credential
+        self.identifier = identifier
+
+    def abort(self):
+        sock = self.connection.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def run(self, active, publish):
+        """Return False when the viewer should switch to legacy polling."""
+        headers = {'Authorization': 'Bearer ' + self.credential, 'Content-Type': 'application/json'}
+        after = None
+        try:
+            self.connection.connect()
+            self.connection.sock.settimeout(LIVE_STREAM_SECONDS + 2)
+            self.connection.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            while active():
+                payload = json.dumps({'id': self.identifier, 'after': after}, separators=(',', ':')).encode()
+                started = time.monotonic()
+                self.connection.request('POST', '/v2/live-stream', payload, headers)
+                with self.connection.getresponse() as response:
+                    if response.status in (404, 405, 501, 503):
+                        return False
+                    if response.status != 200:
+                        answer = json.loads(response.read(4097))
+                        raise HubRejection(answer.get('error', '连续画面连接未完成'))
+                    if not response.chunked or response.getheader('Content-Type') != LIVE_STREAM_TYPE:
+                        raise ValueError('连续画面连接响应无效')
+                    while active():
+                        raw = response.readline(LIVE_STREAM_RECORD_MAX + 1)
+                        if not raw:
+                            break
+                        if raw == b'\n':
+                            continue
+                        if len(raw) > LIVE_STREAM_RECORD_MAX or not raw.endswith(b'\n'):
+                            raise ValueError('连续画面消息无效')
+                        value = json.loads(raw)
+                        if not isinstance(value, dict) or value.get('id') != self.identifier:
+                            raise ValueError('连续画面会话响应无效')
+                        sent = value.pop('sent_ms', None)
+                        if type(sent) is not int or not 0 <= sent < LIVE_STREAM_SECONDS * 1000:
+                            raise ValueError('连续画面时间无效')
+                        frame = value['frame']
+                        if frame and ('delta_after' in frame or 'delta_base64' in frame):
+                            raise ValueError('连续画面格式无效')
+                        # Both clocks measure elapsed time within this batch.
+                        # Include the request flight time and any downstream
+                        # queueing when applying the existing frame age limit.
+                        transit = max(0, time.monotonic() - started - sent / 1000)
+                        if active():
+                            publish(value, transit)
+                            if frame:
+                                after = frame['seq']
+                            elif not value.get('unchanged'):
+                                after = None
+                        if value['error']:
+                            return True
+            return True
+        except (HubRejection, RelayIdentityError):
+            raise
+        except (OSError, http.client.HTTPException):
+            return False
+        finally:
+            self.connection.close()
+
+
 class PinnedHub:
     def __init__(self, endpoint, credential):
         parsed = urlsplit(endpoint['url'])
@@ -139,6 +212,9 @@ class PinnedHub:
         self.lock = threading.Lock()
         self.connection = None
         self.last_response = 0
+
+    def live_stream(self, identifier):
+        return LiveStream(self.host, self.port, self.pin, self.credential, identifier)
 
     def call(self, operation, body=None):
         # Read-only recovery may use a fresh connection after a relay closes an
@@ -547,7 +623,8 @@ class DesktopClient:
             value = self.live_input_hub.call(operation, body)
             if operation == 'live-open':
                 self.live_session = value['id']
-                self.live_view = LiveView(self.live_hub, value['id'], self.stop_event)
+                self.live_view = LiveView(self.live_hub, value['id'], self.stop_event,
+                                          stream_version=value.get('view_stream'))
                 self.live_view.start()
             return value
         if not self.supports_updates and operation.startswith('update-'):
