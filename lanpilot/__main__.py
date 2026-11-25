@@ -4,7 +4,7 @@ from .core import Bridge
 p=argparse.ArgumentParser(prog='邻控');s=p.add_subparsers(dest='command',required=True)
 s.add_parser('devices')
 s.add_parser('ssh-list')
-x=s.add_parser('ssh-add');x.add_argument('name');x.add_argument('host');x.add_argument('--user',default='');x.add_argument('--port',type=int,default=22)
+x=s.add_parser('ssh-add');x.add_argument('name');x.add_argument('host');x.add_argument('--user',default='');x.add_argument('--port',type=int)
 x=s.add_parser('ssh-open');x.add_argument('id')
 x=s.add_parser('ssh-rename');x.add_argument('id');x.add_argument('name')
 x=s.add_parser('rename');x.add_argument('device');x.add_argument('name')

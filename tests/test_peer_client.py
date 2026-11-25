@@ -606,6 +606,20 @@ class LinuxClientTests(unittest.TestCase):
                 self.assertEqual({'closed': True}, linux.api('live-close', live))
                 popen.assert_not_called()
 
+    def test_ssh_alias_port_can_be_inherited_or_explicit(self):
+        with tempfile.TemporaryDirectory() as directory, patch('lanpilot.peer_client.sys.platform', 'linux'):
+            client = self.make_client(directory)
+            config = Path(directory) / 'ssh_config'
+            config.write_text('Host work-alias\n  Port 2227\n')
+            with patch.object(client, 'open_linux_ssh') as launch:
+                for port, expected in [('', 2227), ('22', 22), (2244, 2244)]:
+                    profile = client.save_ssh({'name': 'Office', 'host': 'work-alias', 'port': port})
+                    client.open_ssh(profile['id'])
+                    args = launch.call_args.args[0]
+                    result = subprocess.run([args[0], '-G', '-F', str(config), *args[1:]],
+                                            capture_output=True, text=True, check=True)
+                    self.assertIn(f'port {expected}', result.stdout.splitlines())
+
     def test_linux_ssh_launches_open_ssh_in_desktop_terminal_with_separate_arguments(self):
         tools = {'ssh': '/usr/bin/ssh', 'konsole': '/usr/bin/konsole'}
         with tempfile.TemporaryDirectory() as directory, patch('lanpilot.peer_client.sys.platform', 'linux'):

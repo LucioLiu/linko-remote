@@ -50,7 +50,7 @@ function renderDevices() {
 function renderSSH() {
  const list = $('ssh-list'); list.replaceChildren();
  if(!state.ssh.length){list.append(textNode('div','还没有 SSH 连接，点击右上角添加。','empty')); return;}
- for(const item of state.ssh){const row=textNode('div','','device-row'),meta=textNode('div','','device-meta');meta.append(textNode('strong',item.name),textNode('small',(item.user?item.user+'@':'')+item.host+' · '+item.port)); row.append(textNode('div','›_','device-icon'),meta,action('打开终端',()=>api('ssh-open',{id:item.id}),true));list.append(row);}
+ for(const item of state.ssh){const row=textNode('div','','device-row'),meta=textNode('div','','device-meta');meta.append(textNode('strong',item.name),textNode('small',(item.user?item.user+'@':'')+item.host+' · '+(item.port ?? '沿用 SSH 配置'))); row.append(textNode('div','›_','device-icon'),meta,action('打开终端',()=>api('ssh-open',{id:item.id}),true));list.append(row);}
 }
 async function refresh() {
  if(lastStatePoll || closing) return; lastStatePoll=true;

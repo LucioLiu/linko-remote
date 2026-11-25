@@ -109,9 +109,10 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
  @objc func addSSH(){
   let a=NSAlert();a.messageText="添加 SSH 连接";a.informativeText="连接已开启 SSH 的电脑或服务器。可使用 ~/.ssh/config 中的主机别名。"
   let box=NSView(frame:NSRect(x:0,y:0,width:340,height:164));var fields=[NSTextField]()
-  for (i,text) in ["名称，例如：示例服务器","主机 IP / 域名 / SSH 别名","用户名，留空沿用 SSH 配置","端口，默认 22"].enumerated(){let f=NSTextField(frame:NSRect(x:0,y:CGFloat(126-i*40),width:340,height:27));f.placeholderString=text;box.addSubview(f);fields.append(f)}
+  for (i,text) in ["名称，例如：示例服务器","主机 IP / 域名 / SSH 别名","用户名，留空沿用 SSH 配置","端口，留空沿用 SSH 配置"].enumerated(){let f=NSTextField(frame:NSRect(x:0,y:CGFloat(126-i*40),width:340,height:27));f.placeholderString=text;box.addSubview(f);fields.append(f)}
   a.accessoryView=box;a.addButton(withTitle:"保存连接");a.addButton(withTitle:"取消");guard a.runModal() == .alertFirstButtonReturn else{return}
-  run(["ssh-add",fields[0].stringValue,fields[1].stringValue,"--user",fields[2].stringValue,"--port",fields[3].stringValue.isEmpty ? "22" : fields[3].stringValue]){r in if case .failure(let e)=r{self.notice("保存失败",e.localizedDescription)};self.check()}
+  let portArgs = fields[3].stringValue.isEmpty ? [] : ["--port",fields[3].stringValue]
+  run(["ssh-add",fields[0].stringValue,fields[1].stringValue,"--user",fields[2].stringValue] + portArgs){r in if case .failure(let e)=r{self.notice("保存失败",e.localizedDescription)};self.check()}
  }
  @objc func openSelected(){
   guard table.selectedRow>=0 else{return};let row=rows[table.selectedRow]

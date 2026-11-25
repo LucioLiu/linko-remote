@@ -969,8 +969,9 @@ class DesktopClient:
     def save_ssh(self, body):
         name = display_name(body.get('name'))
         host, user = body.get('host', '').strip(), body.get('user', '').strip()
-        port = int(body.get('port') or 22)
-        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.:-]{0,252}', host) or (user and not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}', user)) or not 1 <= port <= 65535:
+        raw_port = body.get('port')
+        port = None if raw_port in (None, '') else int(raw_port)
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.:-]{0,252}', host) or (user and not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}', user)) or (port is not None and not 1 <= port <= 65535):
             raise ValueError('SSH 地址、用户名或端口无效')
         item = dict(id=uuid.uuid4().hex[:12], name=name, host=host, user=user, port=port)
         with self.lock:
@@ -982,7 +983,9 @@ class DesktopClient:
         item = next((x for x in self.config['ssh'] if x['id'] == identifier), None)
         if item is None:
             raise ValueError('找不到 SSH 连接')
-        args = ['ssh', '-p', str(item['port'])]
+        args = ['ssh']
+        if item.get('port') is not None:
+            args += ['-p', str(item['port'])]
         if item['user']:
             args += ['-l', item['user']]
         args += ['--', item['host']]
