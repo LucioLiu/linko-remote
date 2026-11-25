@@ -1,0 +1,97 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+    <style>
+      body { margin:0; color:var(--foreground); font: 13px var(--font-sans); }
+      h3 { margin: 0 0 8px; font-size: 16px; }
+      .row { display:grid; align-items:center; grid-template-columns: 135px 1fr 40px 1fr 35px; gap:6px;
+             min-height:26px; border-bottom:1px solid var(--border); }
+      .head {font-weight:600}
+      .bars { background:var(--secondary); border-radius:3px; height:10px; overflow:hidden }
+      .bars b { display:block; background:var(--series); height:100%; }
+      strong { text-align:right; font-variant-numeric:tabular-nums; }
+      p { margin:8px 0 0; color:var(--muted-foreground); }
+      @media(max-width:430px) { .row {grid-template-columns:114px 1fr 34px 1fr 30px;gap:4px;} }
+    </style>
+    <h3>停滚后的小字识别与媒体流量</h3>
+    <div class="row head"><span>链路 · 种子 · 方案</span><span>最佳字段数</span><span></span>
+    <span>媒体 KiB</span><span></span></div><div class="row" style="--series:var(--chart-1)">
+          <span>1M · 0 · H.264</span>
+          <div class="bars"><b style="width:11.1%"></b></div><strong>2/18</strong>
+          <div class="bars"><b style="width:52.6%"></b></div><strong>304</strong>
+        </div>
+<div class="row" style="--series:var(--chart-2)">
+          <span>1M · 0 · JPEG</span>
+          <div class="bars"><b style="width:16.7%"></b></div><strong>3/18</strong>
+          <div class="bars"><b style="width:100.0%"></b></div><strong>579</strong>
+        </div>
+<div class="row" style="--series:var(--chart-3)">
+          <span>1M · 0 · 降权 JPEG</span>
+          <div class="bars"><b style="width:100.0%"></b></div><strong>18/18</strong>
+          <div class="bars"><b style="width:88.3%"></b></div><strong>512</strong>
+        </div>
+<div class="row" style="--series:var(--chart-1)">
+          <span>1M · 17 · H.264</span>
+          <div class="bars"><b style="width:33.3%"></b></div><strong>6/18</strong>
+          <div class="bars"><b style="width:59.9%"></b></div><strong>347</strong>
+        </div>
+<div class="row" style="--series:var(--chart-2)">
+          <span>1M · 17 · JPEG</span>
+          <div class="bars"><b style="width:55.6%"></b></div><strong>10/18</strong>
+          <div class="bars"><b style="width:78.3%"></b></div><strong>454</strong>
+        </div>
+<div class="row" style="--series:var(--chart-1)">
+          <span>1M · 93 · H.264</span>
+          <div class="bars"><b style="width:61.1%"></b></div><strong>11/18</strong>
+          <div class="bars"><b style="width:63.9%"></b></div><strong>370</strong>
+        </div>
+<div class="row" style="--series:var(--chart-2)">
+          <span>1M · 93 · JPEG</span>
+          <div class="bars"><b style="width:55.6%"></b></div><strong>10/18</strong>
+          <div class="bars"><b style="width:78.4%"></b></div><strong>454</strong>
+        </div>
+<div class="row" style="--series:var(--chart-3)">
+          <span>1M · 991 · 降权 JPEG</span>
+          <div class="bars"><b style="width:94.4%"></b></div><strong>17/18</strong>
+          <div class="bars"><b style="width:85.6%"></b></div><strong>496</strong>
+        </div>
+<div class="row" style="--series:var(--chart-1)">
+          <span>1.6M · 0 · H.264</span>
+          <div class="bars"><b style="width:0.0%"></b></div><strong>0/18</strong>
+          <div class="bars"><b style="width:51.2%"></b></div><strong>297</strong>
+        </div>
+<div class="row" style="--series:var(--chart-2)">
+          <span>1.6M · 0 · JPEG</span>
+          <div class="bars"><b style="width:11.1%"></b></div><strong>2/18</strong>
+          <div class="bars"><b style="width:95.5%"></b></div><strong>553</strong>
+        </div>
+<div class="row" style="--series:var(--chart-3)">
+          <span>1.6M · 0 · 降权 JPEG</span>
+          <div class="bars"><b style="width:100.0%"></b></div><strong>18/18</strong>
+          <div class="bars"><b style="width:84.9%"></b></div><strong>492</strong>
+        </div>
+<div class="row" style="--series:var(--chart-1)">
+          <span>1.6M · 17 · H.264</span>
+          <div class="bars"><b style="width:11.1%"></b></div><strong>2/18</strong>
+          <div class="bars"><b style="width:60.8%"></b></div><strong>352</strong>
+        </div>
+<div class="row" style="--series:var(--chart-2)">
+          <span>1.6M · 17 · JPEG</span>
+          <div class="bars"><b style="width:72.2%"></b></div><strong>13/18</strong>
+          <div class="bars"><b style="width:91.6%"></b></div><strong>531</strong>
+        </div>
+<div class="row" style="--series:var(--chart-1)">
+          <span>1.6M · 93 · H.264</span>
+          <div class="bars"><b style="width:22.2%"></b></div><strong>4/18</strong>
+          <div class="bars"><b style="width:69.1%"></b></div><strong>400</strong>
+        </div>
+<div class="row" style="--series:var(--chart-2)">
+          <span>1.6M · 93 · JPEG</span>
+          <div class="bars"><b style="width:11.1%"></b></div><strong>2/18</strong>
+          <div class="bars"><b style="width:89.0%"></b></div><strong>516</strong>
+        </div>
+<div class="row" style="--series:var(--chart-3)">
+          <span>1.6M · 991 · 降权 JPEG</span>
+          <div class="bars"><b style="width:50.0%"></b></div><strong>9/18</strong>
+          <div class="bars"><b style="width:76.1%"></b></div><strong>441</strong>
+        </div>
+    <p>每轮 25 秒。最佳字段数取停滚后约 8 秒内的单次峰值。连续 5 秒全对的判定见实验记录。</p>
+    </html>

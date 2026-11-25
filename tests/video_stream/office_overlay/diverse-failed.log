@@ -1,0 +1,77 @@
+Running 1-0-jpeg-diverse
+Live request rejected: live-stream TypeError Object of type float32 is not JSON serializable
+Live request rejected: live-stream TypeError Object of type float32 is not JSON serializable
+Traceback (most recent call last):
+  File "/Users/qft/Developer/LanPilot/.runtime/live-performance/tests/video_stream/office_overlay/run.py", line 392, in main
+    result = asyncio.run(trial(source, work, binary, rate, size, seed, mode, pin,
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/qft/.local/share/uv/python/cpython-3.12.14-macos-aarch64-none/lib/python3.12/asyncio/runners.py", line 195, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/Users/qft/.local/share/uv/python/cpython-3.12.14-macos-aarch64-none/lib/python3.12/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/qft/.local/share/uv/python/cpython-3.12.14-macos-aarch64-none/lib/python3.12/asyncio/base_events.py", line 691, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/qft/Developer/LanPilot/.runtime/live-performance/tests/video_stream/office_overlay/run.py", line 252, in trial
+    return score(result, writes, binary, shift, experiment.table, office, fixture) | {
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/qft/Developer/LanPilot/.runtime/live-performance/tests/video_stream/office_overlay/run.py", line 271, in score
+    raise RuntimeError('No office pixels sampled')
+RuntimeError: No office pixels sampled
+
+Running 1-991-jpeg-diverse
+Live request rejected: live-stream TypeError Object of type float32 is not JSON serializable
+Live request rejected: live-stream TypeError Object of type float32 is not JSON serializable
+Traceback (most recent call last):
+  File "/Users/qft/Developer/LanPilot/.runtime/live-performance/tests/video_stream/office_overlay/run.py", line 392, in main
+    result = asyncio.run(trial(source, work, binary, rate, size, seed, mode, pin,
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/qft/.local/share/uv/python/cpython-3.12.14-macos-aarch64-none/lib/python3.12/asyncio/runners.py", line 195, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/Users/qft/.local/share/uv/python/cpython-3.12.14-macos-aarch64-none/lib/python3.12/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/qft/.local/share/uv/python/cpython-3.12.14-macos-aarch64-none/lib/python3.12/asyncio/base_events.py", line 691, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/qft/Developer/LanPilot/.runtime/live-performance/tests/video_stream/office_overlay/run.py", line 252, in trial
+    return score(result, writes, binary, shift, experiment.table, office, fixture) | {
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/qft/Developer/LanPilot/.runtime/live-performance/tests/video_stream/office_overlay/run.py", line 271, in score
+    raise RuntimeError('No office pixels sampled')
+RuntimeError: No office pixels sampled
+
+Running 1.6-0-jpeg-diverse
+Traceback (most recent call last):
+  File "/Users/qft/.local/share/uv/python/cpython-3.12.14-macos-aarch64-none/lib/python3.12/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/qft/.local/share/uv/python/cpython-3.12.14-macos-aarch64-none/lib/python3.12/asyncio/base_events.py", line 691, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/Users/qft/Developer/LanPilot/.runtime/live-performance/tests/video_stream/office_overlay/run.py", line 249, in trial
+    result = await asyncio.to_thread(fixture.trial, work / tag, binary, source / 'linko_desktop.py',
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/qft/.local/share/uv/python/cpython-3.12.14-macos-aarch64-none/lib/python3.12/asyncio/threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+asyncio.exceptions.CancelledError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/qft/Developer/LanPilot/.runtime/live-performance/tests/video_stream/office_overlay/run.py", line 404, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/Users/qft/Developer/LanPilot/.runtime/live-performance/tests/video_stream/office_overlay/run.py", line 392, in main
+    result = asyncio.run(trial(source, work, binary, rate, size, seed, mode, pin,
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/qft/.local/share/uv/python/cpython-3.12.14-macos-aarch64-none/lib/python3.12/asyncio/runners.py", line 195, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/Users/qft/.local/share/uv/python/cpython-3.12.14-macos-aarch64-none/lib/python3.12/asyncio/runners.py", line 123, in run
+    raise KeyboardInterrupt()
+KeyboardInterrupt
