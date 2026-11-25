@@ -15,7 +15,7 @@ import threading
 import time
 from pathlib import Path
 
-from .live import LIVE_STREAM_RECORD_MAX, LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE
+from .live import LIVE_AVC_STREAM_RECORD_MAX, LIVE_STREAM_SECONDS, LIVE_STREAM_TYPE, accepts_avc
 from .peer_hub import PeerHub
 
 
@@ -55,12 +55,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if len(authorization) != 1 or not re.fullmatch('Bearer [A-Za-z0-9_-]{40,90}', authorization[0]):
             self.close_connection = True
             return self.answer(401, {'ok': False, 'error': '身份验证失败'})
-        maximum = 24_000_000 if operation == 'result' else 1_500_000 if operation in ('live-exchange', 'live-frame') else 16000
+        maximum = {'result': 24_000_000, 'live-exchange': 1_500_000,
+                   'live-frame': LIVE_AVC_STREAM_RECORD_MAX}.get(operation, 16000)
         lengths = self.headers.get_all('Content-Length', [])
         if len(lengths) != 1 or not re.fullmatch('[0-9]{1,8}', lengths[0]) or not 1 <= int(lengths[0]) <= maximum or self.headers.get('Transfer-Encoding'):
             self.close_connection = True
             return self.answer(400, {'ok': False, 'error': '请求无效'})
         try:
+            received_at = time.monotonic()
             raw = self.rfile.read(int(lengths[0]))
             if len(raw) != int(lengths[0]):
                 raise ValueError('Incomplete body')
@@ -68,7 +70,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if operation == 'live-stream':
                 if not isinstance(body, dict):
                     raise ValueError('Invalid stream request')
-                return self.stream_live(authorization[0][7:], body.get('id'), body.get('after'))
+                return self.stream_live(authorization[0][7:], body.get('id'), body.get('after'), accepts_avc(body))
+            if operation == 'live-frame' and isinstance(body, dict):
+                frame = body.get('frame')
+                if isinstance(frame, dict) and 'avc_base64' in frame:
+                    age = frame.get('capture_age_ms')
+                    if type(age) is int and age >= 0:
+                        # The sender measures age before upload on its own
+                        # monotonic clock. Include time spent receiving the body.
+                        frame['capture_age_ms'] += round((time.monotonic() - received_at) * 1000)
+                elif len(raw) > 1_500_000:
+                    raise ValueError('Invalid JPEG frame request size')
             value = self.server.hub.dispatch(operation, authorization[0][7:], body, self.client_address[0])
             if operation == 'live-open':
                 value['view_stream'] = 1
@@ -84,15 +96,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 print('Submit rejected:', type(error).__name__, str(error)[:150], file=sys.stderr, flush=True)
             return self.answer(400, {'ok': False, 'error': '请求无效或上一操作尚未确认'})
 
-    def stream_live(self, credential, identifier, confirmed):
+    def stream_live(self, credential, identifier, confirmed, accept_avc):
         if not self.server.stream_capacity.acquire(blocking=False):
             return self.answer(503, {'ok': False, 'error': '连续画面连接繁忙'})
         try:
             live = self.server.hub.live
-            session = live.begin_stream(credential, identifier)
+            session = live.begin_stream(credential, identifier, accept_avc)
             timeout = self.connection.gettimeout()
             try:
-                # Bound a stalled write. No frame queue is maintained per peer.
+                # Bound a stalled write. The connection holds only a cursor.
                 self.connection.settimeout(.5)
                 self.send_response(200)
                 self.send_header('Content-Type', LIVE_STREAM_TYPE)
@@ -103,8 +115,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
                 # Reuse across batches only when this connection's viewer
                 # explicitly confirms the sequence it consumed.
-                after = confirmed if (type(confirmed) is int and
-                                      getattr(self, 'stream_cursor', None) == (identifier, confirmed)) else None
+                cursor = getattr(self, 'stream_cursor', None)
+                after = cursor[1] if (cursor and cursor[0] == identifier and cursor[1] is not None
+                                      and type(confirmed) is int and cursor[1][1] == confirmed) else None
                 self.stream_cursor = None
                 ack = None
                 deadline = started + LIVE_STREAM_SECONDS
@@ -127,7 +140,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if value['error']:
                         break
                     if value['frame']:
-                        after = value['frame']['seq']
+                        after = ('avc_base64' in value['frame'], value['frame']['seq'])
                     elif not value.get('unchanged'):
                         after = None
                     ack = value['ack']
@@ -140,7 +153,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.server.stream_capacity.release()
 
     def stream_chunk(self, record):
-        if len(record) > LIVE_STREAM_RECORD_MAX:
+        if len(record) > LIVE_AVC_STREAM_RECORD_MAX:
             raise OSError('Live stream record too large')
         self.wfile.write(f'{len(record):x}\r\n'.encode('ascii') + record + b'\r\n')
 

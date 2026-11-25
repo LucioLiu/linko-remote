@@ -65,6 +65,7 @@ class PeerHub:
           delivered INTEGER DEFAULT 0, result TEXT, created REAL);
         CREATE TABLE IF NOT EXISTS attempts (source TEXT, operation TEXT, at REAL);
         CREATE TABLE IF NOT EXISTS capabilities (id TEXT PRIMARY KEY, live INTEGER);
+        CREATE TABLE IF NOT EXISTS live_avc_capabilities (id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS migrated_receipts (id TEXT PRIMARY KEY, hash TEXT);
         ''')
         self.live = LiveSessions(self)
@@ -188,6 +189,10 @@ class PeerHub:
                             (identifier, digest(credential), name, platform, now))
             live = platform in DESKTOP_PLATFORMS and body.get('live_version') == 1
             self.db.execute('INSERT OR REPLACE INTO capabilities VALUES(?,?)', (identifier, int(live)))
+            if live and platform == 'windows' and type(body.get('live_avc')) is int and body['live_avc'] == 1:
+                self.db.execute('INSERT OR IGNORE INTO live_avc_capabilities VALUES(?)', (identifier,))
+            else:
+                self.db.execute('DELETE FROM live_avc_capabilities WHERE id=?', (identifier,))
             return {'id': identifier, 'name': name, 'platform': platform}
         device = self._device(credential)
         me = device['id']

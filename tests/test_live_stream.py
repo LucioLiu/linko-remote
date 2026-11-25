@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import secrets
 import ssl
+import struct
 import subprocess
 import tempfile
 import threading
@@ -12,11 +13,30 @@ import time
 import unittest
 from unittest.mock import patch
 
-from lanpilot.peer_client import DesktopClient, HubRejection, PinnedHub, RelayIdentityError
+from lanpilot.live import AVC_MAX_HISTORY_BYTES, AVC_MAX_PAYLOAD
+from lanpilot.peer_client import DesktopClient, HubRejection, PinnedConnection, PinnedHub, RelayIdentityError
 from lanpilot.peer_gateway import Handler, PeerGateway
 
 
 GEOMETRY = '0,0,1280,720'
+AVC_GEOMETRY = '-1280,-20,1280,720'
+# Two 64x64 Baseline GOPs encoded with Annex B and repeat headers.
+ACCESS_UNITS = tuple(map(base64.b64decode, (
+    'AAAAAWdCwAraEJoQAAADABAAAAMCiPEiagAAAAFozg/IAAAAAWWIhDomKAAITMnJyddddddddddddeA=',
+    'AAAAAUGaIDa8ZFAMUAxQDFAMUAxQDFAMUAxQDFAMUAxQDFAMUAxQDFAOJ8T4nz+fz+fz+fz+fz+fz+fw',
+    'AAAAAWdCwAraEJoQAAADABAAAAMCiPEiagAAAAFozg/IAAAAAWWIggKomKAAIqcnJyddddddddddddeA',
+    'AAAAAUGaIDa8ZFAMUAxQDFAMUAxQDFAMUAxQDFAMUAxQDFAMUAxQDFAOJ8T4nz+fz+fz+fz+fz+fz+fw',
+)))
+
+
+def avc_upload(seq, unit, *, age=0, flags=None, limit=None):
+    payload = ACCESS_UNITS[unit]
+    if limit is not None:
+        # Fill the record to its wire limit with a filler-data NAL.
+        payload += b'\x00\x00\x00\x01\x0c' + b'\xff' * (limit - len(payload) - 6) + b'\x80'
+    header = struct.pack('<4sIQQHHIiiII', b'LPA1', len(payload), seq, 8500 + seq * 50,
+                         64, 64, int(unit % 2 == 0) if flags is None else flags, -1280, -20, 1280, 720)
+    return {'avc_base64': base64.b64encode(header + payload).decode(), 'capture_age_ms': age}
 
 
 class RecordingHandler(Handler):
@@ -223,3 +243,202 @@ class LiveStreamTLSTests(unittest.TestCase):
         with self.assertRaises(RelayIdentityError):
             wrong_pin.live_stream(identifier).run(lambda: True, self.fail)
         self.assertEqual(requests, len(self.relay.paths))
+
+
+    def open_avc(self):
+        self.sender.call('register', {'name': 'Windows', 'platform': 'windows', 'live_version': 1, 'live_avc': 1})
+        session = self.controller.call('live-open', {'peer': self.target, 'accept_avc': 1})
+        self.assertEqual(1, session['live_avc'])
+        self.assertEqual({'id': session['id'], 'live_avc': 1, 'need_idr': True},
+                         self.sender.call('live-agent-state')['sessions'][0])
+        return session['id']
+
+    def avc_stream(self, identifier, *, connection=None, after=None, hub=None, accept_avc=1):
+        hub = hub or self.controller
+        if connection is None:
+            connection = PinnedConnection(hub.host, hub.port, hub.pin)
+            self.addCleanup(connection.close)
+        headers = {'Authorization': 'Bearer ' + hub.credential, 'Content-Type': 'application/json'}
+        body = json.dumps({'id': identifier, 'after': after, 'accept_avc': accept_avc})
+        connection.request('POST', '/v2/live-stream', body, headers)
+        response = connection.getresponse()
+        self.addCleanup(response.close)
+        return connection, response
+
+    @staticmethod
+    def read_update(response, *, media_only=True):
+        for raw in response:
+            if raw == b'\n':
+                continue
+            value = json.loads(raw)
+            if not media_only or value['frame'] or value['error']:
+                return value
+        raise AssertionError('No live update before the batch ended')
+
+    def upload_avc(self, identifier, frame, hub=None):
+        return (hub or self.sender).call('live-frame', {'id': identifier, 'frame': frame})
+
+    def test_avc_requires_opt_in_on_both_sides(self):
+        session = self.controller.call('live-open', {'peer': self.target, 'accept_avc': 1})
+        self.assertNotIn('live_avc', session)
+        with self.assertRaises(HubRejection):
+            self.upload_avc(session['id'], avc_upload(1, 0))
+        self.controller.call('live-close', {'id': session['id']})
+        self.sender.call('register', {'name': 'Windows', 'platform': 'windows', 'live_version': 1, 'live_avc': 1})
+        legacy = self.controller.call('live-open', {'peer': self.target})
+        self.assertNotIn('live_avc', legacy)
+        self.send(legacy['id'], 1)
+        self.assertIn('jpeg_base64', self.controller.call('live-view', {'id': legacy['id']})['frame'])
+
+    def test_avc_preserves_native_bytes_and_resumes_only_on_idr_after_uplink_gap(self):
+        identifier = self.open_avc()
+        with self.assertRaises(HubRejection):
+            self.upload_avc(identifier, avc_upload(1, 0), hub=self.controller)
+        _, forbidden = self.avc_stream(identifier, hub=self.sender)
+        self.assertEqual(403, forbidden.status)
+        _, response = self.avc_stream(identifier)
+        self.assertEqual(200, response.status)
+        self.assertTrue(response.chunked)
+
+        self.assertTrue(self.upload_avc(identifier, avc_upload(1, 1))['need_idr'])
+        for seq, unit in ((2, 0), (3, 1)):
+            frame = avc_upload(seq, unit)
+            self.assertEqual(seq, self.upload_avc(identifier, frame)['frame_seq'])
+            self.assertEqual({'seq': seq, 'geometry': AVC_GEOMETRY, 'idr': unit == 0,
+                              'avc_base64': frame['avc_base64']}, self.read_update(response)['frame'])
+
+        missing = self.upload_avc(identifier, avc_upload(5, 1))
+        self.assertIsNone(missing['frame_seq'])
+        self.assertTrue(missing['need_idr'])
+        self.assertTrue(self.sender.call('live-exchange', {'id': identifier})['need_idr'])
+        self.assertIsNone(self.upload_avc(identifier, avc_upload(4, 1))['frame_seq'])
+        self.assertIsNone(self.upload_avc(identifier, avc_upload(6, 1))['frame_seq'])
+        self.assertFalse(self.upload_avc(identifier, avc_upload(7, 2))['need_idr'])
+        self.upload_avc(identifier, avc_upload(8, 3))
+        self.assertEqual([7, 8], [self.read_update(response)['frame']['seq'] for _ in range(2)])
+        self.sender.call('availability', {'enabled': False})
+        revoked = self.read_update(response)
+        self.assertTrue(revoked['error'])
+        self.assertIsNone(revoked['frame'])
+        with self.assertRaises(HubRejection):
+            self.upload_avc(identifier, avc_upload(9, 0))
+
+    def test_avc_batch_cursor_requires_same_tls_connection_and_confirmed_sequence(self):
+        identifier = self.open_avc()
+        with patch('lanpilot.peer_gateway.LIVE_STREAM_SECONDS', .4):
+            connection, first = self.avc_stream(identifier)
+            self.upload_avc(identifier, avc_upload(1, 0))
+            self.assertEqual(1, self.read_update(first)['frame']['seq'])
+            first.read()
+            self.upload_avc(identifier, avc_upload(2, 1))
+            _, renewed = self.avc_stream(identifier, connection=connection, after=1)
+            self.assertEqual(2, self.read_update(renewed)['frame']['seq'])
+            renewed.read()
+            _, unconfirmed = self.avc_stream(identifier, connection=connection, after=1)
+            self.assertTrue(self.read_update(unconfirmed)['frame']['idr'])
+            unconfirmed.read()
+            _, reconnected = self.avc_stream(identifier, after=2)
+            self.assertEqual(1, self.read_update(reconnected)['frame']['seq'])
+
+    def test_avc_history_limits_bytes_and_frames_and_signals_new_idr(self):
+        identifier = self.open_avc()
+        self.upload_avc(identifier, avc_upload(1, 0, limit=AVC_MAX_PAYLOAD))
+        self.upload_avc(identifier, avc_upload(2, 1, limit=AVC_MAX_PAYLOAD))
+        history = self.relay.hub.live.sessions[identifier]['avc']
+        self.assertEqual([2], [frame['seq'] for frame, _ in history.frames])
+        self.assertLessEqual(history.size, AVC_MAX_HISTORY_BYTES)
+        _, response = self.avc_stream(identifier, after=1)
+        self.assertIsNone(self.read_update(response, media_only=False)['frame'])
+        self.assertTrue(self.sender.call('live-exchange', {'id': identifier})['need_idr'])
+
+        with patch('lanpilot.live.AVC_MAX_HISTORY_FRAMES', 2):
+            self.upload_avc(identifier, avc_upload(3, 1))
+            self.upload_avc(identifier, avc_upload(4, 1))
+            self.assertEqual([3, 4], [frame['seq'] for frame, _ in history.frames])
+        fresh = avc_upload(5, 2, limit=AVC_MAX_PAYLOAD)
+        self.upload_avc(identifier, fresh)
+        self.assertEqual(fresh['avc_base64'], self.read_update(response)['frame']['avc_base64'])
+
+    def test_avc_rejects_bad_records_and_preserves_freshness_and_lease(self):
+        now = 1000
+        self.relay.hub.clock = lambda: now
+        identifier = self.open_avc()
+        for bad in (avc_upload(1, 1, flags=1), avc_upload(1, 0, flags=3),
+                    avc_upload(1, 0, limit=AVC_MAX_PAYLOAD + 1),
+                    dict(avc_upload(1, 0), avc_base64='***'),
+                    dict(avc_upload(1, 0), capture_age_ms=-1)):
+            with self.assertRaises(HubRejection):
+                self.upload_avc(identifier, bad)
+
+        self.assertIsNone(self.upload_avc(identifier, avc_upload(1, 0, age=1500))['frame_seq'])
+        key = avc_upload(2, 0, age=800)
+        self.assertEqual(2, self.upload_avc(identifier, key)['frame_seq'])
+        _, response = self.avc_stream(identifier)
+        self.assertGreaterEqual(self.read_update(response)['frame_age_ms'], 800)
+        now += .8
+        self.assertEqual(2, self.upload_avc(identifier, key)['frame_seq'])
+        request = {'id': identifier, 'seq': 1, 'geometry': AVC_GEOMETRY,
+                   'events': [{'type': 'move', 'x': 10, 'y': 20}]}
+        with self.assertRaises(HubRejection):
+            self.controller.call('live-input', request)
+
+        self.assertEqual(3, self.upload_avc(identifier, avc_upload(3, 1))['frame_seq'])
+        self.assertEqual({'accepted': 1}, self.controller.call('live-input', request))
+        self.assertEqual(1, self.sender.call('live-exchange', {'id': identifier})['inputs'][0]['seq'])
+        self.assertEqual(3, self.read_update(response)['frame']['seq'])
+        self.assertTrue(self.sender.call('live-exchange', {'id': identifier, 'ack': 1})['active'])
+        self.assertEqual(1, self.read_update(response, media_only=False)['ack'])
+        now = 1008
+        stopped = self.upload_avc(identifier, avc_upload(4, 2))
+        self.assertFalse(stopped['active'])
+        self.assertIsNone(stopped['frame_seq'])
+
+    def test_avc_sender_can_fall_back_to_jpeg_on_existing_stream(self):
+        identifier = self.open_avc()
+        _, response = self.avc_stream(identifier)
+        self.upload_avc(identifier, avc_upload(1, 0))
+        self.assertTrue(self.read_update(response)['frame']['idr'])
+        self.assertEqual(0, self.send(identifier, 1)['live_avc'])
+        self.assertIn('jpeg_base64', self.read_update(response)['frame'])
+        self.assertEqual(0, self.sender.call('live-exchange', {'id': identifier})['live_avc'])
+        self.assertIsNone(self.upload_avc(identifier, avc_upload(2, 0))['frame_seq'])
+
+    def test_avc_viewer_can_fall_back_to_jpeg_polling(self):
+        identifier = self.open_avc()
+        self.upload_avc(identifier, avc_upload(1, 0))
+        self.assertIsNone(self.controller.call('live-view', {'id': identifier})['frame'])
+        self.assertEqual(0, self.sender.call('live-exchange', {'id': identifier})['live_avc'])
+        self.send(identifier, 1)
+        self.assertIn('jpeg_base64', self.controller.call('live-view', {'id': identifier})['frame'])
+
+    def test_avc_stream_without_opt_in_never_sends_buffered_avc(self):
+        identifier = self.open_avc()
+        self.upload_avc(identifier, avc_upload(1, 0))
+        _, response = self.avc_stream(identifier, accept_avc=0)
+        self.assertEqual(0, self.sender.call('live-exchange', {'id': identifier})['live_avc'])
+        self.send(identifier, 1)
+        self.assertIn('jpeg_base64', self.read_update(response)['frame'])
+
+    def test_avc_jpeg_fallback_before_first_idr(self):
+        identifier = self.open_avc()
+        _, response = self.avc_stream(identifier)
+        self.assertEqual(0, self.send(identifier, 1)['live_avc'])
+        self.assertIn('jpeg_base64', self.read_update(response)['frame'])
+
+    def test_avc_slow_upload_counts_toward_capture_age(self):
+        identifier = self.open_avc()
+        connection = PinnedConnection(self.sender.host, self.sender.port, self.sender.pin)
+        self.addCleanup(connection.close)
+        body = json.dumps({'id': identifier, 'frame': avc_upload(1, 0, age=1400)}).encode()
+        connection.putrequest('POST', '/v2/live-frame')
+        connection.putheader('Authorization', 'Bearer ' + self.sender.credential)
+        connection.putheader('Content-Length', str(len(body)))
+        connection.endheaders(body[:-1])
+        self.wait_for(lambda: self.relay.paths.count('/v2/live-frame') == 1)
+        time.sleep(.15)
+        connection.send(body[-1:])
+        with connection.getresponse() as response:
+            result = json.load(response)['value']
+        self.assertTrue(result['active'])
+        self.assertTrue(result['need_idr'])
+        self.assertIsNone(result['frame_seq'])
